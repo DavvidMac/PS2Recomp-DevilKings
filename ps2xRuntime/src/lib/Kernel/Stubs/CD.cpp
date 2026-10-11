@@ -210,6 +210,16 @@ namespace ps2_stubs
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
 
+        static uint32_t traceCount = 0;
+        if (traceCount < 128u || (traceCount % 512u) == 0u)
+        {
+            RUNTIME_LOG("[sceCdRead] ra=0x" << std::hex << getRegU32(ctx, 31)
+                                            << " lbn=0x" << a0
+                                            << " sectors=0x" << a1
+                                            << " buf=0x" << a2 << std::dec << std::endl);
+        }
+        ++traceCount;
+
         struct CdReadArgs
         {
             uint32_t lbn = 0;
@@ -429,6 +439,14 @@ namespace ps2_stubs
         pos[2] = toBcd(sectors);
         pos[3] = 0;
         setReturnS32(ctx, 1);
+    }
+
+    void sceCdLayerSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // sceCdLayerSearchFile(fp, name, layer): same a0/a1 as sceCdSearchFile.
+        // The layer only matters for dual-layer DVDs, which the host-backed
+        // CD root does not distinguish.
+        sceCdSearchFile(rdram, ctx, runtime);
     }
 
     void sceCdMmode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -856,6 +874,17 @@ namespace ps2_stubs
         const uint32_t buffer = getRegU32(ctx, 5);
         const uint32_t mode = getRegU32(ctx, 6);
         const uint32_t errorAddress = getRegU32(ctx, 7);
+
+        static uint32_t traceCount = 0;
+        if (traceCount < 128u || (traceCount % 512u) == 0u)
+        {
+            RUNTIME_LOG("[sceCdStRead] ra=0x" << std::hex << getRegU32(ctx, 31)
+                                              << " sectors=0x" << requestedSectors
+                                              << " buf=0x" << buffer
+                                              << " mode=" << mode
+                                              << " active=" << g_cdStreamTiming.active << std::dec << std::endl);
+        }
+        ++traceCount;
 
         CdStReadContinuation state{};
         state.requestedSectors = requestedSectors;

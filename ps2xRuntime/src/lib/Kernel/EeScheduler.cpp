@@ -294,7 +294,16 @@ void EeScheduler::run()
 
         try
         {
-            m_insideInterrupt = !running->invocations.empty() && running->invocations.back().kind == GuestInvocationKind::Interrupt;
+            // GS VSync callbacks and alarm handlers run from interrupt handlers on
+            // hardware, so non-i syscalls inside them must not switch threads.
+            m_insideInterrupt = false;
+            if (!running->invocations.empty())
+            {
+                const GuestInvocationKind kind = running->invocations.back().kind;
+                m_insideInterrupt = kind == GuestInvocationKind::Interrupt ||
+                                    kind == GuestInvocationKind::GsCallback ||
+                                    kind == GuestInvocationKind::Alarm;
+            }
             m_guestExecuting.store(true, std::memory_order_release);
             function(m_rdram, &context, &m_runtime);
             m_guestExecuting.store(false, std::memory_order_release);
@@ -423,7 +432,8 @@ void EeScheduler::setupCurrentThread(uint32_t stack, uint32_t stackSize, uint32_
 int EeScheduler::createThread(const EeThreadCreateParams &params)
 {
     assertExecutor();
-    if (params.priority < 1 || params.priority >= kPriorityCount)
+    // EE kernel priorities are 0..127 (0 is highest); 1..126 is the IOP range.
+    if (params.priority < 0 || params.priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }
@@ -701,7 +711,7 @@ int EeScheduler::cancelWakeup(int id)
 int EeScheduler::changePriority(int id, int priority, bool interruptSafe, int &oldPriority)
 {
     assertExecutor();
-    if (priority < 1 || priority >= kPriorityCount)
+    if (priority < 0 || priority >= kPriorityCount)
     {
         return KE_ILLEGAL_PRIORITY;
     }

@@ -162,6 +162,100 @@ namespace
                expect(static_cast<int32_t>(cpu.gpr[2]) == expected, "PollEventFlag returned an unexpected result");
     }
 
+    int createMailbox(IopKernel &kernel, IopMemory &memory, uint32_t attr)
+    {
+        constexpr uint32_t descriptor = 0x4000u;
+        memory.write32(descriptor + 0u, attr);
+        memory.write32(descriptor + 4u, 0u);
+        IopCpuState cpu{};
+        cpu.gpr[4] = descriptor;
+        if (!kernel.dispatchMailboxImport(4u, cpu))
+            return -1;
+        return static_cast<int>(cpu.gpr[2]);
+    }
+
+    bool mailboxCall(IopKernel &kernel, uint16_t ordinal, uint32_t a0, uint32_t a1, int32_t expected, const char *what)
+    {
+        IopCpuState cpu{};
+        cpu.gpr[4] = a0;
+        cpu.gpr[5] = a1;
+        return expect(kernel.dispatchMailboxImport(ordinal, cpu), what) &&
+               expect(static_cast<int32_t>(cpu.gpr[2]) == expected, what);
+    }
+
+    bool testMailboxes()
+    {
+        IopMemory memory;
+        IopKernel kernel(memory);
+        kernel.reset();
+
+        constexpr uint32_t result = 0x4100u;
+        constexpr uint32_t msgA = 0x4200u;
+        constexpr uint32_t msgB = 0x4210u;
+        constexpr uint32_t msgC = 0x4220u;
+
+        // FIFO mailbox: PollMbx on empty, then messages come back in send order.
+        const int fifo = createMailbox(kernel, memory, 0u);
+        if (!expect(fifo > 0, "CreateMbx failed") ||
+            !mailboxCall(kernel, 9u, result, static_cast<uint32_t>(fifo), -424, "PollMbx on empty mailbox") ||
+            !mailboxCall(kernel, 6u, static_cast<uint32_t>(fifo), msgA, 0, "SendMbx A") ||
+            !mailboxCall(kernel, 6u, static_cast<uint32_t>(fifo), msgB, 0, "SendMbx B") ||
+            !expect(memory.read32(msgA) == msgB, "SendMbx did not link messages") ||
+            !mailboxCall(kernel, 9u, result, static_cast<uint32_t>(fifo), 0, "PollMbx A") ||
+            !expect(memory.read32(result) == msgA, "FIFO mailbox returned the wrong first message") ||
+            !mailboxCall(kernel, 8u, result, static_cast<uint32_t>(fifo), 0, "ReceiveMbx B") ||
+            !expect(memory.read32(result) == msgB, "FIFO mailbox returned the wrong second message"))
+            return false;
+
+        // MBA_MSPRI: lower priority value is delivered first.
+        const int prio = createMailbox(kernel, memory, 0x4u);
+        memory.write8(msgA + 4u, 5u);
+        memory.write8(msgB + 4u, 1u);
+        memory.write8(msgC + 4u, 5u);
+        if (!mailboxCall(kernel, 6u, static_cast<uint32_t>(prio), msgA, 0, "SendMbx prio A") ||
+            !mailboxCall(kernel, 6u, static_cast<uint32_t>(prio), msgB, 0, "SendMbx prio B") ||
+            !mailboxCall(kernel, 6u, static_cast<uint32_t>(prio), msgC, 0, "SendMbx prio C") ||
+            !mailboxCall(kernel, 9u, result, static_cast<uint32_t>(prio), 0, "PollMbx prio 1") ||
+            !expect(memory.read32(result) == msgB, "priority mailbox did not deliver the highest priority first") ||
+            !mailboxCall(kernel, 9u, result, static_cast<uint32_t>(prio), 0, "PollMbx prio 2") ||
+            !expect(memory.read32(result) == msgA, "priority mailbox broke FIFO order for equal priorities"))
+            return false;
+
+        // A thread blocked in ReceiveMbx is handed the next message directly.
+        constexpr uint32_t threadDescriptor = 0x4300u;
+        memory.write32(threadDescriptor + 0u, 0u);
+        memory.write32(threadDescriptor + 4u, 0u);
+        memory.write32(threadDescriptor + 8u, 0x1000u);
+        memory.write32(threadDescriptor + 12u, 0x400u);
+        memory.write32(threadDescriptor + 16u, 10u);
+        IopCpuState cpu{};
+        cpu.gpr[4] = threadDescriptor;
+        if (!expect(kernel.dispatchThreadImport(4u, cpu, 0u), "CreateThread was not handled"))
+            return false;
+        const uint32_t threadId = cpu.gpr[2];
+        cpu = {};
+        cpu.gpr[4] = threadId;
+        if (!expect(kernel.dispatchThreadImport(6u, cpu, 0u), "StartThread was not handled"))
+            return false;
+        IopThread *thread = kernel.beginNextReady(0u);
+        if (!expect(thread != nullptr, "started thread was not scheduled"))
+            return false;
+
+        thread->cpu.gpr[4] = result;
+        thread->cpu.gpr[5] = static_cast<uint32_t>(fifo);
+        if (!expect(kernel.dispatchMailboxImport(8u, thread->cpu), "blocking ReceiveMbx was not handled") ||
+            !expect(thread->cpu.yielded, "ReceiveMbx on empty mailbox did not block") ||
+            !expect(thread->state == IopThreadState::Mailbox, "blocked thread is not waiting on the mailbox"))
+            return false;
+        kernel.endTimeslice(*thread, 0xFFFFFFFFu);
+
+        memory.write32(result, 0u);
+        return mailboxCall(kernel, 7u, static_cast<uint32_t>(fifo), msgC, 0, "iSendMbx to waiter") &&
+               expect(memory.read32(result) == msgC, "waiting thread did not receive the message") &&
+               expect(thread->state == IopThreadState::Ready, "waiting thread was not made ready") &&
+               mailboxCall(kernel, 9u, result, static_cast<uint32_t>(fifo), -424, "message was also queued");
+    }
+
     bool testCdvdSpecialControl()
     {
         NullHost host;
@@ -331,7 +425,7 @@ namespace
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback())
+        !testTimrmanPeriodicCallback() || !testMailboxes())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

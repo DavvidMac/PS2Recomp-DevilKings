@@ -284,6 +284,12 @@ namespace ps2x::iop::detail
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
             }
+            if (iequals(call.library, "thmsgbx"))
+            {
+                return kernel.dispatchMailboxImport(call.ordinal, cpu)
+                           ? ImportDisposition::Handled
+                           : ImportDisposition::Missing;
+            }
             if (iequals(call.library, "sifcmd"))
             {
                 return rpc.dispatchSifCmdImport(call.ordinal, cpu)
@@ -702,6 +708,16 @@ namespace ps2x::iop::detail
         uint64_t totalCycles = 0;
         uint64_t totalInstructions = 0;
         uint64_t eeCycleCarry = 0;
+
+        // Run EE cycles that runEeCycles() batched, so anything that observes or
+        // talks to the IOP sees it at the EE's current time.
+        void flushPendingEeCycles() noexcept
+        {
+            const uint64_t iopCycles = eeCycleCarry / 8u;
+            eeCycleCarry %= 8u;
+            if (iopCycles)
+                runCycles(iopCycles);
+        }
         CpuState *activeCpu = nullptr;
         std::string lastError;
         bool servicingDmaInterrupts = false;
@@ -726,22 +742,34 @@ namespace ps2x::iop::detail
 
     ModuleLoadResult IopEmulator::loadModule(std::string_view path, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushPendingEeCycles();
         return m_impl->loadModule(path, arguments, argumentSize);
     }
 
     ModuleLoadResult IopEmulator::loadModuleBuffer(uint32_t guestAddress, const void *arguments, uint32_t argumentSize)
     {
+        m_impl->flushPendingEeCycles();
         return m_impl->loadModuleBuffer(guestAddress, arguments, argumentSize);
     }
 
     bool IopEmulator::stopModule(int32_t moduleId, int32_t *result)
     {
+        m_impl->flushPendingEeCycles();
         return m_impl->stopModule(moduleId, result);
     }
 
     void IopEmulator::runEeCycles(uint64_t eeCycles) noexcept
     {
+        // The EE scheduler reports progress every few dozen cycles (each guest
+        // loop checkpoint). Running the IOP scheduler for a handful of cycles per
+        // call costs far more than the emulated work, so batch small advances.
+        constexpr uint64_t kMinIopBatchCycles = 128u;
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
+        if (total / 8u < kMinIopBatchCycles)
+        {
+            m_impl->eeCycleCarry = total;
+            return;
+        }
         const uint64_t iopCycles = total / 8u;
         m_impl->eeCycleCarry = total % 8u;
         if (iopCycles)
@@ -750,6 +778,7 @@ namespace ps2x::iop::detail
 
     RpcResult IopEmulator::handleRpc(const RpcRequest &request)
     {
+        m_impl->flushPendingEeCycles();
         return m_impl->rpc.handleRpc(request, *m_impl);
     }
 
@@ -760,6 +789,7 @@ namespace ps2x::iop::detail
 
     void IopEmulator::onSifTransfer(const SifTransfer &transfer)
     {
+        m_impl->flushPendingEeCycles();
         m_impl->rpc.onSifTransfer(transfer);
     }
 
@@ -804,7 +834,8 @@ namespace ps2x::iop::detail
 
     uint64_t IopEmulator::cycles() const noexcept
     {
-        return m_impl->totalCycles;
+        // Include batched cycles; they run before the next IOP interaction.
+        return m_impl->totalCycles + m_impl->eeCycleCarry / 8u;
     }
 
     uint64_t IopEmulator::instructions() const noexcept

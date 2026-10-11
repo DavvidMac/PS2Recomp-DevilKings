@@ -167,7 +167,21 @@ namespace ps2_stubs
 
     void sceDmaRecvN(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceDmaRecvN", rdram, ctx, runtime);
+        // sceDmaRecvN(chan, addr, qwc): normal-mode receive into main RAM
+        // (e.g. fromSPR, where the caller has already programmed SADR).
+        const uint32_t channelBase = runtime ? resolveDmaChannelBase(rdram, getRegU32(ctx, 4)) : 0u;
+        if (channelBase == 0u)
+        {
+            setReturnS32(ctx, -1);
+            return;
+        }
+
+        PS2Memory &mem = runtime->memory();
+        mem.writeIORegister(channelBase + 0x20u, normalizeQwcFromArg(getRegU32(ctx, 6)) & 0xFFFFu);
+        mem.writeIORegister(channelBase + 0x10u, toDmaPhys(getRegU32(ctx, 5)));
+        mem.writeIORegister(channelBase + 0x00u, 0x00000100u); // STR=1, normal mode, DIR=0 (to memory).
+        mem.processPendingTransfers();
+        setReturnS32(ctx, 0);
     }
 
     void sceDmaReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
