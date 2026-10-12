@@ -16,6 +16,7 @@ extern "C"
 }
 #endif
 
+#include <cstdlib>
 #include <deque>
 #include <memory>
 
@@ -1757,6 +1758,15 @@ namespace ps2_stubs
             const uint32_t outWidth = align16(width);
             const uint32_t outHeight = align16(height);
             const uint32_t macroblockColumns = outWidth / 16u;
+            // sceIpuRGB32 macroblocks (16x16, 1024 bytes) are stored column by
+            // column by default, which matches games that upload 16-pixel wide
+            // strips. PS2X_MPEG_MB_RASTER=1 stores them in decode (raster) order,
+            // as CRI Sofdec expects before converting the picture itself.
+            static const bool s_rasterMacroblocks = []()
+            {
+                const char *value = std::getenv("PS2X_MPEG_MB_RASTER");
+                return value && value[0] == '1';
+            }();
 
             for (uint32_t mbx = 0u; mbx < macroblockColumns; ++mbx)
             {
@@ -1764,9 +1774,10 @@ namespace ps2_stubs
                     static_cast<size_t>(mbx) * static_cast<size_t>(outHeight) * 16u * 4u;
                 for (uint32_t y = 0u; y < outHeight; ++y)
                 {
-                    uint8_t *dst = getMemPtr(
-                        rdram,
-                        destAddr + static_cast<uint32_t>(stripOffset + static_cast<size_t>(y) * 16u * 4u));
+                    const size_t rowOffset = s_rasterMacroblocks
+                                                 ? (static_cast<size_t>(y / 16u) * macroblockColumns + mbx) * 1024u + (y % 16u) * 64u
+                                                 : stripOffset + static_cast<size_t>(y) * 16u * 4u;
+                    uint8_t *dst = getMemPtr(rdram, destAddr + static_cast<uint32_t>(rowOffset));
                     if (!dst)
                     {
                         continue;

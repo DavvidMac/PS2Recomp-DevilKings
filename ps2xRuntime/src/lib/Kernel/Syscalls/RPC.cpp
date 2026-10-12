@@ -1,5 +1,7 @@
 #include "Common.h"
 #include "RPC.h"
+#include <cstdlib>
+#include <cctype>
 #include "../../ps2_iop_transport.h"
 
 namespace ps2_syscalls
@@ -187,6 +189,58 @@ namespace ps2_syscalls
         setReturnS32(ctx, ret);
     }
 
+    // PS2X_IOP_MODULE_ARGS="NAME.IRX:arg,arg;OTHER.IRX:arg" appends load
+    // arguments to IOP modules whose path contains NAME (case-insensitive).
+    // They follow the game's own arguments, so they win for parsers that keep
+    // the last value (e.g. "CSEALPHA.IRX:spudma=1").
+    static void appendConfiguredModuleArguments(const std::string &modulePath, std::vector<uint8_t> &arguments)
+    {
+        const char *env = std::getenv("PS2X_IOP_MODULE_ARGS");
+        if (!env || !*env)
+        {
+            return;
+        }
+        auto upper = [](std::string text)
+        {
+            for (char &c : text)
+            {
+                c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            }
+            return text;
+        };
+        const std::string path = upper(modulePath);
+        const std::string config(env);
+        size_t pos = 0u;
+        while (pos < config.size())
+        {
+            const size_t end = std::min(config.find(';', pos), config.size());
+            const std::string entry = config.substr(pos, end - pos);
+            pos = end + 1u;
+            const size_t colon = entry.find(':');
+            if (colon == std::string::npos || path.find(upper(entry.substr(0, colon))) == std::string::npos)
+            {
+                continue;
+            }
+            size_t argPos = colon + 1u;
+            while (argPos < entry.size())
+            {
+                const size_t argEnd = std::min(entry.find(',', argPos), entry.size());
+                const std::string arg = entry.substr(argPos, argEnd - argPos);
+                argPos = argEnd + 1u;
+                if (arg.empty())
+                {
+                    continue;
+                }
+                if (!arguments.empty() && arguments.back() != 0u)
+                {
+                    arguments.push_back(0u);
+                }
+                arguments.insert(arguments.end(), arg.begin(), arg.end());
+                arguments.push_back(0u);
+            }
+        }
+    }
+
     void SifLoadModule(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t pathAddr = getRegU32(ctx, 4);     // $a0
@@ -206,6 +260,8 @@ namespace ps2_syscalls
             setReturnS32(ctx, -1);
             return;
         }
+
+        appendConfiguredModuleArguments(modulePath, arguments);
 
         if (!runtime)
         {

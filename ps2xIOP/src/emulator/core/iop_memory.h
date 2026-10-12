@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <optional>
 #include <span>
 #include <string>
@@ -72,6 +73,9 @@ namespace ps2x::iop::detail
 
         [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
 
+        // IOP cycle counter used to pace SPU2 AutoDMA transfers in real time.
+        void setCycleCounter(const uint64_t *counter) noexcept { m_cycleCounter = counter; }
+
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
@@ -87,5 +91,14 @@ namespace ps2x::iop::detail
         uint32_t m_interruptMask = 0;
         uint32_t m_interruptControl = 1;
         std::optional<DmaStart> m_dmaStart;
+        const uint64_t *m_cycleCounter = nullptr;
+        struct SpuAutoDma
+        {
+            bool active = false;
+            uint32_t madr = 0;
+            uint64_t startCycle = 0;
+            uint64_t bytes = 0;
+        };
+        std::array<SpuAutoDma, 2> m_spuAutoDma{};
     };
 }

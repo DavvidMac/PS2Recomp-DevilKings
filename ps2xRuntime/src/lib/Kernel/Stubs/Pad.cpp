@@ -1,4 +1,8 @@
 #include "Common.h"
+#include "runtime/ee_scheduler.h"
+#include <vector>
+#include <string>
+#include <cstdlib>
 #include "Pad.h"
 
 namespace ps2_stubs
@@ -79,6 +83,85 @@ namespace ps2_stubs
             if (pressed)
             {
                 state.buttons = static_cast<uint16_t>(state.buttons & ~mask);
+            }
+        }
+
+        // PS2X_PAD_SCRIPT="from-to:BTN+BTN;..." presses buttons on port 0 for
+        // the given VSync tick ranges, e.g. "1700-1730:LEFT;1760-1790:CROSS".
+        // Lets automated runs drive menus without host keyboard focus.
+        struct PadScriptStep
+        {
+            uint64_t from = 0u;
+            uint64_t to = 0u;
+            uint16_t mask = 0u;
+        };
+
+        const std::vector<PadScriptStep> &padScript()
+        {
+            static const std::vector<PadScriptStep> steps = []()
+            {
+                std::vector<PadScriptStep> parsed;
+                const char *env = std::getenv("PS2X_PAD_SCRIPT");
+                if (!env)
+                {
+                    return parsed;
+                }
+                static const std::pair<const char *, uint16_t> kNames[] = {
+                    {"UP", kPadBtnUp}, {"DOWN", kPadBtnDown}, {"LEFT", kPadBtnLeft}, {"RIGHT", kPadBtnRight},
+                    {"CROSS", kPadBtnCross}, {"CIRCLE", kPadBtnCircle}, {"SQUARE", kPadBtnSquare},
+                    {"TRIANGLE", kPadBtnTriangle}, {"START", kPadBtnStart}, {"SELECT", kPadBtnSelect},
+                    {"L1", kPadBtnL1}, {"R1", kPadBtnR1}, {"L2", kPadBtnL2}, {"R2", kPadBtnR2},
+                    {"L3", kPadBtnL3}, {"R3", kPadBtnR3}};
+                std::string text(env);
+                size_t pos = 0u;
+                while (pos < text.size())
+                {
+                    const size_t end = std::min(text.find(';', pos), text.size());
+                    const std::string item = text.substr(pos, end - pos);
+                    pos = end + 1u;
+                    const size_t dash = item.find('-');
+                    const size_t colon = item.find(':');
+                    if (dash == std::string::npos || colon == std::string::npos || colon < dash)
+                    {
+                        continue;
+                    }
+                    PadScriptStep step{};
+                    step.from = std::strtoull(item.substr(0, dash).c_str(), nullptr, 10);
+                    step.to = std::strtoull(item.substr(dash + 1u, colon - dash - 1u).c_str(), nullptr, 10);
+                    size_t namePos = colon + 1u;
+                    while (namePos < item.size())
+                    {
+                        const size_t nameEnd = std::min(item.find('+', namePos), item.size());
+                        const std::string name = item.substr(namePos, nameEnd - namePos);
+                        for (const auto &[label, mask] : kNames)
+                        {
+                            if (name == label)
+                            {
+                                step.mask = static_cast<uint16_t>(step.mask | mask);
+                            }
+                        }
+                        namePos = nameEnd + 1u;
+                    }
+                    parsed.push_back(step);
+                }
+                return parsed;
+            }();
+            return steps;
+        }
+
+        void applyPadScript(PadInputState &state, int port, PS2Runtime *runtime)
+        {
+            if (port != 0 || !runtime || padScript().empty())
+            {
+                return;
+            }
+            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            for (const PadScriptStep &step : padScript())
+            {
+                if (tick >= step.from && tick <= step.to)
+                {
+                    setButton(state, step.mask, true);
+                }
             }
         }
 
@@ -313,6 +396,7 @@ namespace ps2_stubs
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
+                applyPadScript(state, port, runtime);
             }
 
             fillPadStatus(outData, state, portState);

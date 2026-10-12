@@ -16,6 +16,34 @@ namespace ps2x::iop::detail
     {
     }
 
+    namespace
+    {
+        // sysclib ctype flags: upper 0x01, lower 0x02, digit 0x04, space 0x08,
+        // punct 0x10, control 0x20, hex digit 0x40, blank 0x80. IRXs test e.g.
+        // look_ctype_table(c) & 0x04 for isdigit when parsing module arguments.
+        uint8_t sysclibCtypeFlags(uint8_t c)
+        {
+            uint8_t flags = 0u;
+            if (c >= 'A' && c <= 'Z')
+                flags |= 0x01u;
+            if (c >= 'a' && c <= 'z')
+                flags |= 0x02u;
+            if (c >= '0' && c <= '9')
+                flags |= 0x04u;
+            if (c == ' ' || (c >= 0x09u && c <= 0x0Du))
+                flags |= 0x08u;
+            if (c > ' ' && c < 0x7Fu && !(flags & 0x07u))
+                flags |= 0x10u;
+            if (c < 0x20u || c == 0x7Fu)
+                flags |= 0x20u;
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))
+                flags |= 0x40u;
+            if (c == ' ')
+                flags |= 0x80u;
+            return flags;
+        }
+    }
+
     bool IopSysclib::dispatchImport(uint16_t ordinal, IopCpuState &cpu)
     {
         const uint32_t a0 = cpu.gpr[4];
@@ -73,9 +101,17 @@ namespace ps2x::iop::detail
         case 7:
             setV0(static_cast<uint32_t>(std::tolower(static_cast<unsigned char>(a0))));
             return true;
-        case 8:
-        case 9: // ctype table is optional for most IRXs.
-            setV0(0);
+        case 8: // look_ctype_table
+            setV0(sysclibCtypeFlags(static_cast<uint8_t>(a0)));
+            return true;
+        case 9: // get_ctype_table
+            if (m_ctypeTable == 0u)
+            {
+                m_ctypeTable = m_memory.allocate(256u);
+                for (uint32_t c = 0; m_ctypeTable != 0u && c < 256u; ++c)
+                    m_memory.write8(m_ctypeTable + c, sysclibCtypeFlags(static_cast<uint8_t>(c)));
+            }
+            setV0(m_ctypeTable);
             return true;
         case 10: // memchr
             for (uint32_t i = 0; i < a2; ++i)

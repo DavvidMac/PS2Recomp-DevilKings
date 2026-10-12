@@ -1,7 +1,6 @@
 #include "iop_memory.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <cstring>
 
 namespace ps2x::iop::detail
@@ -38,6 +37,7 @@ namespace ps2x::iop::detail
         m_interruptMask = 0;
         m_interruptControl = 1;
         m_dmaStart.reset();
+        m_spuAutoDma = {};
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -214,19 +214,16 @@ namespace ps2x::iop::detail
 
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
-        const auto value = m_hardware.find(address);
-        // Compatibility option PS2X_ADMAS_ZERO=1: report SPU2 core 0 AutoDMA as
-        // idle. SPU2 output is not emulated and AutoDMA blocks complete far
-        // faster than on hardware, so a streaming driver (CRI ADX) can keep
-        // core 0 busy exactly when another driver (Capcom CSE) uploads voice
-        // data, which then fails with SCESD_EBUSY and stalls the game.
-        static const bool s_reportCore0AdmaIdle = []()
+        if ((address == kDmaSpu0Chcr - 8u || address == kDmaSpu1Chcr - 8u) && m_cycleCounter)
         {
-            const char *value = std::getenv("PS2X_ADMAS_ZERO");
-            return value && value[0] == '1';
-        }();
-        if (address == 0x1F9001B0u && s_reportCore0AdmaIdle)
-            return value != m_hardware.end() ? (value->second & 0xFFFF0000u) : 0u;
+            const SpuAutoDma &dma = m_spuAutoDma[address == kDmaSpu1Chcr - 8u ? 1u : 0u];
+            if (dma.active)
+            {
+                const uint64_t consumed = std::min<uint64_t>(dma.bytes, (*m_cycleCounter - dma.startCycle) / 768u * 4u);
+                return dma.madr + static_cast<uint32_t>(consumed);
+            }
+        }
+        const auto value = m_hardware.find(address);
         if (value != m_hardware.end())
             return value->second;
         switch (address)
@@ -282,9 +279,29 @@ namespace ps2x::iop::detail
         const uint32_t wordsPerBlock = std::max<uint32_t>(blockControl & 0xFFFFu, 1u);
         const uint32_t blockCount = std::max<uint32_t>(blockControl >> 16u, 1u);
         const uint64_t transferWords = static_cast<uint64_t>(wordsPerBlock) * blockCount;
+        uint64_t delayCycles = std::max<uint64_t>(transferWords * 2u, 64u);
+
+        // AutoDMA (ADMAS set for this core) streams PCM that the SPU2 consumes at
+        // 48 kHz: one 32-bit word (a 16-bit stereo sample pair) per 768 IOP
+        // cycles. Drivers such as CRI ADX derive their playback clock from the
+        // DMA position (MADR via sceSdBlockTransStatus), so pace it in real time.
+        const uint32_t core = secondCore ? 1u : 0u;
+        uint32_t admas = 0u;
+        if (const auto current = m_hardware.find(0x1F9001B0u + core * 0x400u); current != m_hardware.end())
+            admas = current->second & 0xFFFFu;
+        m_spuAutoDma[core] = {};
+        if (admas != 0u && m_cycleCounter)
+        {
+            constexpr uint64_t kIopCyclesPerSample = 768u;
+            delayCycles = transferWords * kIopCyclesPerSample;
+            uint32_t madr = 0u;
+            if (const auto current = m_hardware.find(address - 8u); current != m_hardware.end())
+                madr = current->second;
+            m_spuAutoDma[core] = SpuAutoDma{true, madr, *m_cycleCounter, transferWords * 4u};
+        }
         m_dmaStart = DmaStart{
             secondCore ? kDmaSpu1Irq : kDmaSpu0Irq,
-            std::max<uint64_t>(transferWords * 2u, 64u),
+            delayCycles,
         };
     }
 

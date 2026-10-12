@@ -17,6 +17,8 @@
 #include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
 
+#include <string>
+#include <vector>
 #include <algorithm>
 #include <cctype>
 #include <map>
@@ -129,6 +131,7 @@ namespace ps2x::iop::detail
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            memory.setCycleCounter(&totalCycles);
             totalInstructions = 0;
             eeCycleCarry = 0;
             activeCpu = nullptr;
@@ -620,19 +623,50 @@ namespace ps2x::iop::detail
             module.entry = loaded.entry;
             module.gp = loaded.gp;
 
-            uint32_t args = 0u;
+            // IRX entry: start(int argc, char *argv[]). Like loadcore, argv[0] is
+            // the module path and the NUL-separated load arguments follow.
+            std::vector<std::string> argvStrings{module.path};
             if (arguments && argumentSize)
             {
-                args = allocate(argumentSize + 1u, 16u);
-                if (args)
+                const auto *bytes = static_cast<const char *>(arguments);
+                uint32_t begin = 0u;
+                for (uint32_t i = 0; i < argumentSize; ++i)
                 {
-                    writeRam(args, arguments, argumentSize);
-                    write8(args + argumentSize, 0u);
+                    if (bytes[i] == 0)
+                    {
+                        argvStrings.emplace_back(bytes + begin, i - begin);
+                        begin = i + 1u;
+                    }
                 }
+                if (begin < argumentSize)
+                    argvStrings.emplace_back(bytes + begin, argumentSize - begin);
             }
-            const uint32_t startResult = callFunction(module.entry, argumentSize, args, 0u, 0u, module.gp);
-            if (args)
-                freeAllocation(args);
+            uint32_t stringBytes = 0u;
+            for (const std::string &text : argvStrings)
+                stringBytes += static_cast<uint32_t>(text.size()) + 1u;
+            const uint32_t pointerBytes = static_cast<uint32_t>((argvStrings.size() + 1u) * 4u);
+            const uint32_t argvBlock = allocate(pointerBytes + stringBytes, 16u);
+            uint32_t argv = 0u;
+            if (argvBlock)
+            {
+                argv = argvBlock;
+                uint32_t cursor = argvBlock + pointerBytes;
+                for (size_t i = 0; i < argvStrings.size(); ++i)
+                {
+                    const std::string &text = argvStrings[i];
+                    const uint32_t pointer = cursor;
+                    writeRam(argv + static_cast<uint32_t>(i) * 4u, &pointer, 4u);
+                    writeRam(cursor, text.data(), text.size());
+                    write8(cursor + static_cast<uint32_t>(text.size()), 0u);
+                    cursor += static_cast<uint32_t>(text.size()) + 1u;
+                }
+                const uint32_t terminator = 0u;
+                writeRam(argv + static_cast<uint32_t>(argvStrings.size()) * 4u, &terminator, 4u);
+            }
+            const uint32_t argc = argvBlock ? static_cast<uint32_t>(argvStrings.size()) : 0u;
+            const uint32_t startResult = callFunction(module.entry, argc, argv, 0u, 0u, module.gp);
+            if (argvBlock)
+                freeAllocation(argvBlock);
             module.resident = startResult == 0u || startResult == 2u;
             result.moduleId = module.id;
             result.startResult = static_cast<int32_t>(startResult);
