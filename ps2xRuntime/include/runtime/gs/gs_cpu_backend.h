@@ -163,6 +163,15 @@ private:
     void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
     std::vector<QueuedWork> m_queue;
     bool m_workerBusy = false;
+    // Presentation snapshots queued but not yet taken. The producer may run at
+    // most kMaxPendingPresents frames ahead of the rasteriser.
+    static constexpr uint32_t kMaxPendingPresents = 2u;
+    uint32_t m_pendingPresents = 0u;
+    // Bound on queued plus in-flight work items, for scenes that draw without
+    // flipping (loading screens).
+    static constexpr size_t kMaxQueuedWork = 32768u;
+    size_t m_inFlightWork = 0u;
+    std::condition_variable m_presentCv;
     bool m_stopWorker = false;
     std::thread m_worker;
     void MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);

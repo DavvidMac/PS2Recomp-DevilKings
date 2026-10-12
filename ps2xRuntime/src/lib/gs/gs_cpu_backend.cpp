@@ -569,6 +569,8 @@ bool GSCpuBackend::EnqueueWork(const std::function<void(QueuedWork &)> &fill)
     std::unique_lock<std::mutex> queueLock(m_queueMutex);
     if (!m_worker.joinable())
         m_worker = std::thread([this]() { WorkerLoop(); });
+    m_presentCv.wait(queueLock, [this]()
+                     { return m_queue.size() + m_inFlightWork < kMaxQueuedWork || m_stopWorker; });
     m_queue.emplace_back();
     fill(m_queue.back());
     queueLock.unlock();
@@ -583,6 +585,7 @@ GSCpuBackend::~GSCpuBackend()
         m_stopWorker = true;
     }
     m_queueCv.notify_all();
+    m_presentCv.notify_all();
     if (m_worker.joinable())
         m_worker.join();
 }
@@ -598,6 +601,7 @@ void GSCpuBackend::WorkerLoop()
             if (m_queue.empty() && m_stopWorker)
                 return;
             batches.swap(m_queue);
+            m_inFlightWork = batches.size();
             m_workerBusy = true;
         }
         {
@@ -636,14 +640,22 @@ void GSCpuBackend::WorkerLoop()
                 }
                 if (work.sink)
                     work.sink(std::move(frame));
+                {
+                    std::lock_guard<std::mutex> queueLock(m_queueMutex);
+                    if (m_pendingPresents != 0u)
+                        --m_pendingPresents;
+                }
+                m_presentCv.notify_all();
             }
         }
         batches.clear();
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_workerBusy = false;
+            m_inFlightWork = 0u;
             if (m_queue.empty())
                 m_idleCv.notify_all();
+            m_presentCv.notify_all();
         }
     }
 }
@@ -654,6 +666,9 @@ void GSCpuBackend::QueuePresent(const GSPresentationRequest &request, PresentSin
         std::unique_lock<std::mutex> queueLock(m_queueMutex);
         if (m_worker.joinable())
         {
+            m_presentCv.wait(queueLock, [this]()
+                             { return m_pendingPresents < kMaxPendingPresents || m_stopWorker; });
+            ++m_pendingPresents;
             QueuedWork work{};
             work.kind = QueuedWork::Kind::Present;
             work.request = request;
