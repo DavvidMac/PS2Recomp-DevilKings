@@ -14,6 +14,26 @@
 
 namespace
 {
+    // Diagnostics: PS2X_GS_DRAW_TRACE=<vsync> logs every primitive and image
+    // transfer submitted from that VSync on (<vsync>:<count>, default 2).
+    bool drawTraceActive(const GSRegisters *privRegs)
+    {
+        static long long s_traceCount = 2;
+        static const long long s_traceTick = []() -> long long
+        {
+            const char *value = std::getenv("PS2X_GS_DRAW_TRACE");
+            if (!value)
+                return -1;
+            if (const char *count = std::strchr(value, ':'))
+                s_traceCount = std::atoll(count + 1);
+            return std::atoll(value);
+        }();
+        if (s_traceTick < 0 || !privRegs)
+            return false;
+        const long long tick = static_cast<long long>(privRegs->vsyncTick.load(std::memory_order_relaxed));
+        return tick >= s_traceTick && tick < s_traceTick + s_traceCount;
+    }
+
     static constexpr uint32_t kHostFrameWidth = 640u;
 
     GSPrimReg decodePrimRegister(uint64_t value)
@@ -1457,6 +1477,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxpos = m_trxpos;
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
+            if (drawTraceActive(m_privRegs))
+                std::fprintf(stderr, "[gs:xfer] t=%llu dir=%u dbp=%u dbw=%u dpsm=%x sbp=%u dx=%u dy=%u w=%u h=%u\n",
+                             static_cast<unsigned long long>(m_privRegs->vsyncTick.load()), m_trxdir,
+                             command.bitbltbuf.dbp, static_cast<uint32_t>(command.bitbltbuf.dbw),
+                             static_cast<uint32_t>(command.bitbltbuf.dpsm), command.bitbltbuf.sbp,
+                             static_cast<uint32_t>(command.trxpos.dsax), static_cast<uint32_t>(command.trxpos.dsay),
+                             static_cast<uint32_t>(command.trxreg.rrw), static_cast<uint32_t>(command.trxreg.rrh));
             m_backend->BeginTransfer(command);
         }
         recordTransferDebugEventUnlocked();
@@ -1641,6 +1668,30 @@ void GS::vertexKick(bool drawing)
     if (drawing && m_backend)
     {
         GSPrimitiveBatch batch = buildDrawBatch(needed);
+        if (drawTraceActive(m_privRegs))
+        {
+            const auto &c = batch.state.context;
+            const auto &v0 = batch.vertices[0];
+            const auto &vl = batch.vertices[needed - 1];
+            std::fprintf(stderr,
+                         "[gs:draw] t=%llu prim=%u tme=%u abe=%u fst=%u fbp=%u fbw=%u fpsm=%x fbmsk=%x zbp=%u zpsm=%x zmsk=%u test=%llx alpha=%llx "
+                         "tbp=%u tbw=%u tpsm=%x tw=%u th=%u tfx=%u tcc=%u scissor=%d,%d-%d,%d ofs=%d,%d "
+                         "v0=(%.1f,%.1f z=%u rgba=%u,%u,%u,%u uv=%u,%u stq=%g,%g,%g) vN=(%.1f,%.1f rgba=%u,%u,%u,%u uv=%u,%u) "
+                         "pmode=%llx dispfb1=%llx dispfb2=%llx display2=%llx\n",
+                         static_cast<unsigned long long>(m_privRegs->vsyncTick.load()), static_cast<uint32_t>(m_prim.type),
+                         static_cast<uint32_t>(batch.state.prim.tme), static_cast<uint32_t>(batch.state.prim.abe),
+                         static_cast<uint32_t>(batch.state.prim.fst), c.frame.fbp, c.frame.fbw, static_cast<uint32_t>(c.frame.psm),
+                         c.frame.fbmsk, c.zbuf.zbp, static_cast<uint32_t>(c.zbuf.psm), static_cast<uint32_t>(c.zbuf.zmask),
+                         static_cast<unsigned long long>(c.test), static_cast<unsigned long long>(c.alpha),
+                         c.tex0.tbp0, static_cast<uint32_t>(c.tex0.tbw), static_cast<uint32_t>(c.tex0.psm),
+                         static_cast<uint32_t>(c.tex0.tw), static_cast<uint32_t>(c.tex0.th), static_cast<uint32_t>(c.tex0.tfx),
+                         static_cast<uint32_t>(c.tex0.tcc), c.scissor.x0, c.scissor.y0, c.scissor.x1, c.scissor.y1,
+                         c.xyoffset.ofx >> 4, c.xyoffset.ofy >> 4,
+                         v0.x, v0.y, static_cast<uint32_t>(v0.z), v0.r, v0.g, v0.b, v0.a, v0.u >> 4, v0.v >> 4, v0.s, v0.t, v0.q,
+                         vl.x, vl.y, vl.r, vl.g, vl.b, vl.a, vl.u >> 4, vl.v >> 4,
+                         static_cast<unsigned long long>(m_privRegs->pmode), static_cast<unsigned long long>(m_privRegs->dispfb1),
+                         static_cast<unsigned long long>(m_privRegs->dispfb2), static_cast<unsigned long long>(m_privRegs->display2));
+        }
         updatePreferredDisplaySourceForDraw(batch);
         m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);

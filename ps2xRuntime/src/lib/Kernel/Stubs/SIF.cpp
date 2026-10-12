@@ -6,6 +6,8 @@
 #include "runtime/ee_scheduler.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -303,7 +305,13 @@ namespace ps2_stubs
     {
         (void)rdram;
         const uint32_t reqSize = getRegU32(ctx, 4);
-        setReturnU32(ctx, runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u);
+        const uint32_t address = runtime ? runtime->allocateIopMemory(reqSize, 64u) : 0u;
+        static const bool s_trace = std::getenv("PS2X_IOPHEAP_TRACE") != nullptr;
+        if (s_trace && runtime)
+            std::fprintf(stderr, "[iopheap] t=%llu ee-alloc size=%x -> %x ra=%x\n",
+                         static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), reqSize, address,
+                         getRegU32(ctx, 31));
+        setReturnU32(ctx, address);
     }
 
     void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -354,6 +362,10 @@ namespace ps2_stubs
     {
         (void)rdram;
         const uint32_t addr = getRegU32(ctx, 4);
+        static const bool s_trace = std::getenv("PS2X_IOPHEAP_TRACE") != nullptr;
+        if (s_trace && runtime)
+            std::fprintf(stderr, "[iopheap] t=%llu ee-free %x ra=%x\n",
+                         static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), addr, getRegU32(ctx, 31));
         setReturnS32(ctx, runtime && runtime->freeIopMemory(addr) ? 0 : -1);
     }
 
@@ -697,6 +709,36 @@ namespace ps2_stubs
             }
 
             pending[pendingCount++] = xfer;
+        }
+
+        // PS2X_SIF_TRACE=1 logs every EE->IOP DMA descriptor.
+        // PS2X_SIF_TRACE=2 also prints the first 64 payload bytes.
+        static const int s_traceSif = []()
+        {
+            const char *value = std::getenv("PS2X_SIF_TRACE");
+            return value ? std::atoi(value) : 0;
+        }();
+        if (s_traceSif && runtime)
+        {
+            for (uint32_t i = 0; i < pendingCount; ++i)
+            {
+                std::fprintf(stderr, "[sif:dma] t=%llu ra=%x i=%u src=%x dst=%x size=%x attr=%x",
+                             static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()),
+                             getRegU32(ctx, 31), i, pending[i].src, pending[i].dest,
+                             static_cast<uint32_t>(pending[i].size), static_cast<uint32_t>(pending[i].attr));
+                if (s_traceSif >= 2)
+                {
+                    uint32_t words[16] = {};
+                    const uint32_t bytes = std::min<uint32_t>(sizeof(words), static_cast<uint32_t>(pending[i].size));
+                    if (readEeRange(rdram, pending[i].src, reinterpret_cast<uint8_t *>(words), bytes))
+                    {
+                        std::fprintf(stderr, " data=");
+                        for (uint32_t w = 0; w < bytes / 4u; ++w)
+                            std::fprintf(stderr, "%08x ", words[w]);
+                    }
+                }
+                std::fprintf(stderr, "\n");
+            }
         }
 
         if (ok)

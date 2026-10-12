@@ -16,6 +16,7 @@ extern "C"
 }
 #endif
 
+#include <cstdio>
 #include <cstdlib>
 #include <deque>
 #include <memory>
@@ -1957,8 +1958,20 @@ namespace ps2_stubs
         }
     }
 
+    // PS2X_MPEG_TRACE=1 logs libmpeg calls with the VSync they were made on.
+    static void traceMpegCall(const char *name, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        static const bool s_trace = std::getenv("PS2X_MPEG_TRACE") != nullptr;
+        if (!s_trace || !runtime)
+            return;
+        std::fprintf(stderr, "[mpeg:call] t=%llu tid=%d %s a0=%x a1=%x a2=%x a3=%x ra=%x\n",
+                     static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), runtime->eeScheduler().currentThreadId(), name,
+                     getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7), getRegU32(ctx, 31));
+    }
+
     void sceMpegFlush(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegFlush", ctx, runtime);
         (void)rdram;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         bool wakePictureWaiter = false;
@@ -1983,6 +1996,7 @@ namespace ps2_stubs
 
     void sceMpegAddBs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegAddBs", ctx, runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
@@ -2018,6 +2032,7 @@ namespace ps2_stubs
 
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegAddCallback", ctx, runtime);
         (void)rdram;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2047,6 +2062,7 @@ namespace ps2_stubs
 
     void sceMpegAddStrCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegAddStrCallback", ctx, runtime);
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t streamType = getRegU32(ctx, 5);
@@ -2065,6 +2081,7 @@ namespace ps2_stubs
 
     void sceMpegClearRefBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegClearRefBuff", ctx, runtime);
         (void)ctx;
         (void)runtime;
         static const uint32_t kRefGlobalAddrs[] = {
@@ -2101,6 +2118,7 @@ namespace ps2_stubs
 
     void sceMpegCreate(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegCreate", ctx, runtime);
         const uint32_t param_1 = getRegU32(ctx, 4); // a0
         const uint32_t param_2 = getRegU32(ctx, 5); // a1
         const uint32_t param_3 = getRegU32(ctx, 6); // a2
@@ -2180,6 +2198,7 @@ namespace ps2_stubs
 
     void sceMpegDelete(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegDelete", ctx, runtime);
         (void)rdram;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2194,6 +2213,7 @@ namespace ps2_stubs
 
     void sceMpegDemuxPss(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegDemuxPss", ctx, runtime);
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t dataAddr = getRegU32(ctx, 5);
         const uint32_t byteCount = getRegU32(ctx, 6);
@@ -2263,6 +2283,7 @@ namespace ps2_stubs
 
     void sceMpegDemuxPssRing(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegDemuxPssRing", ctx, runtime);
         static std::atomic<uint32_t> s_demuxRingEntryCount{0u};
         const uint32_t entryIdx = s_demuxRingEntryCount.fetch_add(1u, std::memory_order_relaxed);
         if (entryIdx < 4u)
@@ -2425,6 +2446,11 @@ namespace ps2_stubs
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
                 }
+                static const bool s_traceWait = std::getenv("PS2X_MPEG_TRACE") != nullptr;
+                if (s_traceWait)
+                    std::fprintf(stderr, "[mpeg:wait] t=%llu mpeg=%x nodataRequests=%u sawInput=%d\n",
+                                 static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), mpegAddr,
+                                 playback.nodataRequestsWithoutInput, playback.sawInput ? 1 : 0);
                 // libmpeg asks the game for more bitstream when the IPU runs dry.
                 // Run the guest sceMpegCbNodata callback (it DMAs data to the
                 // IPU, which reaches the decoder through installIpuInputSink),
@@ -2565,6 +2591,19 @@ namespace ps2_stubs
             }
         }
 
+        static const bool s_traceMpeg = std::getenv("PS2X_MPEG_TRACE") != nullptr;
+        if (s_traceMpeg)
+        {
+            std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+            const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+            std::fprintf(stderr, "[mpeg:pic] t=%llu tid=%d mpeg=%x img=%x have=%d frame=%u size=%ux%u queued=%zu ended=%d failed=%d sawInput=%d eof=%d gen=%llu\n",
+                         static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()), runtime->eeScheduler().currentThreadId(), mpegAddr, imageAddr,
+                         haveFrame ? 1 : 0, frameCount, width, height, playback.decodedFrames.size(),
+                         playback.streamEnded ? 1 : 0, playback.decoderFailed ? 1 : 0, playback.sawInput ? 1 : 0,
+                         g_mpeg_stub_state.currentCdStreamEofSeen ? 1 : 0,
+                         static_cast<unsigned long long>(g_mpeg_stub_state.cdStreamGeneration));
+        }
+
         if (haveFrame)
         {
             writeDecodedFrameToGuest(rdram, imageAddr, frame);
@@ -2589,6 +2628,7 @@ namespace ps2_stubs
 
     void sceMpegInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegInit", ctx, runtime);
         (void)rdram;
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         const uint64_t cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
@@ -2608,6 +2648,7 @@ namespace ps2_stubs
 
     void sceMpegIsEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegIsEnd", ctx, runtime);
         (void)rdram;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
 
@@ -2650,6 +2691,7 @@ namespace ps2_stubs
 
     void sceMpegIsRefBuffEmpty(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegIsRefBuffEmpty", ctx, runtime);
         (void)rdram;
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2660,6 +2702,7 @@ namespace ps2_stubs
 
     void sceMpegReset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegReset", ctx, runtime);
         (void)runtime;
         const uint32_t param_1 = getRegU32(ctx, 4);
         {
@@ -2703,6 +2746,7 @@ namespace ps2_stubs
 
     void sceMpegSetDecodeMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegSetDecodeMode", ctx, runtime);
         (void)rdram;
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);
@@ -2721,6 +2765,7 @@ namespace ps2_stubs
 
     void sceMpegSetImageBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        traceMpegCall("sceMpegSetImageBuff", ctx, runtime);
         (void)rdram;
         (void)runtime;
         const uint32_t mpegAddr = getRegU32(ctx, 4);

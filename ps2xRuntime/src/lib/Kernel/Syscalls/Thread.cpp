@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "Thread.h"
 #include "runtime/ee_scheduler.h"
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2_syscalls
 {
@@ -144,6 +146,22 @@ namespace ps2_syscalls
             EeScheduler &ee = scheduler(rdram, ctx, runtime);
             const int id = static_cast<int>(getRegU32(ctx, 4));
             const int result = ee.wakeupThread(id, interruptSafe);
+            // PS2X_WAKE_TRACE=<tid> logs every wakeup aimed at that thread.
+            static const int s_traceTarget = []()
+            {
+                const char *value = std::getenv("PS2X_WAKE_TRACE");
+                return value ? std::atoi(value) : -1;
+            }();
+            if (id == s_traceTarget)
+            {
+                const GuestThread *target = ee.thread(id);
+                std::fprintf(stderr, "[wake] t=%llu from=%d irq=%d ra=%x result=%d status=%d wait=%d count=%u\n",
+                             static_cast<unsigned long long>(ee.currentVSyncTick()), ee.currentThreadId(),
+                             interruptSafe ? 1 : 0, getRegU32(ctx, 31), result,
+                             target ? static_cast<int>(target->status) : -1,
+                             target ? static_cast<int>(target->wait.reason) : -1,
+                             target ? target->wakeupCount : 0u);
+            }
             setReturnS32(ctx, threadIdOnSuccess(result, id));
             ee.transferIfRequested(interruptSafe);
         }

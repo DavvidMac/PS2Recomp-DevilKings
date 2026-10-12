@@ -470,6 +470,23 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
 void EeScheduler::dumpThreadsForDiagnostics() const
 {
     // PS2X_THREAD_DUMP=<n>: print every guest thread's state every n VSyncs.
+    // PS2X_RDRAM_DUMP=<vsync>:<path> writes the 32 MiB of EE RAM at that VSync.
+    static const char *rdramDump = std::getenv("PS2X_RDRAM_DUMP");
+    if (rdramDump && *rdramDump)
+    {
+        char *pathStart = nullptr;
+        const uint64_t dumpTick = std::strtoull(rdramDump, &pathStart, 10);
+        if (pathStart && *pathStart == ':' && m_vsyncTick == dumpTick)
+        {
+            if (std::FILE *file = std::fopen(pathStart + 1, "wb"))
+            {
+                std::fwrite(m_runtime.memory().getRDRAM(), 1, PS2_RAM_SIZE, file);
+                std::fclose(file);
+                std::cerr << "[rdram-dump] vsync=" << m_vsyncTick << " -> " << (pathStart + 1) << std::endl;
+            }
+        }
+    }
+
     static const uint64_t interval = []() -> uint64_t
     {
         const char *value = std::getenv("PS2X_THREAD_DUMP");
@@ -492,6 +509,34 @@ void EeScheduler::dumpThreadsForDiagnostics() const
                   << " pc=0x" << context.pc
                   << " ra=0x" << GPR_U32(contextPtr, 31)
                   << std::dec << " invocations=" << thread.invocations.size() << std::endl;
+    }
+
+    // PS2X_PEEK=<addr>[:<words>],...: print guest memory words with each dump.
+    static const char *peek = std::getenv("PS2X_PEEK");
+    if (peek && *peek)
+    {
+        const uint8_t *rdram = m_runtime.memory().getRDRAM();
+        const char *cursor = peek;
+        while (*cursor)
+        {
+            char *end = nullptr;
+            const uint32_t address = static_cast<uint32_t>(std::strtoul(cursor, &end, 16));
+            uint32_t words = 1u;
+            if (end && *end == ':')
+                words = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+            std::fprintf(stderr, "  peek %08x:", address);
+            for (uint32_t i = 0; i < words && i < 64u; ++i)
+            {
+                uint32_t value = 0u;
+                const uint32_t offset = (address + i * 4u) & 0x01FFFFFCu;
+                std::memcpy(&value, rdram + offset, sizeof(value));
+                std::fprintf(stderr, " %08x", value);
+            }
+            std::fprintf(stderr, "\n");
+            if (!end || *end != ',')
+                break;
+            cursor = end + 1;
+        }
     }
 }
 

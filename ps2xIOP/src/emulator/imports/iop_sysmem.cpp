@@ -5,10 +5,22 @@
 #include "iop_format.h"
 #include "ps2x/iop/iop_host.h"
 
+#include <cstdio>
+#include <cstdlib>
 #include <string>
 
 namespace ps2x::iop::detail
 {
+    namespace
+    {
+        // PS2X_IOPHEAP_TRACE=1 logs IOP heap allocations and frees.
+        bool traceHeap()
+        {
+            static const bool s_trace = std::getenv("PS2X_IOPHEAP_TRACE") != nullptr;
+            return s_trace;
+        }
+    }
+
     IopSysmem::IopSysmem(IopHost &host, IopMemory &memory) noexcept
         : m_host(host), m_memory(memory)
     {
@@ -31,10 +43,14 @@ namespace ps2x::iop::detail
             const uint32_t address = a0 == 2u
                                          ? m_memory.allocate(a1, 16u, a2)
                                          : m_memory.allocate(a1, 16u);
+            if (traceHeap())
+                std::fprintf(stderr, "[iopheap] iop-alloc mode=%u size=%x -> %x ra=%x\n", a0, a1, address, cpu.gpr[31]);
             setV0(address);
             return true;
         }
         case 5: // FreeSysMemory
+            if (traceHeap())
+                std::fprintf(stderr, "[iopheap] iop-free %x ra=%x\n", a0, cpu.gpr[31]);
             setV0(m_memory.freeAllocation(a0) ? 0u : 0xFFFFFFFFu);
             return true;
         case 6: // QueryMemSize

@@ -2,6 +2,8 @@
 #include "CD.h"
 #include "MPEG.h"
 #include "runtime/ee_scheduler.h"
+#include <cstdio>
+#include <cstdlib>
 
 namespace ps2_stubs
 {
@@ -210,6 +212,12 @@ namespace ps2_stubs
         const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
         const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
 
+        // PS2X_CD_TRACE=1 logs every read with the VSync it was issued on.
+        static const bool s_traceAll = std::getenv("PS2X_CD_TRACE") != nullptr;
+        if (s_traceAll)
+            std::fprintf(stderr, "[cd:read] t=%llu ra=%x lbn=%x sectors=%x buf=%x\n",
+                         static_cast<unsigned long long>(runtime->eeScheduler().currentVSyncTick()),
+                         getRegU32(ctx, 31), a0, a1, a2);
         static uint32_t traceCount = 0;
         if (traceCount < 128u || (traceCount % 512u) == 0u)
         {
