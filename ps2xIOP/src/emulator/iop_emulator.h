@@ -37,6 +37,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] bool isMemoryRange(uint32_t address, size_t size) const;
 
         [[nodiscard]] uint64_t cycles() const noexcept;
+        // SPU2 output: copies up to frames 48 kHz stereo frames, any thread.
+        size_t readAudio(int16_t *destination, size_t frames);
         [[nodiscard]] uint64_t instructions() const noexcept;
         [[nodiscard]] uint32_t loadedModuleCount() const noexcept;
         [[nodiscard]] uint32_t threadCount() const noexcept;

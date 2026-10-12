@@ -1,5 +1,7 @@
 #pragma once
 
+#include "iop_spu2.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <array>
@@ -76,6 +78,8 @@ namespace ps2x::iop::detail
         // IOP cycle counter used to pace SPU2 AutoDMA transfers in real time.
         void setCycleCounter(const uint64_t *counter) noexcept { m_cycleCounter = counter; }
 
+        [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
+
     private:
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
@@ -100,5 +104,6 @@ namespace ps2x::iop::detail
             uint64_t bytes = 0;
         };
         std::array<SpuAutoDma, 2> m_spuAutoDma{};
+        Spu2 m_spu2;
     };
 }

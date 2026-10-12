@@ -1628,6 +1628,8 @@ namespace ps2_stubs
         constexpr uint32_t kMpegCbNodata = 1u;
         constexpr uint32_t kMaxNodataRequestsWithoutInput = 4u;
 
+        void pullIpuInputUntilFrame(PS2Runtime *runtime, uint32_t mpegAddr);
+
         // Games that drive the IPU themselves (CRI Sofdec) feed the bitstream
         // through DMA channel 4 from their sceMpegCbNodata callback instead of
         // sceMpegAddBs. Route those transfers into the HLE decoder.
@@ -1639,6 +1641,18 @@ namespace ps2_stubs
                 return;
             }
             s_installed = true;
+            runtime->memory().setIpuDmaKickCallback([runtime]()
+            {
+                uint32_t mpegAddr = 0u;
+                {
+                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                    mpegAddr = g_mpeg_stub_state.activeIpuMpeg;
+                }
+                if (mpegAddr != 0u)
+                {
+                    pullIpuInputUntilFrame(runtime, mpegAddr);
+                }
+            });
             runtime->memory().setIpuInputCallback([runtime](const uint8_t *data, uint32_t size)
             {
                 uint32_t mpegAddr = 0u;
@@ -1661,6 +1675,30 @@ namespace ps2_stubs
                     runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
                 }
             });
+        }
+
+        // Drain the running toIPU chain until the decoder has a picture queued
+        // for mpegAddr. The chain only stops at the end tag libmpeg's vibuf places
+        // after the last chunk it has filled, so this never outruns the producer.
+        void pullIpuInputUntilFrame(PS2Runtime *runtime, uint32_t mpegAddr)
+        {
+            static constexpr uint32_t kIpuPullBytes = 16u * 1024u;
+            for (uint32_t attempt = 0u; attempt < 64u; ++attempt)
+            {
+                {
+                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                    const MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                    if (!playback.decodedFrames.empty() || playback.streamEnded || playback.decoderFailed)
+                    {
+                        return;
+                    }
+                    g_mpeg_stub_state.activeIpuMpeg = mpegAddr;
+                }
+                if (runtime->memory().pullIpuInputDma(kIpuPullBytes) == 0u)
+                {
+                    return;
+                }
+            }
         }
 
         const MpegRegisteredCallback *findNodataCallbackUnlocked(uint32_t mpegAddr)
@@ -1760,8 +1798,8 @@ namespace ps2_stubs
             const uint32_t macroblockColumns = outWidth / 16u;
             // sceIpuRGB32 macroblocks (16x16, 1024 bytes) are stored column by
             // column by default, which matches games that upload 16-pixel wide
-            // strips. PS2X_MPEG_MB_RASTER=1 stores them in decode (raster) order,
-            // as CRI Sofdec expects before converting the picture itself.
+            // strips (CRI Sofdec included). PS2X_MPEG_MB_RASTER=1 stores them in
+            // decode (raster) order instead.
             static const bool s_rasterMacroblocks = []()
             {
                 const char *value = std::getenv("PS2X_MPEG_MB_RASTER");
@@ -2367,6 +2405,8 @@ namespace ps2_stubs
         uint32_t frameCount = 0u;
         bool haveFrame = false;
         MpegDecodedFrame frame;
+        installIpuInputSink(runtime);
+        pullIpuInputUntilFrame(runtime, mpegAddr);
         {
             std::unique_lock<std::mutex> lock(g_mpeg_stub_mutex);
             MpegPlaybackState &playback = getPlaybackState(mpegAddr);

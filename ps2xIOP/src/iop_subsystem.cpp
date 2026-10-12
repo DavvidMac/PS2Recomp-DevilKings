@@ -164,6 +164,11 @@ namespace ps2x::iop
         return true;
     }
 
+    size_t IopSubsystem::readAudio(int16_t *destination, size_t frames)
+    {
+        return m_impl->emulator.readAudio(destination, frames);
+    }
+
     void IopSubsystem::runEeCycles(uint64_t eeCycles) noexcept
     {
         m_impl->emulator.runEeCycles(eeCycles);

@@ -4,7 +4,9 @@
 #include "runtime/ps2_memory.h"
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -524,6 +526,69 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     return request;
 }
 
+void GS::latchPresentationOnDisplaySwap()
+{
+    if (!m_privRegs)
+        return;
+    const uint64_t dispfb1 = m_privRegs->dispfb1;
+    const uint64_t dispfb2 = m_privRegs->dispfb2;
+    const uint64_t previous1 = m_lastSwapDispfb1.exchange(dispfb1);
+    const uint64_t previous2 = m_lastSwapDispfb2.exchange(dispfb2);
+    if (previous1 == dispfb1 && previous2 == dispfb2)
+        return;
+    static const bool traceFps = std::getenv("PS2X_FPS_TRACE") != nullptr;
+    if (traceFps)
+    {
+        static uint32_t s_swaps = 0u;
+        static auto s_windowStart = std::chrono::steady_clock::now();
+        ++s_swaps;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - s_windowStart >= std::chrono::seconds(5))
+        {
+            const double seconds = std::chrono::duration<double>(now - s_windowStart).count();
+            std::fprintf(stderr, "[fps] game frames/s=%.1f vsync=%llu\n", s_swaps / seconds,
+                         static_cast<unsigned long long>(m_privRegs->vsyncTick.load()));
+            s_swaps = 0u;
+            s_windowStart = now;
+        }
+    }
+    m_lastSwapLatchTick.store(m_privRegs->vsyncTick.load(std::memory_order_acquire));
+    m_hasSwapLatch.store(true);
+
+    GSCpuBackend *cpuBackend = dynamic_cast<GSCpuBackend *>(m_backend.get());
+    if (!cpuBackend)
+    {
+        latchHostPresentationFrame();
+        return;
+    }
+    GSPresentationRequest request{};
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+        request = buildPresentationRequestUnlocked();
+    }
+    // Runs on the raster worker: only the presentation mutex may be taken here,
+    // the EE thread can be waiting on the queue while holding the state mutex.
+    cpuBackend->QueuePresent(request, [this](PresentationFrame &&frame)
+                             {
+        const bool hasFrame = static_cast<bool>(frame);
+        std::lock_guard<std::mutex> presentationLock(m_presentationMutex);
+        m_hostPresentationFrame = std::move(frame.pixels);
+        m_hostPresentationWidth = frame.width;
+        m_hostPresentationHeight = frame.height;
+        m_hostPresentationDisplayFbp = frame.displayFbp;
+        m_hostPresentationSourceFbp = frame.sourceFbp;
+        m_hostPresentationUsedPreferred = frame.usedPreferred;
+        m_hasHostPresentationFrame = hasFrame; });
+}
+
+bool GS::isPresentationSwapDriven(uint64_t vsyncTick) const
+{
+    // A game that stops flipping (single buffer, or a held frame) falls back to
+    // latching the live display every VSync.
+    constexpr uint64_t kSwapTimeoutTicks = 30u;
+    return m_hasSwapLatch.load() && vsyncTick < m_lastSwapLatchTick.load() + kSwapTimeoutTicks;
+}
+
 void GS::latchHostPresentationFrame()
 {
     GSPresentationRequest request{};
@@ -640,6 +705,7 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    latchPresentationOnDisplaySwap();
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;

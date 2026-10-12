@@ -4,13 +4,22 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <condition_variable>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 class GSCpuBackend final : public GSRasterBackend
 {
 public:
     GSCpuBackend();
+    ~GSCpuBackend() override;
+
+    // Presentation snapshot taken in queue order: the sink receives the frame
+    // as VRAM stood after every primitive submitted before this call.
+    using PresentSink = std::function<void(PresentationFrame &&)>;
+    void QueuePresent(const GSPresentationRequest &request, PresentSink sink);
 
     void Initialize(uint8_t *vram, uint32_t vramSize) override;
     void Reset() override;
@@ -82,6 +91,85 @@ private:
     std::array<uint16_t, 512> m_clut{};
     std::array<uint32_t, 2> m_clutCbp{};
     GSMem::TexturePageCache m_texturePageCache;
+
+    // Textures decoded to RGBA8888 in 32x32 tiles on first use, so sampling
+    // avoids swizzled reads and CLUT lookups per texel. Entries are dropped
+    // when any VRAM page they cover is written or the CLUT is reloaded.
+    struct DecodedTexture
+    {
+        bool valid = false;
+        uint32_t tbp = 0;
+        uint32_t tbw = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint8_t psm = 0;
+        uint8_t cpsm = 0;
+        uint8_t csm = 0;
+        uint8_t csa = 0;
+        uint8_t ta0 = 0;
+        uint8_t ta1 = 0;
+        bool aem = false;
+        uint64_t clutVersion = 0;
+        uint64_t epoch = 0;
+        uint64_t lastUse = 0;
+        uint32_t firstPage = 0;
+        uint32_t pageCount = 0;
+        uint32_t tilesX = 0;
+        std::vector<uint32_t> texels;
+        std::vector<uint8_t> tileReady;
+    };
+    std::array<DecodedTexture, 8> m_decodedTextures{};
+    std::array<uint64_t, 512> m_pageWriteEpoch{};
+    uint64_t m_writeEpoch = 1;
+    uint64_t m_clutVersion = 0;
+    uint64_t m_decodeUseCounter = 0;
+    DecodedTexture *m_activeTexture = nullptr;
+
+    // Asynchronous rasterisation: Submit queues primitives for a worker thread
+    // and every other entry point drains the queue first, so the observable
+    // order of GS operations is unchanged. Opt in with PS2X_GS_ASYNC=1 (callers
+    // that read VRAM memory directly, like unit tests, need inline drawing).
+    void DrainQueue() const;
+    void WorkerLoop();
+    bool m_asyncResolved = false;
+    bool m_async = false;
+    mutable std::mutex m_queueMutex;
+    mutable std::condition_variable m_queueCv;
+    mutable std::condition_variable m_idleCv;
+    struct QueuedWork
+    {
+        enum class Kind : uint8_t
+        {
+            Draw,
+            Present,
+            Clut,
+            TextureFlush,
+            Transfer,
+            Upload
+        };
+        Kind kind = Kind::Draw;
+        GSPrimitiveBatch batch{};
+        GSPresentationRequest request{};
+        PresentSink sink;
+        GSTex0Reg tex0{};
+        GSTexClutReg texclut{};
+        GSTransferCommand transfer{};
+        std::vector<uint8_t> payload;
+    };
+    bool EnqueueWork(const std::function<void(QueuedWork &)> &fill);
+    void LoadClutStateUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+    void TextureFlushUnlocked();
+    void BeginTransferUnlocked(const GSTransferCommand &command);
+    void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
+    std::vector<QueuedWork> m_queue;
+    bool m_workerBusy = false;
+    bool m_stopWorker = false;
+    std::thread m_worker;
+    void MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
+    void InvalidateDecodedTexturesUnlocked();
+    void PrepareTextureCacheUnlocked(const GSDrawState &state);
+    uint32_t DecodeTexelUnlocked(const GSDrawState &state, int u, int v);
+    uint32_t FetchDecodedTexelUnlocked(const GSDrawState &state, int u, int v);
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

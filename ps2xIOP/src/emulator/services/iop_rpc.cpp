@@ -244,9 +244,22 @@ namespace ps2x::iop::detail
             m_kernel.sleepCurrent(cpu);
             setV0(0);
             return true;
-        case 23:
+        case 23: // sceSifGetOtherData(rd, eeSource, iopDestination, size, mode)
+        {
+            // Pulls EE memory into IOP RAM over SIF; CSE streams its sound banks
+            // this way before DMAing them into SPU2 RAM.
+            const uint32_t source = cpu.gpr[5];
+            const uint32_t destination = cpu.gpr[6];
+            const int32_t size = static_cast<int32_t>(cpu.gpr[7]);
+            if (size > 0 && static_cast<uint32_t>(size) <= IopMemory::RamSize)
+            {
+                std::vector<uint8_t> buffer(static_cast<size_t>(size));
+                if (m_host.readGuest(source, buffer.data(), buffer.size()))
+                    (void)m_memory.writeRam(destination, buffer.data(), buffer.size());
+            }
             setV0(0);
             return true;
+        }
         case 24: // RemoveRpc
         {
             const uint32_t serverData = cpu.gpr[4];

@@ -38,6 +38,7 @@ namespace ps2x::iop::detail
         m_interruptControl = 1;
         m_dmaStart.reset();
         m_spuAutoDma = {};
+        m_spu2.reset();
     }
 
     uint32_t IopMemory::physicalAddress(uint32_t address) noexcept
@@ -65,6 +66,9 @@ namespace ps2x::iop::detail
             std::memcpy(&value, m_ram.data() + phys, sizeof(value));
             return value;
         }
+        uint16_t spuValue = 0u;
+        if (Spu2::isRegister(phys) && (phys & 1u) == 0u && m_spu2.read16(phys, spuValue))
+            return spuValue;
         return static_cast<uint16_t>(read8(address) | (static_cast<uint16_t>(read8(address + 1u)) << 8u));
     }
 
@@ -84,7 +88,11 @@ namespace ps2x::iop::detail
             return value;
         }
         if ((phys & 3u) == 0u && isHardwareAddress(phys))
+        {
+            if (Spu2::isRegister(phys))
+                return static_cast<uint32_t>(read16(phys)) | (static_cast<uint32_t>(read16(phys + 2u)) << 16u);
             return readHardware32(phys);
+        }
 
         return static_cast<uint32_t>(read8(address)) |
                (static_cast<uint32_t>(read8(address + 1u)) << 8u) |
@@ -124,6 +132,12 @@ namespace ps2x::iop::detail
         }
         write8(address, static_cast<uint8_t>(value));
         write8(address + 1u, static_cast<uint8_t>(value >> 8u));
+        if (Spu2::isRegister(phys) && (phys & 1u) == 0u)
+        {
+            if (m_cycleCounter)
+                m_spu2.advanceTo(*m_cycleCounter);
+            m_spu2.write16(phys, value);
+        }
     }
 
     void IopMemory::write32(uint32_t address, uint32_t value)
@@ -143,6 +157,13 @@ namespace ps2x::iop::detail
         if ((phys & 3u) == 0u)
         {
             writeHardware32(phys, value);
+            if (Spu2::isRegister(phys))
+            {
+                if (m_cycleCounter)
+                    m_spu2.advanceTo(*m_cycleCounter);
+                m_spu2.write16(phys, static_cast<uint16_t>(value));
+                m_spu2.write16(phys + 2u, static_cast<uint16_t>(value >> 16u));
+            }
             return;
         }
         write8(address, static_cast<uint8_t>(value));
@@ -290,6 +311,17 @@ namespace ps2x::iop::detail
         if (const auto current = m_hardware.find(0x1F9001B0u + core * 0x400u); current != m_hardware.end())
             admas = current->second & 0xFFFFu;
         m_spuAutoDma[core] = {};
+        if ((value & 1u) != 0u)
+        {
+            // Memory -> SPU2: AutoDMA streams PCM, otherwise data lands at TSA.
+            uint32_t source = 0u;
+            if (const auto current = m_hardware.find(address - 8u); current != m_hardware.end())
+                source = physicalAddress(current->second);
+            const uint64_t bytes = std::min<uint64_t>(transferWords * 4u, source < RamSize ? RamSize - source : 0u);
+            if (m_cycleCounter)
+                m_spu2.advanceTo(*m_cycleCounter);
+            m_spu2.dmaWrite(core, m_ram.data() + source, static_cast<uint32_t>(bytes), admas != 0u);
+        }
         if (admas != 0u && m_cycleCounter)
         {
             constexpr uint64_t kIopCyclesPerSample = 768u;

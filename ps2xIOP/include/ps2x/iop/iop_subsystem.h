@@ -43,6 +43,9 @@ namespace ps2x::iop
 
         [[nodiscard]] DebugSnapshot debugSnapshot() const;
 
+        // SPU2 output: up to frames 48 kHz stereo frames; callable from any thread.
+        size_t readAudio(int16_t *destination, size_t frames);
+
     private:
         class Impl;
         std::unique_ptr<Impl> m_impl;

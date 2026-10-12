@@ -440,10 +440,25 @@ void EeScheduler::syncCyclesToHostTime() noexcept
         m_hostSyncCycleBase = m_eeCycle;
         return;
     }
-    // Only the EE clock (timers, VSync deadlines) is pulled forward. The IOP keeps
-    // advancing with executed guest work: the interpreter can be slower than
-    // real time, and feeding it host time would starve the EE.
-    advanceEeClock(static_cast<uint32_t>(std::min<uint64_t>(behind, kVBlankPeriodCycles)));
+    // Pull the EE clock (timers, VSync deadlines) forward, and the IOP with it:
+    // IOP sound modules pace SPU2 output by their cycle count, so an IOP that
+    // only advances with checkpoint charges plays audio (and drives the movie
+    // clocks that follow it) far slower than real time. An idle IOP skips to its
+    // next wake-up, so this is cheap. PS2X_IOP_HOST_SYNC=0 restores EE-only sync.
+    static const bool iopHostSync = []()
+    {
+        const char *value = std::getenv("PS2X_IOP_HOST_SYNC");
+        return !(value && value[0] == '0');
+    }();
+    const uint32_t step = static_cast<uint32_t>(std::min<uint64_t>(behind, kVBlankPeriodCycles));
+    if (iopHostSync)
+    {
+        accountCycles(step);
+    }
+    else
+    {
+        advanceEeClock(step);
+    }
 }
 
 void EeScheduler::accountCycles(uint32_t cycles) noexcept

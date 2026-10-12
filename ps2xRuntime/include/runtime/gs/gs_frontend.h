@@ -2,6 +2,7 @@
 #define PS2_GS_FRONTEND_H
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -130,6 +131,12 @@ public:
     void setDebugHistoryPaused(bool paused);
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    // Double-buffered games may overlap their two frame buffers in VRAM, so the
+    // displayed one is only intact until the next frame starts drawing. Latch
+    // the presentation frame when DISPFB changes (the buffer was just finished)
+    // and report whether such swaps are driving presentation.
+    void latchPresentationOnDisplaySwap();
+    bool isPresentationSwapDriven(uint64_t vsyncTick) const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -229,6 +236,10 @@ private:
     uint32_t m_hostPresentationSourceFbp = 0;
     bool m_hostPresentationUsedPreferred = false;
     bool m_hasHostPresentationFrame = false;
+    std::atomic<uint64_t> m_lastSwapDispfb1{0};
+    std::atomic<uint64_t> m_lastSwapDispfb2{0};
+    std::atomic<uint64_t> m_lastSwapLatchTick{0};
+    std::atomic<bool> m_hasSwapLatch{false};
     uint64_t m_nativeImageUploadCount = 0;
     uint64_t m_nativePackedGIFPacketCount = 0;
 

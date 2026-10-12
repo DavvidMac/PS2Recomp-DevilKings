@@ -321,6 +321,11 @@ public:
     // decoding is done by the libmpeg HLE, which consumes the bitstream here.
     using IpuInputCallback = std::function<void(const uint8_t *, uint32_t)>;
     void setIpuInputCallback(IpuInputCallback cb) { m_ipuInputCallback = std::move(cb); }
+    // Drain up to maxBytes (whole tags) from an active toIPU source chain into
+    // the IPU input callback; returns the number of bytes delivered.
+    uint32_t pullIpuInputDma(uint32_t maxBytes);
+    // Called when the game (re)starts a toIPU source chain.
+    void setIpuDmaKickCallback(std::function<void()> cb) { m_ipuDmaKickCallback = std::move(cb); }
 
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
@@ -404,6 +409,7 @@ public:
 
     GifPacketCallback m_gifPacketCallback;
     IpuInputCallback m_ipuInputCallback;
+    std::function<void()> m_ipuDmaKickCallback;
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
@@ -457,6 +463,7 @@ public:
     std::array<EeTimer, 4> m_eeTimers{};
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     bool tryProcessIpuInputDma(uint32_t channelBase, uint32_t chcr);
+    void appendIpuDmaData(std::vector<uint8_t> &payload, uint32_t srcAddr, uint32_t qwCount);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
 };

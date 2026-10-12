@@ -590,6 +590,7 @@ namespace ps2x::iop::detail
                     if (totalCycles == before)
                         ++totalCycles;
                 }
+                memory.spu2().advanceTo(totalCycles);
             }
             catch (...)
             {
@@ -864,6 +865,11 @@ namespace ps2x::iop::detail
             return false;
         const uint32_t physical = IopMemory::physicalAddress(address);
         return physical <= IopMemory::RamSize && size <= IopMemory::RamSize - physical;
+    }
+
+    size_t IopEmulator::readAudio(int16_t *destination, size_t frames)
+    {
+        return m_impl->memory.spu2().readOutput(destination, frames);
     }
 
     uint64_t IopEmulator::cycles() const noexcept

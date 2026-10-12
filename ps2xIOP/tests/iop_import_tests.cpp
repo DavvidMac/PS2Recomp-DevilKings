@@ -420,12 +420,71 @@ namespace
                expect(executor.lastGp == 0x89AB0u, "timer callback lost the registering module GP") &&
                expect(timrman.nextEventCycle(1000u) == 300u, "timer callback return did not rearm compare");
     }
+
+    bool testSpu2VoiceAndAutoDma()
+    {
+        {
+            IopMemory memory;
+            uint64_t cycles = 0u;
+            memory.setCycleCounter(&cycles);
+            // One looping ADPCM block (shift 0, filter 0, nibbles 7) at halfword 0x2000.
+            memory.write16(0x1F9001A8u, 0u);
+            memory.write16(0x1F9001AAu, 0x2000u);
+            memory.write16(0x1F9001ACu, 0x0600u);
+            for (int i = 0; i < 7; ++i)
+                memory.write16(0x1F9001ACu, 0x7777u);
+            memory.write16(0x1F9001C0u, 0u);
+            memory.write16(0x1F9001C2u, 0x2000u);
+            memory.write16(0x1F900004u, 0x1000u); // pitch: 48 kHz
+            memory.write16(0x1F900006u, 0x000Fu); // fastest attack
+            memory.write16(0x1F900008u, 0u);
+            memory.write16(0x1F900000u, 0x3FFFu);
+            memory.write16(0x1F900002u, 0x3FFFu);
+            memory.write16(0x1F900188u, 1u);
+            memory.write16(0x1F900190u, 1u);
+            memory.write16(0x1F9001A0u, 1u); // key on voice 0
+            cycles = 768u * 64u;
+            memory.spu2().advanceTo(cycles);
+            int16_t frames[64 * 2] = {};
+            const size_t count = memory.spu2().readOutput(frames, 64u);
+            bool audible = false;
+            for (size_t i = 0; i < count; ++i)
+                audible = audible || frames[i * 2u] > 1000;
+            if (count != 64u || !audible || memory.read16(0x1F90000Au) == 0u)
+            {
+                std::cerr << "SPU2 voice should play a keyed-on ADPCM block\n";
+                return false;
+            }
+        }
+        {
+            IopMemory memory;
+            uint64_t cycles = 0u;
+            memory.setCycleCounter(&cycles);
+            memory.spu2().advanceTo(0u);
+            int16_t block[512] = {};
+            for (int i = 0; i < 256; ++i)
+            {
+                block[i] = 1000;
+                block[256 + i] = -1000;
+            }
+            memory.spu2().dmaWrite(0u, reinterpret_cast<const uint8_t *>(block), sizeof(block), true);
+            cycles = 768u * 4u;
+            memory.spu2().advanceTo(cycles);
+            int16_t frames[8] = {};
+            if (memory.spu2().readOutput(frames, 4u) != 4u || frames[0] < 900 || frames[1] > -900)
+            {
+                std::cerr << "SPU2 AutoDMA input should reach the output\n";
+                return false;
+            }
+        }
+        return true;
+    }
 }
 
 int main()
 {
     if (!testLoadcoreRebootLibraryMode() || !testCdvdSpecialControl() || !testCdvdSearchFile() ||
-        !testTimrmanPeriodicCallback() || !testMailboxes())
+        !testTimrmanPeriodicCallback() || !testMailboxes() || !testSpu2VoiceAndAutoDma())
         return 1;
     std::cout << "ps2xIOP import tests passed\n";
     return 0;

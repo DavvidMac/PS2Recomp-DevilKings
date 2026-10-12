@@ -19,6 +19,7 @@
 #include <fstream>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <chrono>
@@ -379,6 +380,36 @@ namespace
     }
 }
 
+namespace
+{
+    // SPU2 output from the IOP, pulled by raylib's audio thread.
+    std::atomic<ps2x::iop::IopSubsystem *> g_spu2AudioSource{nullptr};
+#if !defined(PLATFORM_VITA)
+    AudioStream g_spu2Stream{};
+
+    void spu2AudioCallback(void *buffer, unsigned int frames)
+    {
+        auto *out = static_cast<int16_t *>(buffer);
+        size_t produced = 0u;
+        if (ps2x::iop::IopSubsystem *iop = g_spu2AudioSource.load())
+            produced = iop->readAudio(out, frames);
+        std::fill(out + produced * 2u, out + static_cast<size_t>(frames) * 2u, int16_t{0});
+
+        // PS2X_AUDIO_DUMP=<file>: append the played 48 kHz stereo s16 PCM.
+        static FILE *s_dump = []() -> FILE *
+        {
+            const char *path = std::getenv("PS2X_AUDIO_DUMP");
+            return (path && *path) ? std::fopen(path, "wb") : nullptr;
+        }();
+        if (s_dump)
+        {
+            std::fwrite(out, sizeof(int16_t) * 2u, frames, s_dump);
+            std::fflush(s_dump);
+        }
+    }
+#endif
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -396,7 +427,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     const bool needsLatch = !s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick;
     if (needsLatch)
     {
-        rt->gs().latchHostPresentationFrame();
+        rt->gs().latchPresentationOnDisplaySwap();
+        if (!rt->gs().isPresentationSwapDriven(currentTick))
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
@@ -481,13 +514,72 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
         const bool havePrevious = s_previousFieldWidth == width && s_previousFieldHeight == height &&
                                   s_previousField.size() >= rowBytes * height;
-        const uint32_t parity = static_cast<uint32_t>(currentTick & 1u);
-        for (uint32_t y = 0; y < height && (y + 1u) * rowBytes <= s_scratch.size(); ++y)
+        // Which output rows the current field owns. The latched field can lag the
+        // VSync it is shown on (asynchronous rasterisation, dropped frames), so
+        // pick the order that combs least against the previous field instead of
+        // trusting VSync parity, and only switch on a clear win.
+        static uint32_t s_fieldParity = 0u;
+        uint32_t parity = static_cast<uint32_t>(currentTick & 1u);
+        if (havePrevious && height > 4u)
+        {
+            uint64_t combEven = 0u; // current on even rows: missing row above is previous[y-1]
+            uint64_t combOdd = 0u;  // current on odd rows: missing row below is previous[y+1]
+            for (uint32_t y = 1u; y + 1u < height; y += 2u)
+            {
+                const uint8_t *current = s_scratch.data() + static_cast<size_t>(y) * rowBytes;
+                const uint8_t *above = s_previousField.data() + static_cast<size_t>(y - 1u) * rowBytes;
+                const uint8_t *below = s_previousField.data() + static_cast<size_t>(y + 1u) * rowBytes;
+                for (uint32_t x = 0; x < width; x += 4u)
+                {
+                    const uint8_t *c = current + x * 4u;
+                    const uint8_t *a = above + x * 4u;
+                    const uint8_t *b = below + x * 4u;
+                    for (uint32_t ch = 0; ch < 3u; ++ch)
+                    {
+                        combEven += static_cast<uint32_t>(std::abs(static_cast<int>(c[ch]) - static_cast<int>(a[ch])));
+                        combOdd += static_cast<uint32_t>(std::abs(static_cast<int>(c[ch]) - static_cast<int>(b[ch])));
+                    }
+                }
+            }
+            if (combEven * 5u < combOdd * 4u)
+                s_fieldParity = 0u;
+            else if (combOdd * 5u < combEven * 4u)
+                s_fieldParity = 1u;
+            parity = s_fieldParity;
+        }
+        const uint32_t fieldRows = std::min<uint32_t>(height, static_cast<uint32_t>(s_scratch.size() / rowBytes));
+        for (uint32_t y = 0; y < fieldRows; ++y)
         {
             const uint8_t *current = s_scratch.data() + static_cast<size_t>(y) * rowBytes;
             const uint8_t *previous = havePrevious ? s_previousField.data() + static_cast<size_t>(y) * rowBytes : current;
+            // The missing line sits between current lines y and y+1 (even
+            // field) or y-1 and y (odd field).
+            const uint32_t neighbourY = parity == 0u ? std::min(y + 1u, fieldRows - 1u) : (y == 0u ? 0u : y - 1u);
+            const uint8_t *neighbour = s_scratch.data() + static_cast<size_t>(neighbourY) * rowBytes;
             std::memcpy(s_uploadBuffer.data() + static_cast<size_t>(2u * y + parity) * dstRowBytes, current, rowBytes);
-            std::memcpy(s_uploadBuffer.data() + static_cast<size_t>(2u * y + (1u - parity)) * dstRowBytes, previous, rowBytes);
+            uint8_t *missing = s_uploadBuffer.data() + static_cast<size_t>(2u * y + (1u - parity)) * dstRowBytes;
+            // Motion adaptive: keep the previous field where the picture is
+            // static (full vertical detail), interpolate where it moved so
+            // consecutive frames do not comb.
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const uint8_t *cur = current + x * 4u;
+                const uint8_t *nb = neighbour + x * 4u;
+                const uint8_t *prev = previous + x * 4u;
+                uint8_t *dst = missing + x * 4u;
+                int difference = 0;
+                uint8_t interpolated[4];
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    interpolated[c] = static_cast<uint8_t>((static_cast<uint32_t>(cur[c]) + nb[c] + 1u) >> 1u);
+                    if (c < 3u)
+                        difference += std::abs(static_cast<int>(prev[c]) - static_cast<int>(interpolated[c]));
+                }
+                if (difference > 48)
+                    std::memcpy(dst, interpolated, 4u);
+                else
+                    std::memcpy(dst, prev, 4u);
+            }
         }
         s_previousField.assign(s_scratch.begin(), s_scratch.begin() + std::min(s_scratch.size(), rowBytes * height));
         s_previousFieldWidth = width;
@@ -614,6 +706,11 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        g_spu2AudioSource.store(nullptr);
+#if !defined(PLATFORM_VITA)
+        if (IsAudioDeviceReady() && IsAudioStreamValid(g_spu2Stream))
+            StopAudioStream(g_spu2Stream);
+#endif
         m_iopSubsystem.reset();
         m_iopHost.reset();
 #if defined(PLATFORM_VITA)
@@ -622,6 +719,9 @@ PS2Runtime::~PS2Runtime()
 #else
         if (IsAudioDeviceReady())
         {
+            g_spu2AudioSource.store(nullptr);
+            if (IsAudioStreamValid(g_spu2Stream))
+                UnloadAudioStream(g_spu2Stream);
             CloseAudioDevice();
             m_audioBackend.setAudioReady(false);
         }
@@ -820,6 +920,14 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
+        if (IsAudioDeviceReady() && m_iopSubsystem)
+        {
+            g_spu2AudioSource.store(m_iopSubsystem.get());
+            SetAudioStreamBufferSizeDefault(1024);
+            g_spu2Stream = LoadAudioStream(48000, 16, 2);
+            SetAudioStreamCallback(g_spu2Stream, spu2AudioCallback);
+            PlayAudioStream(g_spu2Stream);
+        }
 #endif
         SetTargetFPS(60);
         if (m_debugUiInitCallback)
