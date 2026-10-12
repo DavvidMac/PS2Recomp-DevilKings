@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <bitset>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -50,12 +51,14 @@ private:
     void WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value);
 
     void DrawPrimitive(const GSPrimitiveBatch &batch);
+    void RasterPrimitive(const GSPrimitiveBatch &batch);
     void DrawSprite(const GSPrimitiveBatch &batch);
     void DrawTriangle(const GSPrimitiveBatch &batch);
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
     uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
-    uint32_t LookupCLUT(const GSDrawState &state, uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
+    uint32_t LookupCLUT(const GSDrawState &state, const std::array<uint16_t, 512> &clut,
+                        uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
 
     void PerformLocalToLocalTransfer();
     void PerformLocalToHostTransfer();
@@ -117,8 +120,13 @@ private:
         uint32_t firstPage = 0;
         uint32_t pageCount = 0;
         uint32_t tilesX = 0;
+        // Draws queued for the band threads that sample this entry; a pinned
+        // entry is never evicted.
+        uint32_t pendingRefs = 0;
         std::vector<uint32_t> texels;
         std::vector<uint8_t> tileReady;
+        // Palette the tiles decode with, copied when the entry is created.
+        std::array<uint16_t, 512> clut{};
     };
     std::array<DecodedTexture, 32> m_decodedTextures{};
     std::array<uint64_t, 512> m_pageWriteEpoch{};
@@ -126,7 +134,40 @@ private:
     uint64_t m_clutVersion = 0;
     uint64_t m_flushEpoch = 0;
     uint64_t m_decodeUseCounter = 0;
-    DecodedTexture *m_activeTexture = nullptr;
+    // Entry sampled by the primitive being drawn on this thread.
+    static thread_local DecodedTexture *s_activeTexture;
+    // Serialises tile decodes (and the single-page texture buffer they read
+    // through) when band threads decode lazily.
+    std::mutex m_decodeMutex;
+
+    // Parallel rasterisation (async mode only). The worker prepares draws in
+    // submission order (CLUT loads, texture cache, page tracking) into
+    // m_pendingDraws, and band threads then rasterise the list together, each
+    // owning interleaved groups of rows. A draw that samples pages a pending
+    // draw writes, or writes pages a pending draw samples, flushes the list
+    // first, so the result matches drawing one primitive at a time.
+    struct PendingDraw
+    {
+        const GSPrimitiveBatch *batch = nullptr;
+        DecodedTexture *texture = nullptr;
+    };
+    void QueueDrawUnlocked(const GSPrimitiveBatch &batch);
+    void QueueClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
+    void FlushPendingDrawsUnlocked();
+    void RunPendingBand(uint32_t band, uint32_t bandCount);
+    void BandLoop(uint32_t band);
+    std::vector<PendingDraw> m_pendingDraws;
+    std::bitset<512> m_pendingWritePages;
+    std::bitset<512> m_pendingReadPages;
+    uint64_t m_pendingArea = 0;
+    uint32_t m_bandCount = 0;
+    std::vector<std::thread> m_bandThreads;
+    std::mutex m_bandMutex;
+    std::condition_variable m_bandCv;
+    std::condition_variable m_bandDoneCv;
+    uint64_t m_bandGeneration = 0;
+    uint32_t m_bandsRunning = 0;
+    bool m_stopBands = false;
 
     // Asynchronous rasterisation: Submit queues primitives for a worker thread
     // and every other entry point drains the queue first, so the observable
@@ -179,8 +220,8 @@ private:
     std::thread m_worker;
     void MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y);
     void InvalidateDecodedTexturesUnlocked();
-    void PrepareTextureCacheUnlocked(const GSDrawState &state);
-    uint32_t DecodeTexelUnlocked(const GSDrawState &state, int u, int v);
+    DecodedTexture *PrepareTextureCacheUnlocked(const GSDrawState &state, bool cacheSmall);
+    uint32_t DecodeTexelUnlocked(const GSDrawState &state, const std::array<uint16_t, 512> &clut, int u, int v);
     uint32_t FetchDecodedTexelUnlocked(const GSDrawState &state, int u, int v);
 
     GSTransferCommand m_transfer{};

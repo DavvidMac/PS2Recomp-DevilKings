@@ -102,6 +102,17 @@ namespace
     std::atomic<uint32_t> s_debugContext1PrimitiveCount{0};
     std::atomic<uint32_t> s_debugFbp150PixelCount{0};
 
+    // Rows are dealt to band threads in groups of 1 << kBandShift.
+    constexpr uint32_t kBandShift = 2u;
+    thread_local uint32_t s_bandIndex = 0u;
+    thread_local uint32_t s_bandCount = 1u;
+    thread_local bool s_inBand = false;
+
+    inline bool ownsRow(int y)
+    {
+        return s_bandCount <= 1u || ((static_cast<uint32_t>(y) >> kBandShift) % s_bandCount) == s_bandIndex;
+    }
+
     int wrapTextureCoordinate(int coordinate,
                               int textureSize,
                               uint8_t mode,
@@ -588,6 +599,13 @@ GSCpuBackend::~GSCpuBackend()
     m_presentCv.notify_all();
     if (m_worker.joinable())
         m_worker.join();
+    {
+        std::lock_guard<std::mutex> bandLock(m_bandMutex);
+        m_stopBands = true;
+    }
+    m_bandCv.notify_all();
+    for (std::thread &thread : m_bandThreads)
+        thread.join();
 }
 
 void GSCpuBackend::WorkerLoop()
@@ -612,21 +630,24 @@ void GSCpuBackend::WorkerLoop()
                 {
                 case QueuedWork::Kind::Draw:
                     if (m_vram)
-                        DrawPrimitive(work.batch);
+                        QueueDrawUnlocked(work.batch);
                     continue;
                 case QueuedWork::Kind::Clut:
-                    LoadClutStateUnlocked(work.tex0, work.texclut);
+                    QueueClutUnlocked(work.tex0, work.texclut);
                     continue;
                 case QueuedWork::Kind::TextureFlush:
                     TextureFlushUnlocked();
                     continue;
                 case QueuedWork::Kind::Transfer:
+                    FlushPendingDrawsUnlocked();
                     BeginTransferUnlocked(work.transfer);
                     continue;
                 case QueuedWork::Kind::Upload:
+                    FlushPendingDrawsUnlocked();
                     UploadImageUnlocked(work.payload.data(), static_cast<uint32_t>(work.payload.size()));
                     continue;
                 case QueuedWork::Kind::Present:
+                    FlushPendingDrawsUnlocked();
                     break;
                 }
                 PresentationFrame frame{};
@@ -647,6 +668,7 @@ void GSCpuBackend::WorkerLoop()
                 }
                 m_presentCv.notify_all();
             }
+            FlushPendingDrawsUnlocked();
         }
         batches.clear();
         {
@@ -884,7 +906,9 @@ void GSCpuBackend::WriteVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, u
 {
     if (!m_vram)
         return;
-    MarkVramWriteUnlocked(psm, base, bw, x, y);
+    // Band threads leave page marking to QueueDrawUnlocked.
+    if (!s_inBand)
+        MarkVramWriteUnlocked(psm, base, bw, x, y);
     m_writeVramFuncs[psm & 0x3Fu](m_vram, base, bw, x, y, value);
 }
 
@@ -914,9 +938,14 @@ GSTransferSnapshot GSCpuBackend::GetTransferSnapshot() const
 
 void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
 {
+    s_activeTexture = PrepareTextureCacheUnlocked(batch.state, false);
+    RasterPrimitive(batch);
+}
+
+void GSCpuBackend::RasterPrimitive(const GSPrimitiveBatch &batch)
+{
     const GSDrawState &state = batch.state;
     const auto &ctx = state.context;
-    PrepareTextureCacheUnlocked(state);
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t primitiveIndex = s_debugPrimitiveCount.fetch_add(1u, std::memory_order_relaxed);
         if (primitiveIndex < 64u)
@@ -1043,7 +1072,8 @@ void GSCpuBackend::DrawPrimitive(const GSPrimitiveBatch &batch)
         const auto &ctx = state.context;
         int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
         int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        WritePixel(state, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
+        if (ownsRow(py))
+            WritePixel(state, px, py, static_cast<u32>(v.z), v.r, v.g, v.b, v.a, v.fog);
         break;
     }
     default:
@@ -1218,13 +1248,14 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
     if (writeMask.writeDepth && !ctx.zbuf.zmask && depthTestEnabled)
     {
         uint8_t *depthMemory = DepthMemoryUnlocked();
-        if (depthMemory == m_vram)
+        if (depthMemory == m_vram && !s_inBand)
             MarkVramWriteUnlocked(zpsm, zbp, fbw, x, y);
         m_writeVramFuncs[zpsm & 0x3Fu](depthMemory, zbp, fbw, x, y, z);
     }
 }
 
 uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
+                                  const std::array<uint16_t, 512> &m_clut,
                                   uint8_t index,
                                   uint8_t cpsm,
                                   uint8_t csm,
@@ -1267,7 +1298,7 @@ uint32_t GSCpuBackend::LookupCLUT(const GSDrawState &state,
     return 0xFFFF00FFu;
 }
 
-uint32_t GSCpuBackend::DecodeTexelUnlocked(const GSDrawState &state, int u, int v)
+uint32_t GSCpuBackend::DecodeTexelUnlocked(const GSDrawState &state, const std::array<uint16_t, 512> &clut, int u, int v)
 {
     const auto &tex = state.context.tex0;
     const u32 out = ReadTextureVramUnlocked(tex.psm, tex.tbp0, tex.tbw, u, v);
@@ -1288,27 +1319,32 @@ uint32_t GSCpuBackend::DecodeTexelUnlocked(const GSDrawState &state, int u, int 
     case GS_PSM_T4:
     case GS_PSM_T4HL:
     case GS_PSM_T4HH:
-        return LookupCLUT(state, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
+        return LookupCLUT(state, clut, static_cast<u8>(out), tex.cpsm, tex.csm, tex.csa, tex.psm);
     }
     return 0xFFFF00FFu;
 }
 
 uint32_t GSCpuBackend::FetchDecodedTexelUnlocked(const GSDrawState &state, int u, int v)
 {
-    DecodedTexture &entry = *m_activeTexture;
+    DecodedTexture &entry = *s_activeTexture;
     const uint32_t tileX = static_cast<uint32_t>(u) >> 5u;
     const uint32_t tileY = static_cast<uint32_t>(v) >> 5u;
-    uint8_t &ready = entry.tileReady[tileY * entry.tilesX + tileX];
-    if (!ready)
+    std::atomic_ref<uint8_t> ready(entry.tileReady[tileY * entry.tilesX + tileX]);
+    if (!ready.load(std::memory_order_acquire))
     {
-        const uint32_t x0 = tileX << 5u;
-        const uint32_t y0 = tileY << 5u;
-        const uint32_t x1 = std::min(x0 + 32u, entry.width);
-        const uint32_t y1 = std::min(y0 + 32u, entry.height);
-        for (uint32_t y = y0; y < y1; ++y)
-            for (uint32_t x = x0; x < x1; ++x)
-                entry.texels[y * entry.width + x] = DecodeTexelUnlocked(state, static_cast<int>(x), static_cast<int>(y));
-        ready = 1u;
+        std::lock_guard<std::mutex> decodeLock(m_decodeMutex);
+        if (!ready.load(std::memory_order_relaxed))
+        {
+            const uint32_t x0 = tileX << 5u;
+            const uint32_t y0 = tileY << 5u;
+            const uint32_t x1 = std::min(x0 + 32u, entry.width);
+            const uint32_t y1 = std::min(y0 + 32u, entry.height);
+            for (uint32_t y = y0; y < y1; ++y)
+                for (uint32_t x = x0; x < x1; ++x)
+                    entry.texels[y * entry.width + x] =
+                        DecodeTexelUnlocked(state, entry.clut, static_cast<int>(x), static_cast<int>(y));
+            ready.store(1u, std::memory_order_release);
+        }
     }
     return entry.texels[static_cast<uint32_t>(v) * entry.width + static_cast<uint32_t>(u)];
 }
@@ -1344,6 +1380,232 @@ namespace
     }
 }
 
+thread_local GSCpuBackend::DecodedTexture *GSCpuBackend::s_activeTexture = nullptr;
+
+namespace
+{
+    // Pages from the first row touched to the end of the last one, so the
+    // range is contiguous (pages are laid out row-major from the base).
+    void markPageRows(std::bitset<512> &pages, uint32_t psm, uint32_t base, uint32_t bw, int y0, int y1,
+                      uint64_t *epochs = nullptr, uint64_t epoch = 0u)
+    {
+        const uint32_t width = std::max<uint32_t>(bw, 1u) * 64u;
+        const uint32_t first = vramPageOf(psm, base, bw, 0u, static_cast<uint32_t>(y0));
+        const uint32_t last = vramPageOf(psm, base, bw, width - 1u, static_cast<uint32_t>(y1));
+        for (uint32_t page = first; page <= last && page - first < 512u; ++page)
+        {
+            pages.set(page & 511u);
+            if (epochs)
+                epochs[page & 511u] = epoch;
+        }
+    }
+
+    void markTexturePages(std::bitset<512> &pages, const GSTex0Reg &tex, uint32_t width, uint32_t height)
+    {
+        // Same span PrepareTextureCacheUnlocked covers, with the spill page.
+        const uint32_t firstPage = tex.tbp0 / 32u;
+        const uint32_t spanWidth = std::max<uint32_t>(width, std::max<uint32_t>(1u, tex.tbw) * 64u);
+        const uint32_t lastPage = vramPageOf(tex.psm, tex.tbp0, tex.tbw, spanWidth - 1u, height - 1u) + 1u;
+        for (uint32_t page = firstPage; page <= lastPage && page - firstPage < 512u; ++page)
+            pages.set(page & 511u);
+    }
+
+    // Pixel rectangle a primitive can touch, clipped to the scissor.
+    bool primitiveBounds(const GSPrimitiveBatch &batch, int &x0, int &y0, int &x1, int &y1)
+    {
+        const auto &ctx = batch.state.context;
+        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
+        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+        uint32_t count = 1u;
+        switch (batch.state.prim.type)
+        {
+        case GS_PRIM_TRIANGLE:
+        case GS_PRIM_TRISTRIP:
+        case GS_PRIM_TRIFAN:
+            count = 3u;
+            break;
+        case GS_PRIM_SPRITE:
+        case GS_PRIM_LINE:
+        case GS_PRIM_LINESTRIP:
+            count = 2u;
+            break;
+        default:
+            break;
+        }
+        float minX = batch.vertices[0].x - ofx, maxX = minX;
+        float minY = batch.vertices[0].y - ofy, maxY = minY;
+        for (uint32_t i = 1u; i < count; ++i)
+        {
+            minX = std::min(minX, batch.vertices[i].x - ofx);
+            maxX = std::max(maxX, batch.vertices[i].x - ofx);
+            minY = std::min(minY, batch.vertices[i].y - ofy);
+            maxY = std::max(maxY, batch.vertices[i].y - ofy);
+        }
+        x0 = std::max(static_cast<int>(std::floor(minX)) - 1, static_cast<int>(ctx.scissor.x0));
+        y0 = std::max(static_cast<int>(std::floor(minY)) - 1, static_cast<int>(ctx.scissor.y0));
+        x1 = std::min(static_cast<int>(std::ceil(maxX)) + 1, static_cast<int>(ctx.scissor.x1));
+        y1 = std::min(static_cast<int>(std::ceil(maxY)) + 1, static_cast<int>(ctx.scissor.y1));
+        return x0 <= x1 && y0 <= y1;
+    }
+}
+
+void GSCpuBackend::QueueDrawUnlocked(const GSPrimitiveBatch &batch)
+{
+    const GSDrawState &state = batch.state;
+    const auto &ctx = state.context;
+    int x0 = 0, y0 = 0, x1 = 0, y1 = 0;
+    if (!primitiveBounds(batch, x0, y0, x1, y1))
+        return;
+
+    std::bitset<512> writes;
+    markPageRows(writes, ctx.frame.psm, GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, y0, y1);
+    const bool depthWrites = ((ctx.test >> 16) & 1u) != 0u && !ctx.zbuf.zmask;
+    if (depthWrites && DepthMemoryUnlocked() == m_vram)
+        markPageRows(writes, ctx.zbuf.psm, GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, y0, y1);
+
+    std::bitset<512> reads;
+    if (state.prim.tme)
+        markTexturePages(reads, ctx.tex0, state.textureWidth, state.textureHeight);
+
+    // Read after write and write after read between queued draws.
+    if ((reads & m_pendingWritePages).any() || (writes & m_pendingReadPages).any())
+        FlushPendingDrawsUnlocked();
+
+    DecodedTexture *texture = PrepareTextureCacheUnlocked(state, true);
+    if (texture && (reads & writes).any())
+    {
+        // The draw samples what it renders: decode every tile now, as drawing
+        // inline would on first use, so band threads never decode it late.
+        std::fill(texture->tileReady.begin(), texture->tileReady.end(), uint8_t{0});
+        s_activeTexture = texture;
+        for (uint32_t ty = 0; ty < texture->height; ty += 32u)
+            for (uint32_t tx = 0; tx < texture->width; tx += 32u)
+                (void)FetchDecodedTexelUnlocked(state, static_cast<int>(tx), static_cast<int>(ty));
+    }
+    if (texture)
+        ++texture->pendingRefs;
+
+    // Page write epochs follow submission order, as drawing inline marks them.
+    {
+        std::bitset<512> marked;
+        markPageRows(marked, ctx.frame.psm, GSInternal::framePageBaseToBlock(ctx.frame.fbp), ctx.frame.fbw, y0, y1,
+                     m_pageWriteEpoch.data(), m_writeEpoch);
+        if (depthWrites && DepthMemoryUnlocked() == m_vram)
+            markPageRows(marked, ctx.zbuf.psm, GSInternal::framePageBaseToBlock(ctx.zbuf.zbp), ctx.frame.fbw, y0, y1,
+                         m_pageWriteEpoch.data(), m_writeEpoch);
+    }
+    m_pendingWritePages |= writes;
+    m_pendingReadPages |= reads;
+    m_pendingDraws.push_back(PendingDraw{&batch, texture});
+    m_pendingArea += static_cast<uint64_t>(x1 - x0 + 1) * static_cast<uint64_t>(y1 - y0 + 1);
+    if (m_pendingDraws.size() >= 8192u)
+        FlushPendingDrawsUnlocked();
+}
+
+void GSCpuBackend::QueueClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+{
+    if (tex0.cld >= 1u && tex0.cld <= 5u && m_pendingWritePages.any())
+    {
+        // The palette is read from VRAM a pending draw may still write.
+        std::bitset<512> reads;
+        if (tex0.csm == 0u)
+        {
+            for (uint32_t page = tex0.cbp / 32u; page <= tex0.cbp / 32u + 1u; ++page)
+                reads.set(page & 511u);
+        }
+        else
+        {
+            const uint32_t cbw = texclut.cbw != 0u ? static_cast<uint32_t>(texclut.cbw) : 1u;
+            const int row = static_cast<int>(texclut.cov);
+            markPageRows(reads, tex0.cpsm, tex0.cbp, cbw, row, row);
+        }
+        if ((reads & m_pendingWritePages).any())
+            FlushPendingDrawsUnlocked();
+    }
+    LoadClutStateUnlocked(tex0, texclut);
+}
+
+void GSCpuBackend::RunPendingBand(uint32_t band, uint32_t bandCount)
+{
+    s_bandIndex = band;
+    s_bandCount = bandCount;
+    s_inBand = true;
+    for (const PendingDraw &draw : m_pendingDraws)
+    {
+        s_activeTexture = draw.texture;
+        RasterPrimitive(*draw.batch);
+    }
+    s_inBand = false;
+    s_bandIndex = 0u;
+    s_bandCount = 1u;
+}
+
+void GSCpuBackend::BandLoop(uint32_t band)
+{
+    uint64_t seen = 0u;
+    for (;;)
+    {
+        uint32_t bandCount = 0u;
+        {
+            std::unique_lock<std::mutex> bandLock(m_bandMutex);
+            m_bandCv.wait(bandLock, [&]() { return m_stopBands || m_bandGeneration != seen; });
+            if (m_stopBands)
+                return;
+            seen = m_bandGeneration;
+            bandCount = m_bandCount;
+        }
+        RunPendingBand(band, bandCount);
+        {
+            std::lock_guard<std::mutex> bandLock(m_bandMutex);
+            if (--m_bandsRunning == 0u)
+                m_bandDoneCv.notify_one();
+        }
+    }
+}
+
+void GSCpuBackend::FlushPendingDrawsUnlocked()
+{
+    if (m_pendingDraws.empty())
+        return;
+    (void)DepthMemoryUnlocked();
+
+    if (m_bandCount == 0u)
+    {
+        uint32_t count = std::max(1u, std::thread::hardware_concurrency() / 2u);
+        if (const char *value = std::getenv("PS2X_GS_THREADS"))
+            count = static_cast<uint32_t>(std::max(1, std::atoi(value)));
+        m_bandCount = std::min(count, 16u);
+        for (uint32_t band = 1u; band < m_bandCount; ++band)
+            m_bandThreads.emplace_back([this, band]() { BandLoop(band); });
+    }
+
+    // Small lists are not worth waking the band threads for.
+    if (m_bandCount <= 1u || m_pendingArea < 16384u)
+    {
+        RunPendingBand(0u, 1u);
+    }
+    else
+    {
+        {
+            std::lock_guard<std::mutex> bandLock(m_bandMutex);
+            m_bandsRunning = m_bandCount - 1u;
+            ++m_bandGeneration;
+        }
+        m_bandCv.notify_all();
+        RunPendingBand(0u, m_bandCount);
+        std::unique_lock<std::mutex> bandLock(m_bandMutex);
+        m_bandDoneCv.wait(bandLock, [this]() { return m_bandsRunning == 0u; });
+    }
+
+    for (const PendingDraw &draw : m_pendingDraws)
+        if (draw.texture)
+            draw.texture->pendingRefs = 0u;
+    m_pendingDraws.clear();
+    m_pendingWritePages.reset();
+    m_pendingReadPages.reset();
+    m_pendingArea = 0u;
+}
+
 void GSCpuBackend::MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
 {
     m_pageWriteEpoch[vramPageOf(psm, base, bw, x, y) & 511u] = m_writeEpoch;
@@ -1352,23 +1614,26 @@ void GSCpuBackend::MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t b
 void GSCpuBackend::InvalidateDecodedTexturesUnlocked()
 {
     for (DecodedTexture &entry : m_decodedTextures)
+    {
         entry.valid = false;
-    m_activeTexture = nullptr;
+        entry.pendingRefs = 0u;
+    }
+    s_activeTexture = nullptr;
     ++m_clutVersion;
 }
 
-void GSCpuBackend::PrepareTextureCacheUnlocked(const GSDrawState &state)
+GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTextureCacheUnlocked(const GSDrawState &state, bool cacheSmall)
 {
-    m_activeTexture = nullptr;
     if (!m_vram || !state.prim.tme)
-        return;
+        return nullptr;
     const auto &tex = state.context.tex0;
     const uint32_t width = static_cast<uint32_t>(state.textureWidth);
     const uint32_t height = static_cast<uint32_t>(state.textureHeight);
-    // Small textures stay on the direct path (cheap, and it keeps the texture
-    // page buffer semantics for tiny textures); huge ones are not worth it.
-    if (width * height < 4096u || width > 1024u || height > 1024u)
-        return;
+    // Small textures stay on the direct path when drawing inline (cheap, and
+    // it keeps the texture page buffer semantics for tiny textures). Band
+    // threads always sample through an entry.
+    if ((!cacheSmall && width * height < 4096u) || width == 0u || height == 0u || width > 1024u || height > 1024u)
+        return nullptr;
     const bool indexed = isFourBitIndexedPsm(tex.psm) || isEightBitIndexedPsm(tex.psm);
 
     DecodedTexture *entry = nullptr;
@@ -1384,9 +1649,17 @@ void GSCpuBackend::PrepareTextureCacheUnlocked(const GSDrawState &state)
             entry = &candidate;
             break;
         }
+        if (candidate.pendingRefs != 0u)
+            continue;
         if (!victim || (!candidate.valid && victim->valid) ||
             (candidate.valid == victim->valid && candidate.lastUse < victim->lastUse))
             victim = &candidate;
+    }
+    if (!entry && !victim)
+    {
+        // Every entry is pinned by a pending draw.
+        FlushPendingDrawsUnlocked();
+        return PrepareTextureCacheUnlocked(state, cacheSmall);
     }
 
     if (entry)
@@ -1417,6 +1690,7 @@ void GSCpuBackend::PrepareTextureCacheUnlocked(const GSDrawState &state)
         entry->ta1 = state.texa.ta1;
         entry->aem = state.texa.aem;
         entry->clutVersion = m_clutVersion;
+        entry->clut = m_clut;
         entry->tilesX = (width + 31u) / 32u;
         entry->texels.assign(static_cast<size_t>(width) * height, 0u);
         entry->tileReady.assign(static_cast<size_t>(entry->tilesX) * ((height + 31u) / 32u), uint8_t{0});
@@ -1430,7 +1704,7 @@ void GSCpuBackend::PrepareTextureCacheUnlocked(const GSDrawState &state)
         entry->epoch = ++m_writeEpoch;
     }
     entry->lastUse = ++m_decodeUseCounter;
-    m_activeTexture = entry;
+    return entry;
 }
 
 uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v)
@@ -1465,10 +1739,14 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, float s, float t,
     {
         sampleU = wrapTextureCoordinate(sampleU, texW, wrapU, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, texH, wrapV, minV, maxV);
-        if (m_activeTexture && sampleU >= 0 && sampleV >= 0 &&
-            static_cast<uint32_t>(sampleU) < m_activeTexture->width && static_cast<uint32_t>(sampleV) < m_activeTexture->height)
+        DecodedTexture *active = s_activeTexture;
+        if (active && sampleU >= 0 && sampleV >= 0 &&
+            static_cast<uint32_t>(sampleU) < active->width && static_cast<uint32_t>(sampleV) < active->height)
             return FetchDecodedTexelUnlocked(state, sampleU, sampleV);
-        return DecodeTexelUnlocked(state, sampleU, sampleV);
+        if (!active)
+            return DecodeTexelUnlocked(state, m_clut, sampleU, sampleV);
+        std::lock_guard<std::mutex> decodeLock(m_decodeMutex);
+        return DecodeTexelUnlocked(state, active->clut, sampleU, sampleV);
     };
 
     if (!state.linearFilter)
@@ -1591,6 +1869,8 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
 
         for (int y = drawY0; y <= drawY1; ++y)
         {
+            if (!ownsRow(y))
+                continue;
             float ty = (static_cast<float>(y - unclippedY0) + 0.5f) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
 
@@ -1625,8 +1905,12 @@ void GSCpuBackend::DrawSprite(const GSPrimitiveBatch &batch)
     else
     {
         for (int y = drawY0; y <= drawY1; ++y)
+        {
+            if (!ownsRow(y))
+                continue;
             for (int x = drawX0; x <= drawX1; ++x)
                 WritePixel(state, x, y, z1, r, g, b, a, v1.fog);
+        }
     }
 }
 
@@ -1676,6 +1960,8 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float a2 = -(a0 + a1);
     for (int y = minY; y <= maxY; ++y)
     {
+        if (!ownsRow(y))
+            continue;
         float py = static_cast<float>(y) + 0.5f;
         const float b0 = (-(fy1 - fy2) * fx2 + (fx2 - fx1) * (py - fy2)) * k;
         const float b1 = (-(fy2 - fy0) * fx2 + (fx0 - fx2) * (py - fy2)) * k;
@@ -1823,7 +2109,8 @@ void GSCpuBackend::DrawLine(const GSPrimitiveBatch &batch)
 
         double z = (v0.z + (v1.z - v0.z) * t);
         const uint8_t fog = clampU8(static_cast<int>(v0.fog + (v1.fog - v0.fog) * t));
-        WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
+        if (ownsRow(y0))
+            WritePixel(state, x0, y0, static_cast<u32>(z), r, g, b, a, fog);
 
         if (x0 == x1 && y0 == y1)
             break;
