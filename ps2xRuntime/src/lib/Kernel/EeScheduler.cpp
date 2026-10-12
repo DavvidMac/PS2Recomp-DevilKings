@@ -761,7 +761,11 @@ void EeScheduler::sleepCurrent()
 int EeScheduler::wakeupThread(int id, bool interruptSafe)
 {
     assertExecutor();
-    if (id == 0 || id == m_currentThreadId)
+    // A thread cannot wake itself, but iWakeupThread from an interrupt handler
+    // may target the thread it interrupted: the wakeup is counted, so its next
+    // SleepThread returns at once (CRI middleware wakes its decode threads from
+    // the VSync handler and would otherwise sleep forever on that race).
+    if (id == 0 || (id == m_currentThreadId && !interruptSafe))
     {
         return KE_ILLEGAL_THID;
     }

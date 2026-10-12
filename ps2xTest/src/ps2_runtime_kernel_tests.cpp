@@ -695,6 +695,11 @@ void register_ps2_runtime_kernel_tests()
             t.Equals(ee.cancelWakeup(id), 2, "CancelWakeupThread should return and clear the exact accumulated count");
             t.Equals(ee.cancelWakeup(id), 0, "the wakeup count should remain cleared");
 
+            const int self = ee.currentThreadId();
+            t.Equals(ee.wakeupThread(self, false), KE_ILLEGAL_THID, "WakeupThread cannot target the calling thread");
+            t.Equals(ee.wakeupThread(self, true), KE_OK, "iWakeupThread may target the interrupted thread");
+            t.Equals(ee.cancelWakeup(self), 1, "the interrupted thread keeps the wakeup for its next SleepThread");
+
             uint32_t ownedStack = 0u;
             t.Equals(ee.terminateThread(id, ownedStack, false), KE_OK,
                      "TerminateThread should remove a ready thread and make it dormant");
