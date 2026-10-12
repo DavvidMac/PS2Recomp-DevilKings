@@ -298,7 +298,21 @@ void register_pad_input_tests()
             setRegU32(ctx, 6, 4);
             setRegU32(ctx, 7, 0u);
             ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
-            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(7), "mode table entry should return DualShock in analog mode");
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(4), "mode table entry 0 should be the digital mode");
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 4);
+            setRegU32(ctx, 7, 1u);
+            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(7), "mode table entry 1 should be the DualShock analog mode");
+
+            setRegU32(ctx, 4, 0u);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 4);
+            setRegU32(ctx, 7, static_cast<uint32_t>(-1));
+            ps2_stubs::scePadInfoMode(rdram.data(), &ctx, nullptr);
+            t.Equals(static_cast<uint32_t>(getRegU32(&ctx, 2)), static_cast<uint32_t>(2), "a DualShock 2 should report two modes");
 
             closePadPort(ctx, rdram);
         });

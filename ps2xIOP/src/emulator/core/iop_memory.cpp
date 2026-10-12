@@ -1,6 +1,7 @@
 #include "iop_memory.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 
 namespace ps2x::iop::detail
@@ -214,6 +215,18 @@ namespace ps2x::iop::detail
     uint32_t IopMemory::readHardware32(uint32_t address) const
     {
         const auto value = m_hardware.find(address);
+        // Compatibility option PS2X_ADMAS_ZERO=1: report SPU2 core 0 AutoDMA as
+        // idle. SPU2 output is not emulated and AutoDMA blocks complete far
+        // faster than on hardware, so a streaming driver (CRI ADX) can keep
+        // core 0 busy exactly when another driver (Capcom CSE) uploads voice
+        // data, which then fails with SCESD_EBUSY and stalls the game.
+        static const bool s_reportCore0AdmaIdle = []()
+        {
+            const char *value = std::getenv("PS2X_ADMAS_ZERO");
+            return value && value[0] == '1';
+        }();
+        if (address == 0x1F9001B0u && s_reportCore0AdmaIdle)
+            return value != m_hardware.end() ? (value->second & 0xFFFF0000u) : 0u;
         if (value != m_hardware.end())
             return value->second;
         switch (address)

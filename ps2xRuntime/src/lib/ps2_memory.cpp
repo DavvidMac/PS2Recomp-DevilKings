@@ -1311,6 +1311,11 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 return true;
             }
 
+            if (tryProcessIpuInputDma(channelBase, value))
+            {
+                return true;
+            }
+
             if ((channelBase == 0x1000A000u || channelBase == 0x10009000u || channelBase == 0x10008000u) && (m_gsVRAM || channelBase == 0x10008000u))
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1582,6 +1587,129 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     }
 
     return false;
+}
+
+bool PS2Memory::tryProcessIpuInputDma(uint32_t channelBase, uint32_t chcr)
+{
+    static constexpr uint32_t kToIpuChannel = 0x1000B400u;
+    static constexpr uint32_t kToIpuCause = 4u;
+    static constexpr int kMaxChainTags = 4096;
+    if (channelBase != kToIpuChannel)
+        return false;
+
+    std::vector<uint8_t> payload;
+    auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
+    {
+        const bool scratch = isScratchpad(srcAddr);
+        const uint8_t *base = scratch ? m_scratchpad : m_rdram;
+        const uint32_t limit = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+        uint32_t src = 0u;
+        try
+        {
+            src = translateAddress(srcAddr);
+        }
+        catch (const std::exception &)
+        {
+            return;
+        }
+        uint32_t bytes = qwCount * 16u;
+        while (bytes > 0u)
+        {
+            if (src >= limit)
+                src = 0u;
+            const uint32_t chunk = std::min(bytes, limit - src);
+            payload.insert(payload.end(), base + src, base + src + chunk);
+            bytes -= chunk;
+            src += chunk;
+        }
+    };
+
+    const uint32_t mode = (chcr >> 2u) & 0x3u;
+    if (mode == 0u)
+    {
+        const uint32_t madr = m_ioRegisters[channelBase + 0x10u];
+        const uint32_t qwc = m_ioRegisters[channelBase + 0x20u] & 0xFFFFu;
+        appendData(madr, qwc);
+        m_ioRegisters[channelBase + 0x10u] = madr + qwc * 16u;
+        m_ioRegisters[channelBase + 0x20u] = 0u;
+    }
+    else
+    {
+        // Source chain: refe/cnt/next/ref/refs/end tags (call/ret are not
+        // valid for toIPU and stop the walk).
+        uint32_t tagAddr = m_ioRegisters[channelBase + 0x30u];
+        const bool tieEnabled = (chcr & (1u << 7)) != 0u;
+        uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
+        for (int processed = 0; processed < kMaxChainTags; ++processed)
+        {
+            const bool tagScratch = isScratchpad(tagAddr);
+            const uint8_t *tagBase = tagScratch ? m_scratchpad : m_rdram;
+            const uint32_t tagLimit = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+            uint32_t tagPhys = 0u;
+            try
+            {
+                tagPhys = translateAddress(tagAddr);
+            }
+            catch (const std::exception &)
+            {
+                break;
+            }
+            if (tagPhys + 16u > tagLimit)
+                break;
+
+            uint64_t tag = 0u;
+            std::memcpy(&tag, tagBase + tagPhys, sizeof(tag));
+            const uint32_t tagQwc = static_cast<uint32_t>(tag & 0xFFFFu);
+            const uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7u);
+            const bool irq = ((tag >> 31) & 0x1u) != 0u;
+            const uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFF0u);
+            lastTagUpper = static_cast<uint32_t>((tag >> 16) & 0xFFFFu);
+
+            bool endChain = false;
+            uint32_t dataAddr = 0u;
+            switch (id)
+            {
+            case 0: // refe
+                dataAddr = addr;
+                tagAddr += 16u;
+                endChain = true;
+                break;
+            case 1: // cnt
+                dataAddr = tagAddr + 16u;
+                tagAddr = dataAddr + tagQwc * 16u;
+                break;
+            case 2: // next
+                dataAddr = tagAddr + 16u;
+                tagAddr = addr;
+                break;
+            case 3: // ref
+            case 4: // refs
+                dataAddr = addr;
+                tagAddr += 16u;
+                break;
+            case 7: // end
+                dataAddr = tagAddr + 16u;
+                endChain = true;
+                break;
+            default:
+                endChain = true;
+                break;
+            }
+            if (dataAddr != 0u && tagQwc != 0u)
+                appendData(dataAddr, tagQwc);
+            if (endChain || (irq && tieEnabled))
+                break;
+        }
+        m_ioRegisters[channelBase + 0x30u] = tagAddr;
+        m_ioRegisters[channelBase + 0x20u] = 0u;
+        m_ioRegisters[channelBase] = (m_ioRegisters[channelBase] & 0x0000FFFFu) | (lastTagUpper << 16);
+    }
+
+    if (m_ipuInputCallback && !payload.empty())
+        m_ipuInputCallback(payload.data(), static_cast<uint32_t>(payload.size()));
+
+    completeDmacChannel(channelBase, kToIpuCause);
+    return true;
 }
 
 bool PS2Memory::tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr)

@@ -338,6 +338,13 @@ public:
     bool registerFunction(uint32_t address, RecompiledFunction func);
     RecompiledFunction lookupFunction(uint32_t address);
     bool hasFunction(uint32_t address) const;
+
+    // Code loaded at runtime (overlays, relocatable modules) lives outside the
+    // dense generated table. Such functions are kept in a sparse map; a resolver
+    // can supply them lazily the first time a guest PC is not found.
+    using MissingFunctionResolver = std::function<RecompiledFunction(PS2Runtime &runtime, uint32_t address)>;
+    void setMissingFunctionResolver(MissingFunctionResolver resolver);
+    void unregisterFunctionRange(uint32_t start, uint32_t end);
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,
@@ -513,10 +520,14 @@ private:
     uint32_t m_guestHeapLimit = PS2_RAM_SIZE;
     uint32_t m_guestHeapSuggestedBase = 0x00100000u;
     bool m_guestHeapConfigured = false;
-    uint32_t m_asyncCallbackStackFloor = 0x01F00000u;
-    uint32_t m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    uint32_t m_asyncCallbackStackFloor = 0x00020000u;
+    uint32_t m_asyncCallbackStackTop = 0x00080000u;
 
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
+    RecompiledFunction findFunction(uint32_t address);
+    std::unordered_map<uint32_t, RecompiledFunction> m_dynamicFunctions;
+    MissingFunctionResolver m_missingFunctionResolver;
+    bool m_resolvingMissingFunction = false;
     std::atomic<bool> m_missingFunctionReported{false};
     std::atomic<bool> m_stopRequested{false};
     DebugUiCallback m_debugUiInitCallback = nullptr;

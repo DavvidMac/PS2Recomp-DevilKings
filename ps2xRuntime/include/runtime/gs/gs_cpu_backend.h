@@ -68,6 +68,15 @@ private:
     mutable std::mutex m_mutex;
     uint8_t *m_vram = nullptr;
     uint32_t m_vramSize = 0;
+    // PS2X_SEPARATE_ZBUFFER=1 keeps depth in its own plane, like hardware
+    // renderers do. Some games place the Z buffer over memory that aliases a
+    // displayed frame buffer and rely on real GS timing to hide it. Off by
+    // default (canonical local memory); resolved on first depth access so a
+    // game override can enable it.
+    std::vector<uint8_t> m_depthPlane;
+    bool m_separateDepth = false;
+    bool m_depthModeResolved = false;
+    uint8_t *DepthMemoryUnlocked();
     std::array<ReadVramFunc, kPsmHandlerCount> m_readVramFuncs{};
     std::array<WriteVramFunc, kPsmHandlerCount> m_writeVramFuncs{};
     std::array<uint16_t, 512> m_clut{};

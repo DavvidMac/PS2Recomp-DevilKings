@@ -280,6 +280,9 @@ public:
     void postEvent(EeEvent event);
     [[nodiscard]] bool checkpointDue(uint32_t cycles = kGeneratedCheckpointCycles) noexcept;
     void accountCycles(uint32_t cycles) noexcept;
+    void syncCyclesToHostTime() noexcept;
+    void advanceEeClock(uint32_t cycles) noexcept;
+    void dumpThreadsForDiagnostics() const;
     [[nodiscard]] bool isExecutingGuest() const noexcept;
 
     // Kernel object API. All calls except postEvent/requestStop execute on the
@@ -427,6 +430,9 @@ private:
     uint32_t m_pendingEeTimerInterrupts = 0;
     uint64_t m_eeCycle = 0;
     uint64_t m_sliceEndCycle = kDefaultTimeSliceCycles;
+    std::chrono::steady_clock::time_point m_hostSyncStart{};
+    uint64_t m_hostSyncCycleBase = 0;
+    uint32_t m_hostSyncCountdown = 0;
     std::thread::id m_executorThread{};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_guestExecuting{false};

@@ -4139,8 +4139,9 @@ void register_ps2_gs_tests()
                      "VSync callback should receive a positive tick value");
             t.Equals(g_gsSyncCallbackGp.load(std::memory_order_acquire), kGsCallbackGp,
                      "callback invocation should preserve the registered GP");
-            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x01F00000u,
-                     "callback invocation should use the reserved async stack pool");
+            t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) >= 0x00020000u &&
+                         g_gsSyncCallbackSp.load(std::memory_order_acquire) <= 0x00080000u,
+                     "callback invocation should use the kernel-area async stack pool");
             t.IsTrue(g_gsSyncCallbackSp.load(std::memory_order_acquire) != kGsCallbackCallerSp,
                      "callback invocation must not reuse the caller stack");
         });

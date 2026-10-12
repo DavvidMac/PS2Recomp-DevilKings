@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iostream>
@@ -521,6 +522,9 @@ void GSCpuBackend::Initialize(uint8_t *vram, uint32_t vramSize)
     std::lock_guard<std::mutex> lock(m_mutex);
     m_vram = vram;
     m_vramSize = vramSize;
+    m_depthModeResolved = false;
+    m_separateDepth = false;
+    m_depthPlane.clear();
     ResetUnlocked();
 }
 
@@ -656,6 +660,19 @@ uint32_t GSCpuBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return ReadVramUnlocked(psm, base, bw, x, y);
+}
+
+uint8_t *GSCpuBackend::DepthMemoryUnlocked()
+{
+    if (!m_depthModeResolved)
+    {
+        m_depthModeResolved = true;
+        const char *value = std::getenv("PS2X_SEPARATE_ZBUFFER");
+        m_separateDepth = value && value[0] == '1';
+        if (m_separateDepth && m_vram && m_vramSize != 0u)
+            m_depthPlane.assign(m_vram, m_vram + m_vramSize);
+    }
+    return (m_separateDepth && !m_depthPlane.empty()) ? m_depthPlane.data() : m_vram;
 }
 
 uint32_t GSCpuBackend::ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
@@ -877,7 +894,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         return;
     }
 
-    const uint32_t ztestMethod = static_cast<uint32_t>((ctx.test >> 17) & 3u);
+    // TEST.ZTE=0 disables the depth test and depth writes (GS manual; PCSX2
+    // treats it the same way). Games rely on it to draw 2D layers without
+    // touching a Z buffer that may alias other VRAM.
+    const bool depthTestEnabled = ((ctx.test >> 16) & 1u) != 0u;
+    const uint32_t ztestMethod = depthTestEnabled ? static_cast<uint32_t>((ctx.test >> 17) & 3u) : 1u;
     const bool alphaBlendEnabled = state.prim.abe;
     const bool preserveDestinationAlpha = writeMask.writeRgb && !writeMask.writeAlpha && fpsm == GS_PSM_CT32;
     const bool destinationAlphaTestNeedsRead = ((ctx.test >> 14) & 0x1u) != 0u && (fpsm == GS_PSM_CT32 || fpsm == GS_PSM_CT16 || fpsm == GS_PSM_CT16S);
@@ -920,11 +941,11 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         zpass = true;
         break;
     case 2:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
+        storedZ = m_readVramFuncs[zpsm & 0x3Fu](DepthMemoryUnlocked(), zbp, fbw, x, y);
         zpass = static_cast<uint32_t>(z) >= storedZ;
         break;
     case 3:
-        storedZ = ReadVramUnlocked(zpsm, zbp, fbw, x, y);
+        storedZ = m_readVramFuncs[zpsm & 0x3Fu](DepthMemoryUnlocked(), zbp, fbw, x, y);
         zpass = static_cast<uint32_t>(z) > storedZ;
         break;
     }
@@ -1006,9 +1027,9 @@ void GSCpuBackend::WritePixel(const GSDrawState &state, int x, int y, int z, uin
         WriteVramUnlocked(fpsm, fbp, fbw, x, y, pixel);
     }
 
-    if (writeMask.writeDepth && !ctx.zbuf.zmask)
+    if (writeMask.writeDepth && !ctx.zbuf.zmask && depthTestEnabled)
     {
-        WriteVramUnlocked(zpsm, zbp, fbw, x, y, z);
+        m_writeVramFuncs[zpsm & 0x3Fu](DepthMemoryUnlocked(), zbp, fbw, x, y, z);
     }
 }
 

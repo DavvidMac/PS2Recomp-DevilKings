@@ -512,6 +512,8 @@ namespace ps2_stubs
             uint64_t presentationEndTickQ32 = std::numeric_limits<uint64_t>::max();
             int64_t firstPresentedPts90k = -1;
             uint64_t ptsPresentationBaseTickQ32 = 0u;
+            // sceMpegCbNodata calls issued since the IPU last delivered data.
+            uint32_t nodataRequestsWithoutInput = 0u;
         };
 
         struct MpegStreamCallbackEvent
@@ -542,6 +544,8 @@ namespace ps2_stubs
             uint32_t isEndTraceCount = 0u;
             std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
+            // Decoder that receives bitstream DMA'd to the IPU (toIPU channel).
+            uint32_t activeIpuMpeg = 0u;
         };
 
         std::mutex g_mpeg_stub_mutex;
@@ -1620,6 +1624,61 @@ namespace ps2_stubs
             runtime->eeScheduler().queueInvocation(std::move(invocation));
         }
 
+        constexpr uint32_t kMpegCbNodata = 1u;
+        constexpr uint32_t kMaxNodataRequestsWithoutInput = 4u;
+
+        // Games that drive the IPU themselves (CRI Sofdec) feed the bitstream
+        // through DMA channel 4 from their sceMpegCbNodata callback instead of
+        // sceMpegAddBs. Route those transfers into the HLE decoder.
+        void installIpuInputSink(PS2Runtime *runtime)
+        {
+            static bool s_installed = false;
+            if (s_installed || !runtime)
+            {
+                return;
+            }
+            s_installed = true;
+            runtime->memory().setIpuInputCallback([runtime](const uint8_t *data, uint32_t size)
+            {
+                uint32_t mpegAddr = 0u;
+                bool wakePictureWaiter = false;
+                {
+                    std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
+                    mpegAddr = g_mpeg_stub_state.activeIpuMpeg;
+                    if (mpegAddr == 0u)
+                    {
+                        return;
+                    }
+                    MpegPlaybackState &playback = getPlaybackState(mpegAddr);
+                    const size_t framesBefore = playback.decodedFrames.size();
+                    feedElementaryStream(playback, data, size);
+                    playback.nodataRequestsWithoutInput = 0u;
+                    wakePictureWaiter = playback.decodedFrames.size() != framesBefore || playback.decoderFailed;
+                }
+                if (wakePictureWaiter)
+                {
+                    runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_OK);
+                }
+            });
+        }
+
+        const MpegRegisteredCallback *findNodataCallbackUnlocked(uint32_t mpegAddr)
+        {
+            auto it = g_mpeg_stub_state.callbacksByMpeg.find(mpegAddr);
+            if (it == g_mpeg_stub_state.callbacksByMpeg.end())
+            {
+                return nullptr;
+            }
+            for (const MpegRegisteredCallback &callback : it->second)
+            {
+                if (!callback.stream && callback.type == kMpegCbNodata && callback.func != 0u)
+                {
+                    return &callback;
+                }
+            }
+            return nullptr;
+        }
+
         void dispatchStreamCallbacks(uint8_t *rdram,
                                      R5900Context *ctx,
                                      PS2Runtime *runtime,
@@ -1911,16 +1970,24 @@ namespace ps2_stubs
     void sceMpegAddCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        (void)runtime;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
         const uint32_t callbackType = getRegU32(ctx, 5);
         const uint32_t callbackFunc = getRegU32(ctx, 6);
         const uint32_t callbackData = getRegU32(ctx, 7);
 
+        if (callbackType == kMpegCbNodata)
+        {
+            installIpuInputSink(runtime);
+        }
+
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
+        if (callbackType == kMpegCbNodata)
+        {
+            g_mpeg_stub_state.activeIpuMpeg = mpegAddr;
+        }
 
         const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
         g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
@@ -2306,6 +2373,47 @@ namespace ps2_stubs
                                   << " sawInput=" << playback.sawInput << std::endl;
                     });
                     ++g_mpeg_stub_state.getPictureWaitTraceCount;
+                }
+                // libmpeg asks the game for more bitstream when the IPU runs dry.
+                // Run the guest sceMpegCbNodata callback (it DMAs data to the
+                // IPU, which reaches the decoder through installIpuInputSink),
+                // then retry this call on the same thread.
+                if (const MpegRegisteredCallback *nodata = findNodataCallbackUnlocked(mpegAddr);
+                    nodata && playback.nodataRequestsWithoutInput < kMaxNodataRequestsWithoutInput &&
+                    runtime->hasFunction(nodata->func))
+                {
+                    ++playback.nodataRequestsWithoutInput;
+                    g_mpeg_stub_state.activeIpuMpeg = mpegAddr;
+                    const MpegRegisteredCallback callback = *nodata;
+                    lock.unlock();
+                    installIpuInputSink(runtime);
+
+                    const uint32_t cbDataAddr = runtime->guestMalloc(kMpegCallbackDataSize, 16u);
+                    if (cbDataAddr != 0u)
+                    {
+                        MpegStreamCallbackEvent event{};
+                        event.mpegAddr = mpegAddr;
+                        event.streamType = kMpegCbNodata;
+                        (void)writeMpegCallbackData(rdram, cbDataAddr, event);
+
+                        GuestInvocation invocation{};
+                        invocation.kind = GuestInvocationKind::RpcCallback;
+                        invocation.context = *ctx;
+                        SET_GPR_U32(&invocation.context, 4, mpegAddr);
+                        SET_GPR_U32(&invocation.context, 5, cbDataAddr);
+                        SET_GPR_U32(&invocation.context, 6, callback.data);
+                        SET_GPR_U32(&invocation.context, 7, 0u);
+                        SET_GPR_U32(&invocation.context, 29, 0u);
+                        SET_GPR_U32(&invocation.context, 31, 0u);
+                        invocation.context.pc = callback.func;
+                        invocation.onComplete = [rdram, runtime, cbDataAddr](const R5900Context &, R5900Context &threadContext)
+                        {
+                            runtime->guestFree(cbDataAddr);
+                            sceMpegGetPicture(rdram, &threadContext, runtime);
+                        };
+                        runtime->eeScheduler().invokeCurrent(std::move(invocation));
+                    }
+                    lock.lock();
                 }
                 lock.unlock();
                 runtime->eeScheduler().waitExternal(

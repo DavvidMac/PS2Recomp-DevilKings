@@ -4,6 +4,9 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <iostream>
 #include <cassert>
 #include <cstring>
 #include <limits>
@@ -35,6 +38,7 @@ namespace
     constexpr auto kVBlankDuration = std::chrono::microseconds(500);
     constexpr uint64_t kAlarmTickMicroseconds = 64u;
     constexpr uint32_t kDebugPublishDispatchInterval = 4096u;
+    constexpr uint32_t kHostSyncCheckpointInterval = 1024u;
 
     constexpr uint64_t microsecondsToEeCycles(uint64_t microseconds)
     {
@@ -113,6 +117,9 @@ void EeScheduler::reset(uint8_t *rdram, const R5900Context &mainContext)
     m_pendingEeTimerInterrupts = 0u;
     m_eeCycle = 0u;
     m_sliceEndCycle = kDefaultTimeSliceCycles;
+    m_hostSyncStart = {};
+    m_hostSyncCycleBase = 0u;
+    m_hostSyncCountdown = 0u;
     m_stopRequested.store(false, std::memory_order_release);
     m_checkpointPending.store(false, std::memory_order_release);
     m_debugPublishCountdown = 0u;
@@ -366,6 +373,11 @@ void EeScheduler::postEvent(EeEvent event)
 bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
 {
     accountCycles(cycles);
+    if (m_hostSyncCountdown-- == 0u)
+    {
+        m_hostSyncCountdown = kHostSyncCheckpointInterval;
+        syncCyclesToHostTime();
+    }
 
     if (m_checkpointPending.load(std::memory_order_acquire) ||
         m_stopRequested.load(std::memory_order_acquire))
@@ -397,12 +409,82 @@ bool EeScheduler::checkpointDue(uint32_t cycles) noexcept
     return false;
 }
 
+void EeScheduler::syncCyclesToHostTime() noexcept
+{
+    // Checkpoints charge a fixed, small cycle cost per guest loop iteration, so
+    // a busy guest can fall far behind real time. EE timers and VSync are driven
+    // by m_eeCycle; keep it from lagging behind the host clock so time-based
+    // waits (e.g. polling GetTimerSystemTime) behave like hardware.
+    const auto now = std::chrono::steady_clock::now();
+    if (m_hostSyncStart == std::chrono::steady_clock::time_point{})
+    {
+        m_hostSyncStart = now;
+        m_hostSyncCycleBase = m_eeCycle;
+        return;
+    }
+
+    const uint64_t elapsedUs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(now - m_hostSyncStart).count());
+    const uint64_t target = m_hostSyncCycleBase + microsecondsToEeCycles(elapsedUs);
+    if (target <= m_eeCycle)
+    {
+        return;
+    }
+
+    const uint64_t behind = target - m_eeCycle;
+    if (behind > EeScheduler::kEeClockHz)
+    {
+        // More than a second behind (debugger pause, host stall): rebase instead
+        // of replaying the whole gap.
+        m_hostSyncStart = now;
+        m_hostSyncCycleBase = m_eeCycle;
+        return;
+    }
+    // Only the EE clock (timers, VSync deadlines) is pulled forward. The IOP keeps
+    // advancing with executed guest work: the interpreter can be slower than
+    // real time, and feeding it host time would starve the EE.
+    advanceEeClock(static_cast<uint32_t>(std::min<uint64_t>(behind, kVBlankPeriodCycles)));
+}
+
 void EeScheduler::accountCycles(uint32_t cycles) noexcept
+{
+    advanceEeClock(cycles);
+    m_runtime.advanceIopEeCycles(std::max<uint32_t>(1u, cycles));
+}
+
+void EeScheduler::dumpThreadsForDiagnostics() const
+{
+    // PS2X_THREAD_DUMP=<n>: print every guest thread's state every n VSyncs.
+    static const uint64_t interval = []() -> uint64_t
+    {
+        const char *value = std::getenv("PS2X_THREAD_DUMP");
+        return value ? std::strtoull(value, nullptr, 10) : 0u;
+    }();
+    if (interval == 0u || (m_vsyncTick % interval) != 0u)
+    {
+        return;
+    }
+    std::cerr << "[thread-dump] vsync=" << m_vsyncTick << std::endl;
+    for (const auto &[threadId, thread] : m_threads)
+    {
+        R5900Context context = thread.activeContext();
+        R5900Context *contextPtr = &context;
+        std::cerr << "  id=" << threadId
+                  << " status=" << static_cast<int>(thread.status)
+                  << " wait=" << static_cast<int>(thread.wait.reason)
+                  << " prio=" << thread.currentPriority
+                  << std::hex << " entry=0x" << thread.entry
+                  << " pc=0x" << context.pc
+                  << " ra=0x" << GPR_U32(contextPtr, 31)
+                  << std::dec << " invocations=" << thread.invocations.size() << std::endl;
+    }
+}
+
+void EeScheduler::advanceEeClock(uint32_t cycles) noexcept
 {
     const uint64_t elapsed = std::max<uint64_t>(1u, cycles);
     m_eeCycle += elapsed;
     m_pendingEeTimerInterrupts |= m_runtime.memory().advanceEeTimers(elapsed);
-    m_runtime.advanceIopEeCycles(elapsed);
     if (m_pendingEeTimerInterrupts != 0u)
     {
         m_checkpointPending.store(true, std::memory_order_release);
@@ -1878,6 +1960,7 @@ void EeScheduler::processEvent(const EeEvent &event)
         break;
     case EeEventType::VBlankStart:
         ++m_vsyncTick;
+        dumpThreadsForDiagnostics();
         m_runtime.memory().gs().vsyncTick.store(m_vsyncTick, std::memory_order_release);
         if ((m_vsyncTick & 1u) != 0u)
         {

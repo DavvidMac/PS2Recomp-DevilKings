@@ -2080,6 +2080,27 @@ namespace ps2recomp
                 auto &targets = m_resumeEntryTargetsByOwner[owner->start];
                 targets.push_back(target);
             }
+
+            // A call in the last instructions of a function can return into the
+            // next function when the analyzer split a routine at the call's
+            // delay slot. The scheduler resumes such calls at jal+8, so that
+            // address must be an entry of whichever function contains it.
+            for (const Instruction &inst : instructions)
+            {
+                const bool isCall = inst.opcode == OPCODE_JAL ||
+                                    (inst.opcode == OPCODE_SPECIAL && inst.function == SPECIAL_JALR);
+                const uint32_t returnAddress = inst.address + 8u;
+                if (!isCall || returnAddress < function.end)
+                {
+                    continue;
+                }
+                const Function *owner = findContainingFunction(returnAddress);
+                if (!owner || owner->start == returnAddress)
+                {
+                    continue;
+                }
+                m_resumeEntryTargetsByOwner[owner->start].push_back(returnAddress);
+            }
         }
 
         size_t totalTargets = 0u;
@@ -2202,6 +2223,28 @@ namespace ps2recomp
         if (truncated)
         {
             function.end = instructions.back().address + 4;
+        }
+        else if (instructions.back().hasDelaySlot && instructions.back().address + 4u == end &&
+                 m_elfParser->isValidAddress(end))
+        {
+            // A function bounded right after a branch (typically a tail call
+            // `j other; addiu $sp, $sp, N`) still executes the delay slot that
+            // lives at the next function's first address. Decode it so the
+            // emitter runs the real instruction instead of a synthetic NOP.
+            try
+            {
+                Instruction delaySlot = m_decoder->decodeInstruction(end, m_elfParser->readWord(end), !m_config.lowMemoryMode);
+                auto mmioIt = m_config.mmioByInstructionAddress.find(end);
+                if (mmioIt != m_config.mmioByInstructionAddress.end())
+                {
+                    delaySlot.isMmio = true;
+                    delaySlot.mmioAddress = mmioIt->second;
+                }
+                instructions.push_back(delaySlot);
+            }
+            catch (const std::exception &)
+            {
+            }
         }
 
         m_decodedFunctions.insert_or_assign(function.start, std::move(instructions));

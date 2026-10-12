@@ -92,6 +92,12 @@ namespace
     constexpr uint32_t kGuestHeapSafetyPad = 0x1000u;
     constexpr uint32_t kGuestHeapHardLimit = 0x01F00000u;
 
+    // Interrupt/alarm/callback handlers run on the EE kernel stack on hardware,
+    // which lives below the user area (0x00080000). Keep their stacks there:
+    // games freely place thread stacks at the top of user RAM.
+    constexpr uint32_t kAsyncCallbackStackFloor = 0x00020000u;
+    constexpr uint32_t kAsyncCallbackStackTop = 0x00080000u;
+
     constexpr uint32_t COP0_CAUSE_EXCCODE_MASK = 0x0000007Cu;
     constexpr uint32_t COP0_CAUSE_BD = 0x80000000u;
     constexpr uint32_t COP0_STATUS_EXL = 0x00000002u;
@@ -450,8 +456,45 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
+    // Interlaced field rendering: games draw each field into a half-height
+    // buffer (e.g. 512x224 for a 448-line display) and alternate buffers per
+    // VSync, offsetting the odd field by half a line. Showing each field as a
+    // full frame makes the picture bob up and down; weave the latest two
+    // fields instead, like a TV does. PS2X_DEINTERLACE=0 disables this.
+    static const bool s_deinterlace = []()
+    {
+        const char *value = std::getenv("PS2X_DEINTERLACE");
+        return !(value && value[0] == '0');
+    }();
+    static std::vector<uint8_t> s_previousField;
+    static uint32_t s_previousFieldWidth = 0u;
+    static uint32_t s_previousFieldHeight = 0u;
+    const bool weaveFields = s_deinterlace && !s_scratch.empty() && width != 0u && height != 0u &&
+                             height <= 256u && height * 2u <= static_cast<uint32_t>(FB_HEIGHT) &&
+                             width <= static_cast<uint32_t>(FB_WIDTH);
+
     std::fill(s_uploadBuffer.begin(), s_uploadBuffer.end(), 0u);
-    if (!s_scratch.empty() && width != 0u && height != 0u)
+    uint32_t presentedHeight = height;
+    if (weaveFields)
+    {
+        const size_t rowBytes = static_cast<size_t>(width) * 4u;
+        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
+        const bool havePrevious = s_previousFieldWidth == width && s_previousFieldHeight == height &&
+                                  s_previousField.size() >= rowBytes * height;
+        const uint32_t parity = static_cast<uint32_t>(currentTick & 1u);
+        for (uint32_t y = 0; y < height && (y + 1u) * rowBytes <= s_scratch.size(); ++y)
+        {
+            const uint8_t *current = s_scratch.data() + static_cast<size_t>(y) * rowBytes;
+            const uint8_t *previous = havePrevious ? s_previousField.data() + static_cast<size_t>(y) * rowBytes : current;
+            std::memcpy(s_uploadBuffer.data() + static_cast<size_t>(2u * y + parity) * dstRowBytes, current, rowBytes);
+            std::memcpy(s_uploadBuffer.data() + static_cast<size_t>(2u * y + (1u - parity)) * dstRowBytes, previous, rowBytes);
+        }
+        s_previousField.assign(s_scratch.begin(), s_scratch.begin() + std::min(s_scratch.size(), rowBytes * height));
+        s_previousFieldWidth = width;
+        s_previousFieldHeight = height;
+        presentedHeight = height * 2u;
+    }
+    else if (!s_scratch.empty() && width != 0u && height != 0u)
     {
         const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
         const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
@@ -473,8 +516,50 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
 
     UpdateTexture(tex, s_uploadBuffer.data());
     outWidth = width;
-    outHeight = height;
+    outHeight = presentedHeight;
+    s_lastHeight = presentedHeight;
     s_hasUploadedFrame = true;
+
+    // Diagnostics: PS2X_FRAME_DUMP_DIR=<dir> saves the presented frame as PNG
+    // every 120 ticks, so a run can be inspected without watching the window.
+    static const char *s_frameDumpDir = std::getenv("PS2X_FRAME_DUMP_DIR");
+    static uint64_t s_lastFrameDumpTick = 0u;
+    static uint32_t s_frameDumpIndex = 0u;
+    static const uint64_t s_frameDumpInterval = []() -> uint64_t
+    {
+        const char *value = std::getenv("PS2X_FRAME_DUMP_INTERVAL");
+        return value ? std::max<uint64_t>(1u, std::strtoull(value, nullptr, 10)) : 120u;
+    }();
+    static const uint64_t s_frameDumpFromTick = []() -> uint64_t
+    {
+        const char *value = std::getenv("PS2X_FRAME_DUMP_FROM");
+        return value ? std::strtoull(value, nullptr, 10) : 0u;
+    }();
+    if (s_frameDumpDir && *s_frameDumpDir && currentTick >= s_frameDumpFromTick && currentTick >= s_lastFrameDumpTick + s_frameDumpInterval)
+    {
+        s_lastFrameDumpTick = currentTick;
+        const uint32_t dumpWidth = std::max<uint32_t>(1u, std::min<uint32_t>(width, FB_WIDTH));
+        const uint32_t dumpHeight = std::max<uint32_t>(1u, std::min<uint32_t>(presentedHeight, FB_HEIGHT));
+        std::vector<uint8_t> pixels(static_cast<size_t>(dumpWidth) * dumpHeight * 4u);
+        for (uint32_t y = 0; y < dumpHeight; ++y)
+        {
+            std::memcpy(pixels.data() + static_cast<size_t>(y) * dumpWidth * 4u,
+                        s_uploadBuffer.data() + static_cast<size_t>(y) * FB_WIDTH * 4u,
+                        static_cast<size_t>(dumpWidth) * 4u);
+        }
+        for (size_t i = 3; i < pixels.size(); i += 4u)
+        {
+            pixels[i] = 0xFFu; // PS2 alpha is 0..0x80; make the dump opaque
+        }
+        Image frame{};
+        frame.data = pixels.data();
+        frame.width = static_cast<int>(dumpWidth);
+        frame.height = static_cast<int>(dumpHeight);
+        frame.mipmaps = 1;
+        frame.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+        const std::string path = std::string(s_frameDumpDir) + "/frame_" + std::to_string(s_frameDumpIndex++) + "_t" + std::to_string(currentTick) + "_fbp" + std::to_string(displayFbp) + ".png";
+        ExportImage(frame, path.c_str());
+    }
 }
 
 PS2Runtime::PS2Runtime()
@@ -503,8 +588,8 @@ PS2Runtime::PS2Runtime()
     m_guestHeapLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
     m_guestHeapSuggestedBase = kGuestHeapDefaultBase;
     m_guestHeapConfigured = false;
-    m_asyncCallbackStackFloor = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-    m_asyncCallbackStackTop = PS2_RAM_SIZE;
+    m_asyncCallbackStackFloor = kAsyncCallbackStackFloor;
+    m_asyncCallbackStackTop = kAsyncCallbackStackTop;
 }
 
 void PS2Runtime::setDebugUiCallbacks(DebugUiCallback initCallback,
@@ -971,9 +1056,8 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
     }
     {
         std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
-        const uint32_t hardLimit = std::min(kGuestHeapHardLimit, PS2_RAM_SIZE);
-        m_asyncCallbackStackFloor = std::min(std::max(hardLimit, suggestedHeapBase), PS2_RAM_SIZE);
-        m_asyncCallbackStackTop = PS2_RAM_SIZE;
+        m_asyncCallbackStackFloor = kAsyncCallbackStackFloor;
+        m_asyncCallbackStackTop = kAsyncCallbackStackTop;
     }
 
     LoadedModule module;
@@ -1091,17 +1175,89 @@ namespace
 bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
 {
     uint32_t slot = 0u;
-    if (!generatedFunctionTableSlot(address, slot))
+    if (generatedFunctionTableSlot(address, slot))
     {
-        std::cerr << "[function-table] cannot replace guest PC 0x" << std::hex << address
-                  << ": outside generated dense table [0x" << g_ps2RecompiledFunctionTableBase
-                  << ", 0x" << g_ps2RecompiledFunctionTableEnd << ")"
+        g_ps2RecompiledFunctionTable[slot] = func;
+        return true;
+    }
+
+    if ((address & 3u) != 0u)
+    {
+        std::cerr << "[function-table] cannot register unaligned guest PC 0x" << std::hex << address
                   << std::dec << std::endl;
         return false;
     }
 
-    g_ps2RecompiledFunctionTable[slot] = func;
+    // Outside the generated dense table: code loaded at runtime.
+    if (func != nullptr)
+    {
+        m_dynamicFunctions[address] = func;
+    }
+    else
+    {
+        m_dynamicFunctions.erase(address);
+    }
     return true;
+}
+
+void PS2Runtime::setMissingFunctionResolver(MissingFunctionResolver resolver)
+{
+    m_missingFunctionResolver = std::move(resolver);
+}
+
+void PS2Runtime::unregisterFunctionRange(uint32_t start, uint32_t end)
+{
+    for (auto it = m_dynamicFunctions.begin(); it != m_dynamicFunctions.end();)
+    {
+        if (it->first >= start && it->first < end)
+        {
+            it = m_dynamicFunctions.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
+PS2Runtime::RecompiledFunction PS2Runtime::findFunction(uint32_t address)
+{
+    uint32_t slot = 0u;
+    if (generatedFunctionTableSlot(address, slot))
+    {
+        if (RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot])
+        {
+            return fn;
+        }
+    }
+
+    if (!m_dynamicFunctions.empty())
+    {
+        const auto it = m_dynamicFunctions.find(address);
+        if (it != m_dynamicFunctions.end())
+        {
+            return it->second;
+        }
+    }
+
+    if (m_missingFunctionResolver && !m_resolvingMissingFunction)
+    {
+        m_resolvingMissingFunction = true;
+        RecompiledFunction fn = m_missingFunctionResolver(*this, address);
+        m_resolvingMissingFunction = false;
+        if (fn != nullptr)
+        {
+            m_dynamicFunctions[address] = fn;
+            return fn;
+        }
+        // The resolver may have registered a whole module instead.
+        const auto it = m_dynamicFunctions.find(address);
+        if (it != m_dynamicFunctions.end())
+        {
+            return it->second;
+        }
+    }
+    return nullptr;
 }
 
 bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
@@ -1111,8 +1267,8 @@ bool PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
-    uint32_t slot = 0u;
-    return generatedFunctionTableSlot(address, slot) && g_ps2RecompiledFunctionTable[slot] != nullptr;
+    // findFunction() may consult the resolver, which registers loaded code.
+    return const_cast<PS2Runtime *>(this)->findFunction(address) != nullptr;
 }
 
 const char *describeGuestBranchKind(PS2Runtime::GuestBranchKind kind)
@@ -1138,14 +1294,9 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
 
-    uint32_t slot = 0u;
-    if (generatedFunctionTableSlot(address, slot))
+    if (RecompiledFunction fn = findFunction(address))
     {
-        RecompiledFunction fn = g_ps2RecompiledFunctionTable[slot];
-        if (fn != nullptr)
-        {
-            return fn;
-        }
+        return fn;
     }
 
     std::cerr << "Error: No exact recompiled function for guest PC 0x" << std::hex << address
@@ -1991,9 +2142,9 @@ uint32_t PS2Runtime::reserveAsyncCallbackStack(uint32_t size, uint32_t alignment
 
     std::lock_guard<std::mutex> lock(m_asyncCallbackStackMutex);
     uint32_t top = m_asyncCallbackStackTop;
-    if (top > PS2_RAM_SIZE)
+    if (top > kAsyncCallbackStackTop)
     {
-        top = PS2_RAM_SIZE;
+        top = kAsyncCallbackStackTop;
     }
     top &= ~(kGuestHeapDefaultAlignment - 1u);
 

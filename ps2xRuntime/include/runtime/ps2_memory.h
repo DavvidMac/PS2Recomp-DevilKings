@@ -317,6 +317,11 @@ public:
     void setGifPacketCallback(GifPacketCallback cb) { m_gifPacketCallback = std::move(cb); }
     void setGifArbiter(GifArbiter *arbiter) { m_gifArbiter = arbiter; }
 
+    // DMA channel 4 (toIPU) payloads. The IPU itself is not emulated; MPEG
+    // decoding is done by the libmpeg HLE, which consumes the bitstream here.
+    using IpuInputCallback = std::function<void(const uint8_t *, uint32_t)>;
+    void setIpuInputCallback(IpuInputCallback cb) { m_ipuInputCallback = std::move(cb); }
+
     using Vu1MscalCallback = std::function<void(uint32_t startPC, uint32_t top, uint32_t itop)>;
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
@@ -398,6 +403,7 @@ public:
     std::vector<TLBEntry> m_tlbEntries;
 
     GifPacketCallback m_gifPacketCallback;
+    IpuInputCallback m_ipuInputCallback;
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
@@ -450,6 +456,7 @@ public:
 
     std::array<EeTimer, 4> m_eeTimers{};
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
+    bool tryProcessIpuInputDma(uint32_t channelBase, uint32_t chcr);
     void completeDmacChannel(uint32_t channelBase, uint32_t cause);
     void queueCompletedDmacCause(uint32_t cause);
 };
