@@ -93,8 +93,10 @@ private:
     GSMem::TexturePageCache m_texturePageCache;
 
     // Textures decoded to RGBA8888 in 32x32 tiles on first use, so sampling
-    // avoids swizzled reads and CLUT lookups per texel. Entries are dropped
-    // when any VRAM page they cover is written or the CLUT is reloaded.
+    // avoids swizzled reads and CLUT lookups per texel. Tiles are dropped when
+    // a VRAM page they cover is written (at the next use, and again at the
+    // next TEXFLUSH so writes hidden by the texture page buffer show up).
+    // Indexed entries are keyed by a hash of the CLUT contents.
     struct DecodedTexture
     {
         bool valid = false;
@@ -118,10 +120,11 @@ private:
         std::vector<uint32_t> texels;
         std::vector<uint8_t> tileReady;
     };
-    std::array<DecodedTexture, 8> m_decodedTextures{};
+    std::array<DecodedTexture, 32> m_decodedTextures{};
     std::array<uint64_t, 512> m_pageWriteEpoch{};
     uint64_t m_writeEpoch = 1;
     uint64_t m_clutVersion = 0;
+    uint64_t m_flushEpoch = 0;
     uint64_t m_decodeUseCounter = 0;
     DecodedTexture *m_activeTexture = nullptr;
 

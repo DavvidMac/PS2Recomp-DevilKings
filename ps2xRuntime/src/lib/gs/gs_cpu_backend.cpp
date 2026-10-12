@@ -740,7 +740,6 @@ void GSCpuBackend::LoadClutStateUnlocked(const GSTex0Reg &tex0, const GSTexClutR
 
 void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
-    ++m_clutVersion;
     const bool fourBit = isFourBitIndexedPsm(tex0.psm);
     const bool sixteenBit = tex0.cpsm == GS_PSM_CT16 || tex0.cpsm == GS_PSM_CT16S;
     const bool thirtyTwoBit = tex0.cpsm == GS_PSM_CT32 || tex0.cpsm == GS_PSM_CT24;
@@ -785,6 +784,13 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
             m_clut[destination + 256u] = static_cast<uint16_t>(raw >> 16u);
         }
     }
+
+    // Decoded textures key on the palette contents, so reloading an unchanged
+    // CLUT (games do it before every draw) keeps them.
+    uint64_t hash = 0xcbf29ce484222325ull;
+    for (const uint16_t value : m_clut)
+        hash = (hash ^ value) * 0x100000001b3ull;
+    m_clutVersion = hash;
 }
 
 void GSCpuBackend::Flush()
@@ -803,10 +809,24 @@ void GSCpuBackend::TextureFlush()
 void GSCpuBackend::TextureFlushUnlocked()
 {
     m_texturePageCache.Invalidate();
-    // Decoded tiles were read through the texture page buffer, so they share
-    // its TEXFLUSH visibility rule.
+    // Decoded tiles were read through the texture page buffer, so tiles whose
+    // pages were written since the previous flush may hold data the flush now
+    // exposes.
     for (DecodedTexture &entry : m_decodedTextures)
-        std::fill(entry.tileReady.begin(), entry.tileReady.end(), uint8_t{0});
+    {
+        if (!entry.valid)
+            continue;
+        for (uint32_t i = 0; i < entry.pageCount; ++i)
+        {
+            if (m_pageWriteEpoch[(entry.firstPage + i) & 511u] >= m_flushEpoch)
+            {
+                std::fill(entry.tileReady.begin(), entry.tileReady.end(), uint8_t{0});
+                entry.epoch = ++m_writeEpoch;
+                break;
+            }
+        }
+    }
+    m_flushEpoch = ++m_writeEpoch;
 }
 
 void GSCpuBackend::Sync(GSSyncReason reason)
