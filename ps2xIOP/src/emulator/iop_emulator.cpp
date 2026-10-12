@@ -489,10 +489,33 @@ namespace ps2x::iop::detail
             return callFunction(address, a0, a1, a2, a3, gp, instructionBudget);
         }
 
+        // A thread that suspends interrupts (CpuSuspendIntr) is neither
+        // preempted nor interrupted on hardware until it resumes them; IOP
+        // modules rely on that to update shared state atomically. A module that
+        // leaves interrupts off for too long is ignored so the rest of the IOP
+        // keeps running.
+        static constexpr uint64_t kMaxCriticalSectionCycles = 1'000'000u;
+        uint64_t criticalSectionStart = 0u;
+        bool criticalSectionOpen = false;
+        bool inCriticalSection()
+        {
+            if (memory.interruptControl() != 0u)
+            {
+                criticalSectionOpen = false;
+                return false;
+            }
+            if (!criticalSectionOpen)
+            {
+                criticalSectionOpen = true;
+                criticalSectionStart = totalCycles;
+            }
+            return totalCycles - criticalSectionStart < kMaxCriticalSectionCycles;
+        }
+
         // Not that good to use exception handling for control flow but will do for now
         void servicePendingDmaInterrupts()
         {
-            if (servicingDmaInterrupts || pendingDmaInterrupts.empty())
+            if (servicingDmaInterrupts || pendingDmaInterrupts.empty() || inCriticalSection())
                 return;
 
             servicingDmaInterrupts = true;
@@ -523,7 +546,7 @@ namespace ps2x::iop::detail
 
         void servicePendingGuestCallbacks()
         {
-            if (servicingGuestCallbacks || pendingGuestCallbacks.empty())
+            if (servicingGuestCallbacks || pendingGuestCallbacks.empty() || inCriticalSection())
                 return;
 
             std::vector<ScheduledGuestCallback> callbacks;
@@ -571,7 +594,8 @@ namespace ps2x::iop::detail
                 {
                     servicePendingDmaInterrupts();
                     servicePendingGuestCallbacks();
-                    timrman.serviceDue(totalCycles, *this);
+                    if (!inCriticalSection())
+                        timrman.serviceDue(totalCycles, *this);
                     IopThread *next = kernel.beginNextReady(totalCycles);
                     if (!next)
                     {
@@ -586,6 +610,10 @@ namespace ps2x::iop::detail
                     }
                     const uint64_t before = totalCycles;
                     runCpu(next->cpu, static_cast<uint32_t>(std::min<uint64_t>(kDefaultSlice, target - totalCycles)));
+                    // The slice may not end inside a critical section.
+                    while (inCriticalSection() && !next->cpu.stopped && !next->cpu.yielded &&
+                           next->state == IopThreadState::Running)
+                        runCpu(next->cpu, kDefaultSlice);
                     kernel.endTimeslice(*next, kThreadReturnSentinel);
                     if (totalCycles == before)
                         ++totalCycles;
