@@ -22,6 +22,7 @@ These debugging switches are read once at startup from the environment (some are
 | `PS2X_VU1_TRACE` | `<pc>:<pairs>[:<skip>[:<lower>]]` | Once VU1 reaches micro address `<pc>` (hex) for the `<skip>`+1-th time (decimal, default 0), logs the next `<pairs>` (decimal) executed instruction pairs as `[vu1]` with CLIP, Q, VI and VF writes; `<lower>` (hex) only matches where the lower instruction word equals it. Fires once. |
 | `PS2X_VU1_NOCLIP` | Any value | Forces VU1 clip flags to inside; enabled by presence, including an empty value. No output. |
 | `PS2X_VU1_DUMP` | `<vsync>:<path>` | Writes VU1 data memory to `<path>` and micro memory to `<path>.code` at that VSync; prints `[vu1-dump]`. |
+| `PS2X_VU1_STATS` | Any value | About once a second prints `[vu1-stats]`: VU1 micro program runs, instruction pairs and cycles per second, the share of wall time spent in VU1 and host nanoseconds per pair. |
 
 ## GS/video
 

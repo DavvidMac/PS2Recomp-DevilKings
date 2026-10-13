@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 
 class GS;
 class PS2Memory;
@@ -208,6 +209,7 @@ private:
     uint32_t m_cachedCodeSize = 0;
     uint64_t m_cachedCodeGeneration = 0;
     bool m_decodedCodeCacheValid = false;
+    DecodedInstructionPair m_uncachedDecodedPair{};
 
     std::array<FlagPipelineEntry, kMaxFlagEntries> m_flagPipeline{};
     ScalarPipelineEntry m_fdiv{};
@@ -216,6 +218,12 @@ private:
     std::array<PendingVfWrite, kMaxPendingVfWrites> m_vfWritePipeline{};
     std::array<PendingViWrite, kMaxPendingViWrites> m_viWritePipeline{};
     std::array<PendingAccWrite, kMaxPendingAccWrites> m_accWritePipeline{};
+    // Bit n set = slot n of the matching pipeline holds a queued entry.
+    uint32_t m_flagSlots = 0;
+    uint32_t m_storeSlots = 0;
+    uint32_t m_vfWriteSlots = 0;
+    uint32_t m_viWriteSlots = 0;
+    uint32_t m_accWriteSlots = 0;
     XgkickPipeline m_xgkick{};
     std::array<std::array<uint64_t, 4>, 32> m_vfReady{};
     std::array<uint64_t, 16> m_viReady{};
@@ -225,6 +233,8 @@ private:
     std::array<uint64_t, 4> m_accLatestWrite{};
 
     uint64_t m_cycle = 0;
+    // Earliest readyCycle of any queued pipeline entry; commits are skipped until then.
+    uint64_t m_nextCommitCycle = ~0ull;
     uint64_t m_nextWriteSequence = 0;
     uint64_t m_efuResourceReady = 0;
     uint32_t m_workingClip = 0;
@@ -250,7 +260,7 @@ private:
     static void addVfWrite(InstructionUsage &usage, uint8_t reg, uint8_t lanes);
     static uint8_t vfReadLanes(const InstructionUsage &usage, uint8_t reg);
     DecodedInstructionPair decodeInstructionPair(const uint8_t *vuCode, uint32_t pc) const;
-    DecodedInstructionPair getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
+    const DecodedInstructionPair &getDecodedInstructionPairForPc(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory, uint32_t pc);
     void rebuildDecodedCodeCache(const uint8_t *vuCode, uint32_t codeSize, const PS2Memory *memory, uint64_t generation);
 
     void execUpper(uint32_t instr);
@@ -275,8 +285,14 @@ private:
     void queueViWrite(uint8_t reg, int32_t value, uint32_t latency);
     void queueAccWrite(uint8_t laneMask, const float value[4], uint32_t latency);
     void startXgkick(uint32_t qwordAddress);
+    void resetXgkick();
 
     void resetScheduler();
+    void noteCommitCycle(uint64_t readyCycle)
+    {
+        if (readyCycle < m_nextCommitCycle)
+            m_nextCommitCycle = readyCycle;
+    }
     void commitReadyPipelines();
     void advanceOneCycle();
     void advanceTo(uint64_t targetCycle);
@@ -287,7 +303,18 @@ private:
     void markPairWrites(const DecodedInstructionPair &decoded);
     bool pipelinesPending() const;
 
-    float normalizeOperand(float value) const;
+    float normalizeOperand(float value) const
+    {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &value, sizeof(bits));
+        const uint32_t exponent = (bits >> 23) & 0xFFu;
+        if (exponent == 0u)
+            bits &= 0x80000000u;
+        else if (exponent == 0xFFu)
+            bits = (bits & 0x80000000u) | 0x7F7FFFFFu;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    }
     float normalizeResult(float value, uint32_t &laneFlags) const;
     uint32_t microAddressMask() const;
     int32_t readBranchVi(uint8_t reg) const;
