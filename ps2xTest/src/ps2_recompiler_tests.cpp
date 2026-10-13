@@ -62,7 +62,8 @@ static Function makeFunction(const std::string &name, uint32_t start, uint32_t e
     return fn;
 }
 
-static bool writeMinimalMipsElfWithCodeAndDataFunctionSymbols(const std::filesystem::path &elfPath)
+static bool writeMinimalMipsElfWithCodeAndDataFunctionSymbols(const std::filesystem::path &elfPath,
+                                                              bool dataExecutable = false)
 {
     ELFIO::elfio writer;
     writer.create(ELFIO::ELFCLASS32, ELFIO::ELFDATA2LSB);
@@ -81,7 +82,7 @@ static bool writeMinimalMipsElfWithCodeAndDataFunctionSymbols(const std::filesys
 
     ELFIO::section *data = writer.sections.add(".data");
     data->set_type(ELFIO::SHT_PROGBITS);
-    data->set_flags(ELFIO::SHF_ALLOC | ELFIO::SHF_WRITE);
+    data->set_flags(ELFIO::SHF_ALLOC | ELFIO::SHF_WRITE | (dataExecutable ? ELFIO::SHF_EXECINSTR : 0));
     data->set_addr_align(4);
     data->set_address(0x00200000u);
     const char dataBytes[] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, static_cast<char>(0x88)};
@@ -114,7 +115,7 @@ static bool writeMinimalMipsElfWithCodeAndDataFunctionSymbols(const std::filesys
 
     ELFIO::segment *dataSegment = writer.segments.add();
     dataSegment->set_type(ELFIO::PT_LOAD);
-    dataSegment->set_flags(ELFIO::PF_R | ELFIO::PF_W);
+    dataSegment->set_flags(ELFIO::PF_R | ELFIO::PF_W | (dataExecutable ? ELFIO::PF_X : 0));
     dataSegment->set_align(0x1000);
     dataSegment->add_section_index(data->get_index(), data->get_addr_align());
 
@@ -1574,6 +1575,44 @@ void register_ps2_recompiler_tests()
 
             t.IsTrue(hasCodeFunction, "function in executable section should be retained");
             t.IsFalse(hasDataFunction, "STT_FUNC symbol in .data must be ignored");
+
+            std::error_code removeError;
+            std::filesystem::remove(elfPath, removeError);
+        });
+
+        tc.Run("elf parser keeps .data out of code discovery when the linker flags it executable", [](TestCase &t) {
+            const auto uniqueSuffix = std::to_string(
+                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::filesystem::path elfPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-wax-data-" + uniqueSuffix + ".elf");
+
+            const bool writeOk = writeMinimalMipsElfWithCodeAndDataFunctionSymbols(elfPath, true);
+            t.IsTrue(writeOk, "temporary ELF with an executable .data should be generated");
+            if (!writeOk)
+                return;
+
+            ElfParser parser(elfPath.string());
+            const bool parseOk = parser.parse();
+            t.IsTrue(parseOk, "ELF with an executable .data should parse");
+            if (parseOk)
+            {
+                const auto sections = parser.getSections();
+                const auto dataSection = std::find_if(sections.begin(), sections.end(),
+                                                      [](const Section &section)
+                                                      { return section.name == ".data"; });
+                t.IsTrue(dataSection != sections.end(), ".data bytes should remain available");
+                if (dataSection != sections.end())
+                {
+                    t.IsFalse(dataSection->isCode, ".data must not be decoded as R5900 code");
+                    t.IsTrue(dataSection->isData, ".data must still be treated as data");
+                }
+
+                const auto functions = parser.extractFunctions();
+                const bool hasDataFunction = std::any_of(functions.begin(), functions.end(),
+                                                         [](const Function &fn)
+                                                         { return fn.start == 0x00200000u; });
+                t.IsFalse(hasDataFunction, "STT_FUNC symbol in an executable .data must be ignored");
+            }
 
             std::error_code removeError;
             std::filesystem::remove(elfPath, removeError);

@@ -1687,6 +1687,24 @@ namespace ps2recomp
     {
     }
 
+    namespace
+    {
+        bool HasSectionName(const std::string &name, const char *base)
+        {
+            const std::string prefix = std::string(base) + ".";
+            return name == base || name.rfind(prefix, 0) == 0;
+        }
+
+        // SN Systems' linker flags .data executable (WAX). Decoding its tables
+        // as R5900 code produces huge garbage functions, so the conventional
+        // data sections stay data whatever their flags say.
+        bool IsConventionalDataSectionName(const std::string &name)
+        {
+            return HasSectionName(name, ".data") || HasSectionName(name, ".sdata") ||
+                   HasSectionName(name, ".rodata");
+        }
+    }
+
     bool ElfParser::isExecutableSection(const ELFIO::section *section) const
     {
         if ((section->get_flags() & ELFIO::SHF_EXECINSTR) == 0)
@@ -1697,15 +1715,18 @@ namespace ps2recomp
         // bytes in the parsed ELF while excluding these ABI-defined section
         // names from EE function discovery and recompilation.
         const std::string name = section->get_name();
-        const bool vuText = name == ".vutext" || name.rfind(".vutext.", 0) == 0;
-        const bool dvpOverlay = name == ".DVP.overlay" || name.rfind(".DVP.overlay.", 0) == 0;
-        return !vuText && !dvpOverlay;
+        const bool vuText = HasSectionName(name, ".vutext");
+        const bool dvpOverlay = HasSectionName(name, ".DVP.overlay");
+        return !vuText && !dvpOverlay && !IsConventionalDataSectionName(name);
     }
 
     bool ElfParser::isDataSection(const ELFIO::section *section) const
     {
-        return (section->get_flags() & ELFIO::SHF_ALLOC) != 0 &&
-               !(section->get_flags() & ELFIO::SHF_EXECINSTR);
+        if ((section->get_flags() & ELFIO::SHF_ALLOC) == 0)
+            return false;
+
+        return !(section->get_flags() & ELFIO::SHF_EXECINSTR) ||
+               IsConventionalDataSectionName(section->get_name());
     }
 
     std::vector<Function> ElfParser::extractFunctions() const
