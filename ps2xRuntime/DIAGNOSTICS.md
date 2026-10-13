@@ -8,6 +8,7 @@ These debugging switches are read once at startup from the environment (some are
 |---|---|---|
 | `PS2X_WATCH` | `<addr>[:<bytes>[:<vsync>]]` | Reports writes overlapping the watched EE RAM range from the selected VSync. Address uses C-style base detection; omitted byte length defaults to 4 and omitted VSync to 0. Prints `[watch]` with registers and a stack scan; capped at 4,000 reports. |
 | `PS2X_RDRAM_DUMP` | `<vsync>:<path>` | Writes 32 MiB of EE RAM to the file at that VSync; prints `[rdram-dump]`. |
+| `PS2X_PROFILE` | `<delaySeconds>:<seconds>:<path>` | Windows only. A sampling profiler starts `<delaySeconds>` after start-up, records the instruction pointer of every thread about once per millisecond for `<seconds>`, then writes the 40 busiest functions of each thread to `<path>`; prints `[profile]`. |
 | `PS2X_PEEK` | `<hex-addr>[:<words>][,...]` | At each thread dump, prints memory words for each address. Word count defaults to 1 and is capped at 64 per address. |
 | `PS2X_THREAD_DUMP` | `<vsync-interval>` | Prints guest thread state every N VSyncs as `[thread-dump]`; 0 or omitted disables it. |
 | `PS2X_WAKE_TRACE` | `<tid>` | Logs wakeups directed at the thread ID as `[wake]`; omitted disables tracing. |
