@@ -549,6 +549,30 @@ void register_ps2_runtime_kernel_tests()
 {
     MiniTest::Case("PS2RuntimeKernel", [](TestCase &tc)
     {
+        tc.Run("FPU CVT.W.S truncates toward zero and saturates like the EE", [](TestCase &t)
+        {
+            // Games derive grid cells and animation frames with (int)(x / size);
+            // rounding to nearest picks the neighbouring cell.
+            t.Equals(FPU_CVT_W_S(2.7f), 2, "positive values truncate");
+            t.Equals(FPU_CVT_W_S(-2.7f), -2, "negative values truncate toward zero");
+            t.Equals(FPU_CVT_W_S(30.5f), 30, "halfway values do not round up");
+            t.Equals(FPU_CVT_W_S(3.0e9f), INT32_MAX, "positive overflow saturates");
+            t.Equals(FPU_CVT_W_S(-3.0e9f), INT32_MIN, "negative overflow saturates");
+        });
+
+        tc.Run("every R5900Context starts with VF00 hardwired to (0, 0, 0, 1)", [](TestCase &t)
+        {
+            // Threads, interrupt handlers and callbacks all start from a fresh
+            // context; VU0 macro code copies W = 1.0 out of VF00.
+            const R5900Context context{};
+            alignas(16) float lanes[4]{};
+            _mm_store_ps(lanes, context.vu0_vf[0]);
+            t.Equals(lanes[0], 0.0f, "VF00.x");
+            t.Equals(lanes[1], 0.0f, "VF00.y");
+            t.Equals(lanes[2], 0.0f, "VF00.z");
+            t.Equals(lanes[3], 1.0f, "VF00.w");
+        });
+
         tc.Run("unsigned loads and ABI word writes extend independently", [](TestCase &t)
         {
             constexpr uint64_t kUpper = 0x1122334455667788ull;

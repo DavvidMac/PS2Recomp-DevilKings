@@ -1032,15 +1032,40 @@ void register_code_generator_tests()
             sqrtInst.sa = 20;
             sqrtInst.function = COP1_S_SQRT;
             const std::string sqrtCode = gen.translateInstruction(sqrtInst);
-            t.IsTrue(sqrtCode.find("ctx->f[20] = FPU_SQRT_S(ctx->f[22])") != std::string::npos,
+            t.IsTrue(sqrtCode.find("ctx->f[20] = ps2_fpu_sqrt_s(ctx, ctx->f[22])") != std::string::npos,
                      "SQRT.S must read ft: " + sqrtCode);
 
             Instruction rsqrtInst = sqrtInst;
             rsqrtInst.rd = 3;
             rsqrtInst.function = COP1_S_RSQRT;
             const std::string rsqrtCode = gen.translateInstruction(rsqrtInst);
-            t.IsTrue(rsqrtCode.find("ctx->f[20] = ctx->f[3] / FPU_SQRT_S(ctx->f[22])") != std::string::npos,
+            t.IsTrue(rsqrtCode.find("ctx->f[20] = ps2_fpu_rsqrt_s(ctx, ctx->f[3], ctx->f[22])") != std::string::npos,
                      "RSQRT.S must compute fs / sqrt(ft): " + rsqrtCode);
+        });
+
+        tc.Run("EE DIV.S uses the saturating helper and VF00 ignores writes", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            // div.s $f0, $f1, $f2
+            Instruction divInst{};
+            divInst.opcode = OPCODE_COP1;
+            divInst.rs = COP1_S;
+            divInst.rt = 2;
+            divInst.rd = 1;
+            divInst.sa = 0;
+            divInst.function = COP1_S_DIV;
+            const std::string divCode = gen.translateInstruction(divInst);
+            t.IsTrue(divCode.find("ctx->f[0] = ps2_fpu_div_s(ctx, ctx->f[1], ctx->f[2])") != std::string::npos,
+                     "DIV.S must not produce infinities: " + divCode);
+
+            // lqc2 $vf0, 0($a0) must not clobber VF00.
+            Instruction lqc2{};
+            lqc2.opcode = OPCODE_LQC2;
+            lqc2.rs = 4;
+            lqc2.rt = 0;
+            const std::string lqc2Code = gen.translateInstruction(lqc2);
+            t.IsTrue(lqc2Code.find("ctx->vu0_vf[0] =") == std::string::npos,
+                     "LQC2 into VF00 must be discarded: " + lqc2Code);
         });
 
         tc.Run("VU0 VRNEXT writes the advanced R register to ft", [](TestCase &t) {

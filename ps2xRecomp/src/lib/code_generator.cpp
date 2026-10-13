@@ -260,7 +260,12 @@ namespace ps2recomp
 
     std::string CodeGenerator::translateVUInstruction(const Instruction &inst)
     {
-        return VuTranslator(*this).translate(inst);
+        std::string code = VuTranslator(*this).translate(inst);
+        // VF00 is hardwired to (0, 0, 0, 1) and ignores writes. Macro-mode code
+        // (or data the analyser took for code) may still name it as a destination.
+        if (code.find("ctx->vu0_vf[0] =") != std::string::npos)
+            code += " ctx->vu0_vf[0] = _mm_set_ps(1.0f, 0.0f, 0.0f, 0.0f);";
+        return code;
     }
 
     CodeGenerator::AnalysisResult CodeGenerator::collectInternalBranchTargets(

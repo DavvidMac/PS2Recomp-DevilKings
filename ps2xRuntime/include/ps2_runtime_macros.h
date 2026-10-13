@@ -623,7 +623,81 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define FPU_FLOOR_W_S(a) ((int32_t)floorf((float)(a)))
 #define FPU_CVT_S_W(a) ((float)(int32_t)(a))
 #define FPU_CVT_S_L(a) ((float)(int64_t)(a))
-#define FPU_CVT_W_S(a) ((int32_t)nearbyintf((float)(a)))
+// The EE FPU only rounds toward zero: CVT.W.S truncates regardless of the host
+// rounding mode, and values with |x| >= 2^31 saturate to INT32_MAX/INT32_MIN.
+inline int32_t ps2_fpu_cvt_w_s(float value)
+{
+    uint32_t bits;
+    std::memcpy(&bits, &value, sizeof(bits));
+    if ((bits & 0x7F800000u) >= 0x4F000000u)
+        return (bits & 0x80000000u) != 0u ? INT32_MIN : INT32_MAX;
+    return static_cast<int32_t>(value);
+}
+#define FPU_CVT_W_S(a) ps2_fpu_cvt_w_s((float)(a))
+
+// The EE FPU has no infinities or NaNs. Division by zero (or a denormal, which
+// it treats as zero) returns +-FLT_MAX with the quotient's sign and raises D
+// (I for 0/0); square roots of negative values use |x| and raise I.
+constexpr uint32_t kPs2FpuFlagsInvalid = 0x00020040u; // I | SI
+constexpr uint32_t kPs2FpuFlagsDivide = 0x00010020u;  // D | SD
+
+inline float ps2_fpu_signed_max(uint32_t sign)
+{
+    const uint32_t bits = (sign & 0x80000000u) | 0x7F7FFFFFu;
+    float value;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+inline float ps2_fpu_div_s(R5900Context *ctx, float num, float den)
+{
+    uint32_t n, d;
+    std::memcpy(&n, &num, sizeof(n));
+    std::memcpy(&d, &den, sizeof(d));
+    if ((d & 0x7F800000u) == 0u)
+    {
+        ctx->fcr31 |= (n & 0x7F800000u) == 0u ? kPs2FpuFlagsInvalid : kPs2FpuFlagsDivide;
+        return ps2_fpu_signed_max(n ^ d);
+    }
+    return num / den;
+}
+
+inline float ps2_fpu_sqrt_s(R5900Context *ctx, float value)
+{
+    uint32_t v;
+    std::memcpy(&v, &value, sizeof(v));
+    if ((v & 0x7F800000u) == 0u)
+    {
+        const uint32_t zero = v & 0x80000000u;
+        float result;
+        std::memcpy(&result, &zero, sizeof(result));
+        return result;
+    }
+    if ((v & 0x80000000u) != 0u)
+    {
+        ctx->fcr31 |= kPs2FpuFlagsInvalid;
+        return std::sqrt(std::fabs(value));
+    }
+    return std::sqrt(value);
+}
+
+inline float ps2_fpu_rsqrt_s(R5900Context *ctx, float num, float den)
+{
+    uint32_t n, d;
+    std::memcpy(&n, &num, sizeof(n));
+    std::memcpy(&d, &den, sizeof(d));
+    if ((d & 0x7F800000u) == 0u)
+    {
+        ctx->fcr31 |= kPs2FpuFlagsDivide;
+        return ps2_fpu_signed_max(n ^ d);
+    }
+    if ((d & 0x80000000u) != 0u)
+    {
+        ctx->fcr31 |= kPs2FpuFlagsInvalid;
+        return num / std::sqrt(std::fabs(den));
+    }
+    return num / std::sqrt(den);
+}
 #define FPU_CVT_L_S(a) ((int64_t)(float)(a))
 #define FPU_C_F_S(a, b) (0)
 #define FPU_C_UN_S(a, b) (isnan((float)(a)) || isnan((float)(b)))
