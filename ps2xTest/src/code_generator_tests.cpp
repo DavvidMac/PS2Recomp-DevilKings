@@ -1043,6 +1043,30 @@ void register_code_generator_tests()
                      "RSQRT.S must compute fs / sqrt(ft): " + rsqrtCode);
         });
 
+        tc.Run("VU0 VRNEXT writes the advanced R register to ft", [](TestCase &t) {
+            CodeGenerator gen({}, {});
+
+            // vrnext.x $vf5, R (0x4B05043C): ft=5, dest=x.
+            Instruction next{};
+            next.rt = 5;
+            next.vectorInfo.vectorField = 0x8;
+            const std::string nextCode = gen.translateVU_VRNEXT(next);
+            t.IsTrue(nextCode.find("ctx->vu0_vf[5] = _mm_blendv_ps(ctx->vu0_vf[5], ctx->vu0_r") != std::string::npos,
+                     "VRNEXT must write R to ft: " + nextCode);
+            t.IsTrue(nextCode.find("((r >> 4) & 1u) ^ ((r >> 22) & 1u)") != std::string::npos,
+                     "VRNEXT must step the 23-bit LFSR: " + nextCode);
+            t.IsTrue(nextCode.find("_mm_set_epi32(0, 0, 0, -1)") != std::string::npos,
+                     "VRNEXT.x must only write the x field: " + nextCode);
+
+            // vrinit R, $vf5y keeps the mantissa of the selected field.
+            Instruction init{};
+            init.rd = 5;
+            init.vectorInfo.fsf = 1;
+            const std::string initCode = gen.translateVU_VRINIT(init);
+            t.IsTrue(initCode.find("0x3F800000u | (fs_bits[1] & 0x007FFFFFu)") != std::string::npos,
+                     "VRINIT must load the selected field's mantissa: " + initCode);
+        });
+
         tc.Run("VU CFC2/CTC2 access VI registers directly", [](TestCase& t)
             {
                 CodeGenerator gen({}, {});
@@ -2029,33 +2053,29 @@ void register_code_generator_tests()
                      "jalr fallback should not dispatch directly to tail-jump delay slot");
         });
 
-        tc.Run("VU random helpers emit line comments on separate lines", [](TestCase &t) {
+        tc.Run("VU random helpers emit no line comments that could swallow code", [](TestCase &t) {
             CodeGenerator gen({}, {});
 
             Instruction inst{};
             inst.rd = 7;
+            inst.rt = 3;
             inst.vectorInfo.fsf = 2;
+            inst.vectorInfo.vectorField = 0xF;
 
-            std::string vrnext = gen.translateVU_VRNEXT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRNEXT", vrnext);
-            t.IsTrue(vrnext.find("// Simple LFSR-based random number generation (PS2-like behavior)\n"
-                                 "    uint32_t feedback") != std::string::npos,
-                     "VRNEXT should place the generated line comment on its own line");
-
-            std::string vrinit = gen.translateVU_VRINIT(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRINIT", vrinit);
-            t.IsTrue(vrinit.find("// PS2 uses a specific LFSR initialization pattern\n"
-                                 "    if (seed == 0) seed = 1;") != std::string::npos,
-                     "VRINIT should place the generated line comment on its own line");
-
-            std::string vrxor = gen.translateVU_VRXOR(inst);
-            printGeneratedCode("VU random helpers emit line comments on separate lines - VRXOR", vrxor);
-            t.IsTrue(vrxor.find("// XOR the current random value with the data from the VU vector register\n"
-                                "    __m128i xored") != std::string::npos,
-                     "VRXOR should keep the XOR comment on its own line");
-            t.IsTrue(vrxor.find("// Apply a simple mixing function similar to PS2's LFSR\n"
-                                "    __m128i mixed") != std::string::npos,
-                     "VRXOR should keep the LFSR comment on its own line");
+            const std::pair<const char *, std::string> helpers[] = {
+                {"VRNEXT", gen.translateVU_VRNEXT(inst)},
+                {"VRGET", gen.translateVU_VRGET(inst)},
+                {"VRINIT", gen.translateVU_VRINIT(inst)},
+                {"VRXOR", gen.translateVU_VRXOR(inst)},
+            };
+            for (const auto &[name, code] : helpers)
+            {
+                printGeneratedCode(std::string("VU random helpers - ") + name, code);
+                t.IsTrue(code.find("//") == std::string::npos,
+                         std::string(name) + " must not emit line comments: " + code);
+            }
+            t.IsTrue(helpers[3].second.find("(r ^ fs_bits[2]) & 0x007FFFFFu") != std::string::npos,
+                     "VRXOR must XOR the selected field's mantissa into R");
         });
 
         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {

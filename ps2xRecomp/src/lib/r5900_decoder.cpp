@@ -920,8 +920,8 @@ namespace ps2recomp
                     inst.modificationInfo.modifiesControl = false; /* Reads R, writes VF */
                     break;
                 case VU0_S2_VRNEXT:
-                    inst.modificationInfo.modifiesControl = true; /* Modifies R */
-                    inst.modificationInfo.modifiesVFR = false;
+                    inst.modificationInfo.modifiesControl = true; /* Modifies R and writes ft */
+                    inst.modificationInfo.modifiesVFR = true;
                     break;
                 case VU0_S2_VABS:
                 case VU0_S2_VMOVE:
