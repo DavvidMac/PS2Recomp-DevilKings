@@ -352,6 +352,13 @@ public:
     using MissingFunctionResolver = std::function<RecompiledFunction(PS2Runtime &runtime, uint32_t address)>;
     void setMissingFunctionResolver(MissingFunctionResolver resolver);
     void unregisterFunctionRange(uint32_t start, uint32_t end);
+
+    // Code recompiled as a relocatable module (linked at 0, placed anywhere by
+    // the guest's loader) asks which loaded module holds its PC and adds that
+    // base to every address it uses. A module may be loaded more than once.
+    void registerGuestModule(uint32_t base, uint32_t size);
+    void unregisterGuestModule(uint32_t base);
+    uint32_t guestModuleBase(uint32_t address) const;
     bool dispatchGuestBranch(uint8_t *rdram,
                              R5900Context *ctx,
                              uint32_t targetPc,
@@ -533,6 +540,12 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     RecompiledFunction findFunction(uint32_t address);
     std::unordered_map<uint32_t, RecompiledFunction> m_dynamicFunctions;
+    struct GuestModuleRange
+    {
+        uint32_t base = 0;
+        uint32_t end = 0;
+    };
+    std::vector<GuestModuleRange> m_guestModules;
     MissingFunctionResolver m_missingFunctionResolver;
     bool m_resolvingMissingFunction = false;
     std::atomic<bool> m_missingFunctionReported{false};

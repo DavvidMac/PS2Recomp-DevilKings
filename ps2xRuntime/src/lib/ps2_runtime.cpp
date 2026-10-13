@@ -1390,6 +1390,43 @@ void PS2Runtime::setMissingFunctionResolver(MissingFunctionResolver resolver)
     m_missingFunctionResolver = std::move(resolver);
 }
 
+void PS2Runtime::registerGuestModule(uint32_t base, uint32_t size)
+{
+    unregisterGuestModule(base);
+    m_guestModules.push_back(GuestModuleRange{base, base + size});
+}
+
+void PS2Runtime::unregisterGuestModule(uint32_t base)
+{
+    m_guestModules.erase(std::remove_if(m_guestModules.begin(), m_guestModules.end(),
+                                        [base](const GuestModuleRange &module)
+                                        { return module.base == base; }),
+                         m_guestModules.end());
+}
+
+uint32_t PS2Runtime::guestModuleBase(uint32_t address) const
+{
+    // Loaders may hand a module's tail (relocation tables and the like) back to
+    // the heap once it is linked, so a later module can sit inside an earlier
+    // module's registered range. The innermost module, the one with the
+    // highest base, is the one that owns the address.
+    uint32_t best = 0u;
+    bool found = false;
+    for (const GuestModuleRange &module : m_guestModules)
+    {
+        if (address >= module.base && address < module.end && (!found || module.base > best))
+        {
+            best = module.base;
+            found = true;
+        }
+    }
+    if (!found)
+    {
+        std::cerr << "[guest-module] no loaded module contains PC 0x" << std::hex << address << std::dec << std::endl;
+    }
+    return best;
+}
+
 void PS2Runtime::unregisterFunctionRange(uint32_t start, uint32_t end)
 {
     for (auto it = m_dynamicFunctions.begin(); it != m_dynamicFunctions.end();)

@@ -19,6 +19,7 @@
 #include "ps2_runtime_calls.h"
 
 #include <fmt/format.h>
+#include <optional>
 #include <sstream>
 #include <algorithm>
 #include <cstring>
@@ -223,13 +224,71 @@ namespace ps2recomp
 
     CodeGenerator::~CodeGenerator() = default;
 
+    void CodeGenerator::setRelocatableModule(ModuleRelocations relocations)
+    {
+        m_relocatableModule = true;
+        m_moduleRelocations = std::move(relocations);
+    }
+
+    std::string CodeGenerator::guestAddress(uint32_t address) const
+    {
+        return m_relocatableModule ? fmt::format("(moduleBase + 0x{:X}u)", address)
+                                   : fmt::format("0x{:X}u", address);
+    }
+
+    std::string CodeGenerator::guestAddressKey(const std::string &expression) const
+    {
+        return m_relocatableModule ? "(" + expression + " - moduleBase)" : expression;
+    }
+
+    bool CodeGenerator::isModuleImportJump(uint32_t address) const
+    {
+        return m_relocatableModule && m_moduleRelocations.importJumpSites.contains(address);
+    }
+
+    bool CodeGenerator::isModuleRelocatedHi16(uint32_t address) const
+    {
+        return m_relocatableModule && (m_moduleRelocations.internalHi16Sites.contains(address) ||
+                                       m_moduleRelocations.importHi16Sites.contains(address));
+    }
+
+    namespace
+    {
+        // A relocated `lui` produces the full address its LO16 partners need,
+        // minus their own (unrelocated) immediates, so those instructions are
+        // translated unchanged. The loader computes the same sum with the carry
+        // folded into the patched HI16.
+        std::optional<std::string> translateModuleHi16(const CodeGenerator &cg, const Instruction &inst)
+        {
+            if (inst.opcode != OPCODE_LUI || !cg.isModuleRelocatedHi16(inst.address))
+                return std::nullopt;
+
+            const auto &relocations = cg.m_moduleRelocations;
+            if (relocations.internalHi16Sites.contains(inst.address))
+            {
+                return fmt::format("SET_GPR_S32(ctx, {}, (int32_t)(((uint32_t){} << 16) + moduleBase));",
+                                   inst.rt, inst.immediate);
+            }
+
+            const CodeGenerator::ModuleImportHi16 &import = relocations.importHi16Sites.at(inst.address);
+            return fmt::format(
+                "SET_GPR_S32(ctx, {}, (int32_t)(((READ32(moduleBase + 0x{:X}u) & 0xFFFFu) << 16) + "
+                "(uint32_t)(int32_t)(int16_t)READ32(moduleBase + 0x{:X}u) - (uint32_t)(int32_t){}));",
+                inst.rt, inst.address, import.pairedLo16Site, import.linkedLo16);
+        }
+    }
+
     std::string CodeGenerator::translateInstruction(const Instruction &inst)
     {
+        if (auto hi16 = translateModuleHi16(*this, inst))
+            return *hi16;
         return InstructionTranslator(*this).translate(inst, {});
     }
 
     std::string CodeGenerator::translateInstruction(const Instruction &inst, const MemoryAccessHint &memoryHint)
     {
+        if (auto hi16 = translateModuleHi16(*this, inst))
+            return *hi16;
         return InstructionTranslator(*this).translate(inst, memoryHint);
     }
 

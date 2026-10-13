@@ -135,6 +135,26 @@ namespace ps2recomp
         std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b)
                   { return a.first < b.first; });
 
+        if (cg.m_relocatableModule)
+        {
+            // A relocatable module has no fixed slots: the runtime calls this
+            // once per load with the address the module was placed at.
+            std::stringstream ss;
+            ss << "#include \"ps2_runtime.h\"\n";
+            ss << "#include <ps2_recompiled_functions.h>\n";
+            ss << "#include \"ps2_stubs.h\"\n";
+            ss << "#include <ps2_recompiled_stubs.h>\n";
+            ss << "#include \"ps2_syscalls.h\"\n\n";
+            ss << "void registerModuleFunctions(PS2Runtime &runtime, uint32_t moduleBase)\n{\n";
+            for (const auto &[address, name] : entries)
+            {
+                ss << "    runtime.registerFunction(moduleBase + 0x" << std::hex << address << "u, &" << name
+                   << "); // 0x" << address << std::dec << "\n";
+            }
+            ss << "}\n";
+            return ss.str();
+        }
+
         uint32_t tableBase = 0u;
         uint32_t tableEnd = 0u;
         uint32_t slotCount = 0u;

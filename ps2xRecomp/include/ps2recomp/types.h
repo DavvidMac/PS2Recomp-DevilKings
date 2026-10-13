@@ -134,6 +134,8 @@ namespace ps2recomp
         std::string symbolName;
         uint32_t type;
         int32_t addend;
+        // The symbol is not defined in this ELF (SHN_UNDEF): an import.
+        bool symbolUndefined = false;
     };
 
     // Jump table entry
@@ -179,6 +181,11 @@ namespace ps2recomp
         std::string outputPath;
         std::string ghidraMapPath;
         bool singleFileOutput = false;
+        // The input is a relocatable module linked at address 0 whose loader
+        // places it anywhere in RAM (SN Systems SNR2 DLLs). Generated code then
+        // derives every module address from the base the runtime reports, and
+        // the ELF's relocations mark the immediates the loader patches.
+        bool relocatableModule = false;
         bool lowMemoryMode = false;
         uint32_t outputWorkerThreads = 0;
         bool patchSyscalls = false;
