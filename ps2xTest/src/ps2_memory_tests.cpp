@@ -650,6 +650,57 @@ void register_ps2_memory_tests()
             t.Equals(w, preservedW, "mask=3 should write-protect destination field");
         });
 
+        tc.Run("VIF UNPACK V2 and V3 fill the lanes they do not carry", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0xCD, PS2_VU1_DATA_SIZE);
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x65u, 1u, 0u)); // UNPACK V2-16 -> addr 0
+            appendU32(packet, 0xFFFE0003u);               // x=3, y=-2
+            appendU32(packet, makeVifCmd(0x68u, 2u, 1u)); // UNPACK V3-32 -> addr 1..2
+            appendU32(packet, 1u);
+            appendU32(packet, 2u);
+            appendU32(packet, 3u);
+            appendU32(packet, 4u);
+            appendU32(packet, 5u);
+            appendU32(packet, 6u);
+            appendU32(packet, makeVifCmd(0x00u, 0u, 0u)); // NOP after the payload
+
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            uint32_t v[3][4]{};
+            std::memcpy(v, mem.getVU1Data(), sizeof(v));
+            t.Equals(v[0][0], 3u, "V2 x");
+            t.Equals(v[0][1], 0xFFFFFFFEu, "V2 y is sign-extended");
+            t.Equals(v[0][2], 3u, "V2 repeats x into z");
+            t.Equals(v[0][3], 0xFFFFFFFEu, "V2 repeats y into w");
+            t.Equals(v[1][3], 4u, "V3 takes w from the next element in the stream");
+            t.Equals(v[2][2], 6u, "second V3 vector z");
+            t.Equals(v[2][3], 0u, "last V3 w reads the following word");
+        });
+
+        tc.Run("VIF UNPACK V4-5 expands RGBA5551 to 8-bit channels", [](TestCase &t)
+        {
+            PS2Memory mem;
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            std::memset(mem.getVU1Data(), 0, PS2_VU1_DATA_SIZE);
+
+            std::vector<uint8_t> packet;
+            appendU32(packet, makeVifCmd(0x6Fu, 1u, 0u)); // UNPACK V4-5 -> addr 0
+            appendU32(packet, 0x0000FC21u);               // r=1, g=1, b=31, a=1
+
+            mem.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+
+            uint32_t v[4]{};
+            std::memcpy(v, mem.getVU1Data(), sizeof(v));
+            t.Equals(v[0], 8u, "V4-5 red << 3");
+            t.Equals(v[1], 8u, "V4-5 green << 3");
+            t.Equals(v[2], 248u, "V4-5 blue << 3");
+            t.Equals(v[3], 128u, "V4-5 alpha << 7");
+        });
+
         tc.Run("VIF STMOD offset and difference modes apply to UNPACK data", [](TestCase &t)
         {
             PS2Memory mem;

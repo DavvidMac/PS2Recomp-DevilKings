@@ -611,6 +611,12 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         ++srcIndex;
                         decoded = true;
                     }
+                    else if (!sourceAvailable && srcBase + (srcIndex + 1u) * bytesPerVector <= data + sizeBytes)
+                    {
+                        // Filling writes (CL < WL) decode the next source vector without consuming it.
+                        srcVec = srcBase + srcIndex * bytesPerVector;
+                        decoded = true;
+                    }
 
                     auto extend16 = [&](uint16_t raw) -> uint32_t
                     {
@@ -624,6 +630,22 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         if (zeroExtend)
                             return static_cast<uint32_t>(raw);
                         return static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(raw)));
+                    };
+
+                    // V2 repeats x,y into z,w; V3 takes w from the next element in the
+                    // stream (hardware behaviour, as emulated by PCSX2).
+                    auto fillMissingLanes = [&](uint32_t elementBytes, auto readElement)
+                    {
+                        if (components == 2)
+                        {
+                            decompressed[2] = decompressed[0];
+                            decompressed[3] = decompressed[1];
+                        }
+                        else if (components == 3)
+                        {
+                            const uint8_t *next = srcVec + 3u * elementBytes;
+                            decompressed[3] = (next + elementBytes <= data + sizeBytes) ? readElement(next) : 0u;
+                        }
                     };
 
                     bool handledFormat = true;
@@ -651,6 +673,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                 std::memcpy(&scalar, srcVec + c * 4u, sizeof(scalar));
                                 decompressed[c] = scalar;
                             }
+                            fillMissingLanes(4u, [](const uint8_t *p)
+                                             {
+                                                 uint32_t value = 0;
+                                                 std::memcpy(&value, p, sizeof(value));
+                                                 return value; });
                         }
                     }
                     else if (vl == 1u)
@@ -674,6 +701,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                                 std::memcpy(&raw, srcVec + c * 2u, sizeof(raw));
                                 decompressed[c] = extend16(raw);
                             }
+                            fillMissingLanes(2u, [&](const uint8_t *p)
+                                             {
+                                                 uint16_t raw = 0;
+                                                 std::memcpy(&raw, p, sizeof(raw));
+                                                 return extend16(raw); });
                         }
                     }
                     else if (vl == 2u)
@@ -693,17 +725,19 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             {
                                 decompressed[c] = extend8(srcVec[c]);
                             }
+                            fillMissingLanes(1u, [&](const uint8_t *p)
+                                             { return extend8(*p); });
                         }
                     }
                     else if (vl == 3u && vn == 3u)
                     {
-                        // V4-5: packed color-like format in a single 16-bit value.
+                        // V4-5: RGBA5551 expanded to 8 bits per channel.
                         uint16_t packed = 0;
                         std::memcpy(&packed, srcVec, sizeof(packed));
-                        decompressed[0] = packed & 0x1Fu;
-                        decompressed[1] = (packed >> 5) & 0x1Fu;
-                        decompressed[2] = (packed >> 10) & 0x1Fu;
-                        decompressed[3] = (packed >> 15) & 0x01u;
+                        decompressed[0] = (packed & 0x001Fu) << 3;
+                        decompressed[1] = (packed & 0x03E0u) >> 2;
+                        decompressed[2] = (packed & 0x7C00u) >> 7;
+                        decompressed[3] = (packed & 0x8000u) >> 8;
                     }
                     else
                     {
@@ -718,7 +752,6 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         continue;
                     }
 
-                    const bool canAdd = (vl != 3u || vn != 3u);
                     const uint32_t mode = vif1_regs.mode & 3u;
                     const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
                     const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
@@ -732,7 +765,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             maskSpec = (vif1_regs.mask >> shift) & 0x3u;
                         }
 
-                        // In fill-write cycles with suspended source reads, treat raw-data selections as row-fill.
+                        // Without any source data left, raw-data selections fall back to the row.
                         if (!decoded && maskSpec == 0u)
                             maskSpec = 1u;
 
@@ -742,7 +775,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                             if (handledFormat)
                             {
                                 writeVal = decompressed[field];
-                                if (canAdd && (mode == 1u || mode == 2u))
+                                if (mode == 1u || mode == 2u)
                                 {
                                     writeVal = writeVal + vif1_regs.row[field];
                                     if (mode == 2u)

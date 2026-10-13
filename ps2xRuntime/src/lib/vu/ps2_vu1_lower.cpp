@@ -10,8 +10,12 @@
 
 namespace
 {
-    float vuEatan(float value)
+    // EFU arctangent: the series runs on t = (num - den) / (num + den), giving
+    // arctan(num / den) = pi/4 + t * poly(t^2).
+    float vuEatan(float num, float den)
     {
+        const float sum = num + den;
+        const float value = sum != 0.0f ? (num - den) / sum : 0.0f;
         constexpr float coefficients[] = {
             0.999999344348907f,
             -0.333298563957214f,
@@ -705,14 +709,14 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             {
                 const float x = normalizeOperand(m_state.vf[vfS][0]);
                 const float y = normalizeOperand(m_state.vf[vfS][1]);
-                queueP(x != 0.0f ? vuEatan(y / x) : 0.0f, 54u);
+                queueP(vuEatan(y, x), 54u);
                 return;
             }
             case 0x75: // EATANxz
             {
                 const float x = normalizeOperand(m_state.vf[vfS][0]);
                 const float z = normalizeOperand(m_state.vf[vfS][2]);
-                queueP(x != 0.0f ? vuEatan(z / x) : 0.0f, 54u);
+                queueP(vuEatan(z, x), 54u);
                 return;
             }
             case 0x76: // ESUM
@@ -763,7 +767,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             case 0x7C: // EATAN
             {
                 const uint32_t component = (instr >> 21) & 3u;
-                queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component])), 54u);
+                queueP(vuEatan(normalizeOperand(m_state.vf[vfS][component]), 1.0f), 54u);
                 return;
             }
             case 0x7D: // EEXP
