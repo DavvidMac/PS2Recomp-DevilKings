@@ -345,6 +345,24 @@ void register_ps2_runtime_expansion_tests()
             }
         });
 
+        tc.Run("guestModuleBase picks the innermost loaded module", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            // A loader may free the tail of the first module and place the
+            // second one there; both ranges then contain 0x01DB9000.
+            runtime.registerGuestModule(0x01D4DA80u, 0x6EA67u);
+            runtime.registerGuestModule(0x01DB8180u, 0x157C0u);
+
+            t.Equals(runtime.guestModuleBase(0x01D4DB90u), 0x01D4DA80u, "an address only the first module covers");
+            t.Equals(runtime.guestModuleBase(0x01DB9000u), 0x01DB8180u,
+                     "an overlapped address belongs to the module with the highest base");
+            t.Equals(runtime.guestModuleBase(0x01DCD000u), 0x01DB8180u, "an address past the first module");
+
+            runtime.unregisterGuestModule(0x01DB8180u);
+            t.Equals(runtime.guestModuleBase(0x01DB9000u), 0x01D4DA80u, "unloading the inner module uncovers the outer one");
+            t.Equals(runtime.guestModuleBase(0x00100000u), 0u, "an address outside every module has no base");
+        });
+
         tc.Run("lookupFunction rejects internal resume PCs without exact registration", [](TestCase &t)
         {
             PS2Runtime runtime;

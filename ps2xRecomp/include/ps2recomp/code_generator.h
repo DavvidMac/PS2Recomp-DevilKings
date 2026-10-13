@@ -56,6 +56,37 @@ namespace ps2recomp
         void setEmitInstructionComments(bool emitInstructionComments);
         void setReporter(RecompilerReporter *reporter);
 
+        // Relocatable module mode (RecompilerConfig::relocatableModule). The
+        // module is linked at 0; generated code reads its load address into a
+        // local `moduleBase` and adds it to every module address.
+        struct ModuleImportHi16
+        {
+            // The LO16 relocation the loader pairs with this HI16 (same symbol).
+            uint32_t pairedLo16Site = 0;
+            // That instruction's immediate as linked; the translated LO16
+            // instruction still adds it, so the HI16 result must not include it.
+            int16_t linkedLo16 = 0;
+        };
+        struct ModuleRelocations
+        {
+            // `lui` of a module-internal address: linked value + moduleBase.
+            std::unordered_set<uint32_t> internalHi16Sites;
+            // `lui` of an imported symbol: value the loader wrote into guest RAM.
+            std::unordered_map<uint32_t, ModuleImportHi16> importHi16Sites;
+            // `j`/`jal` to an imported symbol: target the loader wrote into guest RAM.
+            std::unordered_set<uint32_t> importJumpSites;
+        };
+        void setRelocatableModule(ModuleRelocations relocations);
+
+        // Address literal for generated code: "0x...u", or "(moduleBase + 0x...u)"
+        // in relocatable module mode.
+        std::string guestAddress(uint32_t address) const;
+        // Operand for a switch over guest addresses whose cases are written as
+        // plain link-time addresses.
+        std::string guestAddressKey(const std::string &expression) const;
+        bool isModuleImportJump(uint32_t address) const;
+        bool isModuleRelocatedHi16(uint32_t address) const;
+
         AnalysisResult collectInternalBranchTargets(const Function &function,
                                                   const std::vector<Instruction> &instructions,
                                                   const std::vector<Function> *allFunctions = nullptr);
@@ -69,6 +100,8 @@ namespace ps2recomp
         const std::vector<Section>& m_sections;
         BootstrapInfo m_bootstrapInfo;
         bool m_emitInstructionComments = true;
+        bool m_relocatableModule = false;
+        ModuleRelocations m_moduleRelocations;
         RecompilerReporter *m_reporter = nullptr;
         std::string m_currentFunctionName;
 

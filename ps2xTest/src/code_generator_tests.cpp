@@ -2103,6 +2103,110 @@ void register_code_generator_tests()
                      "VRXOR must XOR the selected field's mantissa into R");
         });
 
+        tc.Run("relocatable module code derives every address from the load base", [](TestCase &t) {
+            Function func;
+            func.name = "module_fn";
+            func.start = 0x100;
+            func.end = 0x10C;
+            func.isRecompiled = true;
+
+            Symbol callee;
+            callee.name = "module_callee";
+            callee.address = 0x200;
+            callee.isFunction = true;
+
+            CodeGenerator gen({callee}, {});
+            gen.setRelocatableModule({});
+            gen.setResumeEntryTargets({{0x100u, {0x108u}}});
+            const std::string generated = gen.generateFunction(
+                func, {makeJal(0x100, 0x200), makeNop(0x104), makeNop(0x108)}, false);
+            printGeneratedCode("relocatable module addresses", generated);
+
+            t.IsTrue(generated.find("const uint32_t moduleBase = runtime->guestModuleBase(ctx->pc);") != std::string::npos,
+                     "module functions must look up their load base on entry");
+            t.IsTrue(generated.find("switch ((ctx->pc - moduleBase))") != std::string::npos,
+                     "resume dispatch must compare link-time offsets");
+            t.IsTrue(generated.find("case 0x108u: goto label_108;") != std::string::npos,
+                     "resume cases stay link-time constants");
+            t.IsTrue(generated.find("SET_GPR_U32(ctx, 31, (moduleBase + 0x108u));") != std::string::npos,
+                     "the return address must be a load-time address");
+            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, (moduleBase + 0x200u), (moduleBase + 0x100u), (moduleBase + 0x108u)") != std::string::npos,
+                     "internal calls must dispatch to load-time addresses");
+            t.IsTrue(generated.find("ctx->pc = 0x") == std::string::npos,
+                     "no PC may be published as a link-time constant");
+        });
+
+        tc.Run("relocatable module HI16 relocations give LO16 partners the load-time address", [](TestCase &t) {
+            Function func;
+            func.name = "module_data";
+            func.start = 0x100;
+            func.end = 0x110;
+            func.isRecompiled = true;
+
+            CodeGenerator::ModuleRelocations relocations;
+            relocations.internalHi16Sites.insert(0x100u);
+            relocations.importHi16Sites[0x108u] = {0x10Cu, static_cast<int16_t>(0x0B68)};
+            CodeGenerator gen({}, {});
+            gen.setRelocatableModule(relocations);
+            const std::string generated = gen.generateFunction(
+                func,
+                {makeLui(0x100, 2, 0x0001), makeLw(0x104, 3, 2, 0xCFE0), makeLui(0x108, 4, 0x0000),
+                 makeAddiu(0x10C, 4, 4, 0x0B68)},
+                false);
+            printGeneratedCode("relocatable module HI16", generated);
+
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 2, (int32_t)(((uint32_t)1 << 16) + moduleBase));") != std::string::npos,
+                     "an internal HI16 adds the load base to the linked high half");
+            t.IsTrue(generated.find("ADD32(GPR_U32(ctx, 2), 4294954976)") != std::string::npos,
+                     "the LO16 partner keeps its linked immediate");
+            t.IsTrue(generated.find("READ32(moduleBase + 0x108u) & 0xFFFFu) << 16) + "
+                                    "(uint32_t)(int32_t)(int16_t)READ32(moduleBase + 0x10Cu) - (uint32_t)(int32_t)2920") != std::string::npos,
+                     "an import HI16 rebuilds the patched address from guest RAM, minus its partner's immediate");
+            t.IsTrue(generated.find("SET_GPR_S32(ctx, 4, (int32_t)ADD32(GPR_U32(ctx, 4), 2920));") != std::string::npos,
+                     "the import's LO16 partner is translated unchanged");
+        });
+
+        tc.Run("relocatable module imports jump to the address the loader patched in", [](TestCase &t) {
+            Function func;
+            func.name = "module_import_call";
+            func.start = 0x100;
+            func.end = 0x108;
+            func.isRecompiled = true;
+
+            CodeGenerator::ModuleRelocations relocations;
+            relocations.importJumpSites.insert(0x100u);
+            CodeGenerator gen({}, {});
+            gen.setRelocatableModule(relocations);
+            const std::string generated = gen.generateFunction(func, {makeJal(0x100, 0x0), makeNop(0x104)}, false);
+            printGeneratedCode("relocatable module import call", generated);
+
+            t.IsTrue(generated.find("runtime->dispatchGuestBranch(rdram, ctx, ((READ32((moduleBase + 0x100u)) & 0x3FFFFFFu) << 2), "
+                                    "(moduleBase + 0x100u), (moduleBase + 0x108u), PS2Runtime::GuestBranchKind::DirectCall") != std::string::npos,
+                     "an imported call takes its target from the patched instruction");
+            t.IsTrue(generated.find("dispatchGuestBranch(rdram, ctx, (moduleBase + 0x0u)") == std::string::npos,
+                     "the linked placeholder target must not be used");
+        });
+
+        tc.Run("relocatable module registration maps functions at the load base", [](TestCase &t) {
+            Function func;
+            func.name = "module_entry";
+            func.start = 0x140;
+            func.end = 0x148;
+            func.isRecompiled = true;
+
+            CodeGenerator gen({}, {});
+            gen.setRelocatableModule({});
+            gen.setRenamedFunctions({{func.start, "module_entry_0x140"}});
+            const std::string registration = gen.generateFunctionRegistration({func}, {});
+
+            t.IsTrue(registration.find("void registerModuleFunctions(PS2Runtime &runtime, uint32_t moduleBase)") != std::string::npos,
+                     "a module exposes a registration function taking its base");
+            t.IsTrue(registration.find("runtime.registerFunction(moduleBase + 0x140u, &module_entry_0x140);") != std::string::npos,
+                     "functions are registered at base + link offset");
+            t.IsTrue(registration.find("g_ps2RecompiledFunctionTable") == std::string::npos,
+                     "a module must not define the executable's fixed function table");
+        });
+
         tc.Run("resolveStubTarget allows leading underscore alias", [](TestCase &t) {
             t.Equals(PS2Recompiler::resolveStubTarget("_rand"), StubTarget::Stub,
                      "_rand should resolve via rand stub alias");

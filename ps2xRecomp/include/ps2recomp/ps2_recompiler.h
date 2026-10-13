@@ -85,6 +85,7 @@ namespace ps2recomp
         bool isCorrectnessCriticalFunction(const Function &function) const;
         bool hasResolvedStubHandler(const Function &function) const;
         void collectCorrectnessCriticalFunctionStarts();
+        CodeGenerator::ModuleRelocations collectModuleRelocations();
         bool generateFunctionHeader();
         bool generateStubHeader();
         bool writeToFile(const std::string &path, const std::string &content);

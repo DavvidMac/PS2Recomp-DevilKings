@@ -87,10 +87,14 @@ namespace ps2recomp
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
+        if (cg.m_relocatableModule)
+        {
+            ss << "    const uint32_t moduleBase = runtime->guestModuleBase(ctx->pc);\n";
+        }
         ss << "\n";
         if (!resumeTargets.empty())
         {
-            ss << "    switch (ctx->pc) {\n";
+            ss << "    switch (" << cg.guestAddressKey("ctx->pc") << ") {\n";
             for (uint32_t target : resumeTargets)
             {
                 ss << "        case 0x" << std::hex << target << "u: goto label_" << target << ";\n"
@@ -99,8 +103,7 @@ namespace ps2recomp
             ss << "        default: break;\n";
             ss << "    }\n\n";
         }
-        ss << "    ctx->pc = 0x" << std::hex << function.start << "u;\n"
-           << std::dec;
+        ss << "    ctx->pc = " << cg.guestAddress(function.start) << ";\n";
         ss << "\n";
 
         bool lastInstructionWasControlFlow = false;
@@ -190,8 +193,7 @@ namespace ps2recomp
 
                         if (gifDmaKickPlan.completesAt(i))
                         {
-                            ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                               << std::dec;
+                            ss << "    ctx->pc = " << cg.guestAddress(inst.address) << ";\n";
                             ss << "    " << gifDmaKickCall(gifDmaKickPlan) << "\n";
                             gifDmaKickPlan = {};
                         }
@@ -200,8 +202,7 @@ namespace ps2recomp
                         continue;
                     }
 
-                    ss << "    ctx->pc = 0x" << std::hex << inst.address << "u;\n"
-                       << std::dec;
+                    ss << "    ctx->pc = " << cg.guestAddress(inst.address) << ";\n";
                     const MemoryAccessHint memoryHint = resolveMemoryAccessHint(inst, constantRegisters);
                     ss << "    " << cg.translateInstruction(inst, memoryHint);
                     if (inst.isMmio)
@@ -211,6 +212,11 @@ namespace ps2recomp
                     ss << "\n";
 
                     updateConstantRegisters(inst, constantRegisters);
+                    // A relocated `lui` holds a load-time address, not its linked constant.
+                    if (cg.isModuleRelocatedHi16(inst.address))
+                    {
+                        constantRegisters.invalidate(inst.rt);
+                    }
                 }
             }
             catch (const std::exception &e)
@@ -229,8 +235,7 @@ namespace ps2recomp
         // Fallthrough with no terminating branch: publish the next PC so the EE dispatcher does not re-enter this function.
         if (!instructions.empty() && !lastInstructionWasControlFlow)
         {
-            ss << "    ctx->pc = 0x" << std::hex << function.end << "u;\n"
-               << std::dec;
+            ss << "    ctx->pc = " << cg.guestAddress(function.end) << ";\n";
         }
 
         ss << "}\n";

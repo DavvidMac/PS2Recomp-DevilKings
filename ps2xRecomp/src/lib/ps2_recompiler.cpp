@@ -1020,7 +1020,17 @@ namespace ps2recomp
                     m_reporter.warning("relocation", msg.str());
                 }
             }
-            m_codeGenerator->setRelocationCallNames(relocationCallNames);
+            if (m_config.relocatableModule)
+            {
+                // Imported calls go through the address the module loader
+                // patched in; binding them to HLE handlers by name would skip
+                // whatever the main executable does for that symbol.
+                m_codeGenerator->setRelocatableModule(collectModuleRelocations());
+            }
+            else
+            {
+                m_codeGenerator->setRelocationCallNames(relocationCallNames);
+            }
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
             m_codeGenerator->setEmitInstructionComments(true);
@@ -2316,6 +2326,80 @@ namespace ps2recomp
         if (bindingIt != m_stubHandlerBindingsByStart.end() && !bindingIt->second.empty())
             handlerName = bindingIt->second;
         return resolveStubTarget(handlerName) != StubTarget::Unknown;
+    }
+
+    CodeGenerator::ModuleRelocations PS2Recompiler::collectModuleRelocations()
+    {
+        constexpr uint32_t kRelocMips26 = 4u;
+        constexpr uint32_t kRelocMipsHi16 = 5u;
+        constexpr uint32_t kRelocMipsLo16 = 6u;
+
+        auto readWord = [this](uint32_t address, uint32_t &word)
+        {
+            for (const Section &section : m_sections)
+            {
+                if (section.data && address >= section.address &&
+                    address + sizeof(uint32_t) <= section.address + section.size)
+                {
+                    std::memcpy(&word, section.data + (address - section.address), sizeof(word));
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        CodeGenerator::ModuleRelocations relocations;
+        for (size_t i = 0; i < m_relocations.size(); ++i)
+        {
+            const Relocation &reloc = m_relocations[i];
+            if (reloc.type == kRelocMips26 && reloc.symbolUndefined)
+            {
+                relocations.importJumpSites.insert(reloc.offset);
+                continue;
+            }
+            if (reloc.type != kRelocMipsHi16)
+            {
+                continue;
+            }
+            if (!reloc.symbolUndefined)
+            {
+                relocations.internalHi16Sites.insert(reloc.offset);
+                continue;
+            }
+
+            // MIPS ABI: an import's HI16 pairs with the next LO16 of the same symbol.
+            bool paired = false;
+            for (size_t j = i + 1; j < m_relocations.size(); ++j)
+            {
+                const Relocation &lo = m_relocations[j];
+                if (lo.type != kRelocMipsLo16 || lo.symbol != reloc.symbol)
+                {
+                    continue;
+                }
+                uint32_t word = 0;
+                if (readWord(lo.offset, word))
+                {
+                    relocations.importHi16Sites[reloc.offset] = {
+                        lo.offset, static_cast<int16_t>(word & 0xFFFFu)};
+                    paired = true;
+                }
+                break;
+            }
+            if (!paired)
+            {
+                std::ostringstream msg;
+                msg << "import HI16 at 0x" << std::hex << reloc.offset << " ('" << reloc.symbolName
+                    << "') has no LO16 partner";
+                throw std::runtime_error(msg.str());
+            }
+        }
+
+        std::ostringstream msg;
+        msg << "relocatable module: " << relocations.internalHi16Sites.size() << " internal HI16, "
+            << relocations.importHi16Sites.size() << " import HI16, "
+            << relocations.importJumpSites.size() << " import jump site(s)";
+        m_reporter.progress(msg.str());
+        return relocations;
     }
 
     void PS2Recompiler::collectCorrectnessCriticalFunctionStarts()

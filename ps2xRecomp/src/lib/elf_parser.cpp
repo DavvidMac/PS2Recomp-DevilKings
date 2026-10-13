@@ -2510,6 +2510,7 @@ namespace ps2recomp
                                                symBind, symType, symSectionIndex, symOther))
                         {
                             reloc.symbolName = symName;
+                            reloc.symbolUndefined = symbol != 0 && symSectionIndex == ELFIO::SHN_UNDEF;
                         }
                     }
 
