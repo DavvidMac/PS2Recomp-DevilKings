@@ -487,6 +487,30 @@ void EeScheduler::dumpThreadsForDiagnostics() const
         }
     }
 
+    // PS2X_VU1_DUMP=<vsync>:<path> writes VU1 data memory to <path> and VU1
+    // micro memory to <path>.code at that VSync.
+    static const char *vu1Dump = std::getenv("PS2X_VU1_DUMP");
+    if (vu1Dump && *vu1Dump)
+    {
+        char *pathStart = nullptr;
+        const uint64_t dumpTick = std::strtoull(vu1Dump, &pathStart, 10);
+        if (pathStart && *pathStart == ':' && m_vsyncTick == dumpTick)
+        {
+            const std::string path = pathStart + 1;
+            if (std::FILE *file = std::fopen(path.c_str(), "wb"))
+            {
+                std::fwrite(m_runtime.memory().getVU1Data(), 1, PS2_VU1_DATA_SIZE, file);
+                std::fclose(file);
+            }
+            if (std::FILE *file = std::fopen((path + ".code").c_str(), "wb"))
+            {
+                std::fwrite(m_runtime.memory().getVU1Code(), 1, PS2_VU1_CODE_SIZE, file);
+                std::fclose(file);
+            }
+            std::cerr << "[vu1-dump] vsync=" << m_vsyncTick << " -> " << path << std::endl;
+        }
+    }
+
     static const uint64_t interval = []() -> uint64_t
     {
         const char *value = std::getenv("PS2X_THREAD_DUMP");

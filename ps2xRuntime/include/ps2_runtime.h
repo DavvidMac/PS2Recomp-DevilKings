@@ -239,6 +239,13 @@ inline uint8_t ps2PathWatchExtractByteFromWrite(uint32_t writeAddr, uint32_t wat
     return static_cast<uint8_t>((valueHi >> ((byteIndex - 8u) * 8u)) & 0xFFu);
 }
 
+// Diagnostics: PS2X_WATCH=<addr>[:<len>] reports every recompiled-code store
+// that touches the physical range [addr, addr + len) (len defaults to 4).
+extern uint32_t g_ps2WatchStart;
+extern uint32_t g_ps2WatchLength;
+void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                           const char *op, const R5900Context *ctx);
+
 inline void ps2TraceGuestWrite(uint8_t *rdram,
                                uint32_t guestAddr,
                                uint32_t size,
@@ -248,13 +255,11 @@ inline void ps2TraceGuestWrite(uint8_t *rdram,
                                const R5900Context *ctx)
 {
     (void)rdram;
-    (void)guestAddr;
-    (void)size;
-    (void)valueLo;
-    (void)valueHi;
-    (void)op;
-    (void)ctx;
-    // TODO we dont need this anymore so on next release it will be deleted
+    if (g_ps2WatchLength == 0u)
+        return;
+    const uint32_t physical = guestAddr & 0x1FFFFFFFu;
+    if (physical < g_ps2WatchStart + g_ps2WatchLength && physical + size > g_ps2WatchStart)
+        ps2ReportWatchedWrite(physical, size, valueLo, valueHi, op, ctx);
 }
 
 inline void ps2TraceGuestRangeWrite(uint8_t *rdram,

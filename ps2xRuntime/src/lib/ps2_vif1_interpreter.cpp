@@ -1,5 +1,9 @@
 // Based on Blackline Interactive implementation
 #include "runtime/ps2_memory.h"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 enum VIFCmd : uint8_t
@@ -295,6 +299,27 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
     processVIF1Data(m_rdram + srcPhys, sizeBytes);
 }
 
+namespace
+{
+    // Diagnostics: PS2X_VIF1_WATCH=<qword> (see the UNPACK handler).
+    // Caps every [vif1] diagnostic line so a forgotten PS2X_VIF1_WATCH cannot fill the disk.
+    bool vif1WatchLogAllowed()
+    {
+        static std::atomic<uint32_t> s_lines{0u};
+        return s_lines.fetch_add(1u, std::memory_order_relaxed) < 20000u;
+    }
+
+    long vif1WatchQword()
+    {
+        static const long s_watch = []()
+        {
+            const char *value = std::getenv("PS2X_VIF1_WATCH");
+            return value ? std::strtol(value, nullptr, 0) : -1L;
+        }();
+        return s_watch;
+    }
+}
+
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
@@ -398,11 +423,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
+            if (vif1WatchQword() >= 0 && vif1WatchLogAllowed())
+                std::fprintf(stderr, "[vif1] flush cmd=%08x\n", cmd);
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             uint32_t startPC = (uint32_t)imm * 8u;
+            if (vif1WatchQword() >= 0 && vif1WatchLogAllowed())
+                std::fprintf(stderr, "[vif1] mscal pc=%04x tops=%u\n", startPC, vif1_regs.tops & 0x3FFu);
 
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
@@ -422,6 +451,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MSCNT)
         {
+            if (vif1WatchQword() >= 0 && vif1WatchLogAllowed())
+                std::fprintf(stderr, "[vif1] mscnt tops=%u\n", vif1_regs.tops & 0x3FFu);
             const uint32_t runTop = vif1_regs.tops & 0x3FFu;
             const uint32_t runItop = vif1_regs.itops & 0x3FFu;
             vif1_regs.top = runTop;
@@ -571,6 +602,39 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
 
             const bool zeroExtend = (imm & 0x4000u) != 0u;
+
+            // Diagnostics: PS2X_VIF1_WATCH=<qword> reports UNPACKs that write VU1
+            // data qword <qword> and every UNPACK dropped for lack of data.
+            const long s_vifWatch = vif1WatchQword();
+            if (s_vifWatch >= 0)
+            {
+                const uint32_t span = (cl >= wl) ? ((writeVectorCount + wl - 1u) / wl) * cl : writeVectorCount;
+                const uint32_t watch = static_cast<uint32_t>(s_vifWatch);
+                const bool hits = ((watch - vuAddr) & 0x3FFu) < span;
+                const bool dropped = pos + totalBytes > sizeBytes;
+                if ((hits || dropped) && vif1WatchLogAllowed())
+                {
+                    uint32_t first[4] = {};
+                    std::memcpy(first, data + pos, std::min<uint32_t>(16u, sizeBytes > pos ? sizeBytes - pos : 0u));
+                    std::fprintf(stderr,
+                                 "[vif1] %s cmd=%08x vn=%u vl=%u num=%u addr=%u tops=%u cycle=%04x mask=%08x mode=%u "
+                                 "bytes=%u avail=%u data=%08x %08x %08x %08x\n",
+                                 dropped ? "DROPPED" : "unpack", cmd, vn, vl, writeVectorCount, vuAddr, vif1_regs.tops & 0x3FFu,
+                                 vif1_regs.cycle & 0xFFFFu, vif1_regs.mask, vif1_regs.mode, totalBytes,
+                                 sizeBytes - pos, first[0], first[1], first[2], first[3]);
+                    if (hits && !dropped && vl == 0u && vn == 3u)
+                    {
+                        // Full V4-32 payload of the qword being watched and the three after it.
+                        const uint32_t base = ((watch - vuAddr) & 0x3FFu) * 16u;
+                        for (uint32_t q = 0; q < 8u && base + q * 16u + 16u <= totalBytes; ++q)
+                        {
+                            float f[4] = {};
+                            std::memcpy(f, data + pos + base + q * 16u, sizeof(f));
+                            std::fprintf(stderr, "[vif1]   qw%u = %g %g %g %g\n", watch + q, f[0], f[1], f[2], f[3]);
+                        }
+                    }
+                }
+            }
 
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {

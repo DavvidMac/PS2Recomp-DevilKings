@@ -1752,9 +1752,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             queueAccWrite(decoded.upperUsage.accWrite, newAcc,
                           kAccForwardLatency);
         }
+        int32_t tracedNewVi = 0;
         if (writtenVi != 0u)
         {
             const int32_t newVi = m_state.vi[writtenVi];
+            tracedNewVi = newVi;
             m_state.vi[writtenVi] = oldVi;
             const uint32_t latency =
                 decoded.lowerUsage.viLatency != 0u
@@ -1766,6 +1768,74 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         markPairWrites(decoded);
         if (writtenVi != 0u && decoded.lowerUsage.delaysNextBranchRead)
             recordViWriteForBranch(writtenVi, oldVi);
+
+        {
+            // Diagnostics: PS2X_VU1_TRACE=<pc>:<pairs>[:<skip>[:<lower>]] logs <pairs>
+            // executed pairs once VU1 reaches micro address <pc> (hex) for the
+            // (<skip>+1)th time, optionally only where the lower word is <lower> (hex).
+            const uint8_t upperReg = hasUpperWrite ? upperWrite.reg : 0u;
+            const float *upperValue = newUpperVf;
+            const uint8_t lowerReg = hasDistinctLowerWrite ? lowerWrite.reg : 0u;
+            const float *lowerValue = newLowerVf;
+            const uint8_t viReg = writtenVi;
+            const int32_t viValue = tracedNewVi;
+            do
+            {
+                struct TraceConfig
+                {
+                    bool enabled = false;
+                    uint32_t pc = 0;
+                    uint32_t pairs = 0;
+                    uint32_t skip = 0;
+                    uint32_t lower = 0;
+                    bool matchLower = false;
+                };
+                static const TraceConfig config = []()
+                {
+                    TraceConfig c;
+                    if (const char *value = std::getenv("PS2X_VU1_TRACE"))
+                    {
+                        char *end = nullptr;
+                        c.pc = static_cast<uint32_t>(std::strtoul(value, &end, 16));
+                        if (end && *end == ':')
+                            c.pairs = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+                        if (end && *end == ':')
+                            c.skip = static_cast<uint32_t>(std::strtoul(end + 1, &end, 10));
+                        if (end && *end == ':')
+                        {
+                            c.lower = static_cast<uint32_t>(std::strtoul(end + 1, &end, 16));
+                            c.matchLower = true;
+                        }
+                        c.enabled = c.pairs != 0u;
+                    }
+                    return c;
+                }();
+                static uint32_t s_remaining = 0;
+                static uint32_t s_arrivals = 0;
+                if (!config.enabled || m_unit != Unit::VU1)
+                    break;
+                if (s_remaining == 0u && m_state.pc == config.pc && (!config.matchLower || decoded.lower == config.lower))
+                {
+                    if (s_arrivals++ == config.skip)
+                        s_remaining = config.pairs;
+                }
+                if (s_remaining == 0u)
+                    break;
+                --s_remaining;
+                std::fprintf(stderr, "[vu1] c=%llu pc=%04x lo=%08x up=%08x clip=%06x q=%g vi:",
+                             static_cast<unsigned long long>(m_cycle), m_state.pc, decoded.lower, decoded.upper,
+                             m_state.clip & 0xFFFFFFu, m_state.q);
+                for (uint32_t reg = 1; reg < 16u; ++reg)
+                    std::fprintf(stderr, " %d", static_cast<int>(static_cast<int16_t>(m_state.vi[reg])));
+                if (upperReg != 0u)
+                    std::fprintf(stderr, " | U vf%u=(%g,%g,%g,%g)", upperReg, upperValue[0], upperValue[1], upperValue[2], upperValue[3]);
+                if (lowerReg != 0u)
+                    std::fprintf(stderr, " | L vf%u=(%g,%g,%g,%g)", lowerReg, lowerValue[0], lowerValue[1], lowerValue[2], lowerValue[3]);
+                if (viReg != 0u)
+                    std::fprintf(stderr, " | vi%u<-%d", viReg, static_cast<int>(static_cast<int16_t>(viValue)));
+                std::fputc('\n', stderr);
+            } while (false);
+        }
 
         m_state.vf[0][0] = 0.0f;
         m_state.vf[0][1] = 0.0f;

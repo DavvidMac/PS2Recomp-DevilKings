@@ -10,9 +10,58 @@
 #include <string>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 
 namespace
 {
+    // Diagnostics: PS2X_DMA_WATCH=<lo>:<hi>:<vsync> logs, for 60 VSyncs from <vsync>,
+    // every DMA chain tag whose payload overlaps guest range [lo, hi).
+    struct DmaWatch
+    {
+        uint32_t lo = 0u;
+        uint32_t hi = 0u;
+        uint64_t from = 0u;
+        bool enabled = false;
+    };
+
+    const DmaWatch &dmaWatch()
+    {
+        static const DmaWatch s_watch = []()
+        {
+            DmaWatch watch;
+            const char *value = std::getenv("PS2X_DMA_WATCH");
+            if (!value || !*value)
+                return watch;
+            char *end = nullptr;
+            watch.lo = static_cast<uint32_t>(std::strtoul(value, &end, 0));
+            if (!end || *end != ':')
+                return watch;
+            watch.hi = static_cast<uint32_t>(std::strtoul(end + 1, &end, 0));
+            if (end && *end == ':')
+                watch.from = std::strtoull(end + 1, nullptr, 0);
+            watch.enabled = watch.hi > watch.lo;
+            return watch;
+        }();
+        return s_watch;
+    }
+
+    void reportDmaWatch(uint64_t tick, uint32_t channelBase, uint32_t id, uint32_t qwc, uint32_t dataAddr,
+                        uint32_t tagAddr)
+    {
+        const DmaWatch &watch = dmaWatch();
+        if (!watch.enabled || tick < watch.from || tick >= watch.from + 60u)
+            return;
+        const uint32_t start = dataAddr & 0x1FFFFFFFu;
+        const uint32_t end = start + qwc * 16u;
+        if (end <= watch.lo || start >= watch.hi)
+            return;
+        static std::atomic<uint32_t> s_reports{0u};
+        if (s_reports.fetch_add(1u, std::memory_order_relaxed) >= 20000u)
+            return;
+        std::fprintf(stderr, "[dma] t=%llu ch=%08x id=%u qwc=%u data=%08x tag=%08x\n",
+                     static_cast<unsigned long long>(tick), channelBase, id, qwc, start, tagAddr);
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -1524,7 +1573,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             appendVifTagData(currentTagAddr);
 
                         if (hasPayload)
+                        {
                             appendData(dataAddr, tagQwc);
+                            if (dmaWatch().enabled)
+                                reportDmaWatch(gs_regs.vsyncTick.load(std::memory_order_relaxed), channelBase, id,
+                                               tagQwc, dataAddr, currentTagAddr);
+                        }
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)

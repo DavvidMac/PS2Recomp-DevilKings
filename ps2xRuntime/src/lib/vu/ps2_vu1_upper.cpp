@@ -2,6 +2,7 @@
 #include "ps2_vu1_detail.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -411,6 +412,11 @@ void VU1Interpreter::execUpper(uint32_t instr)
                 flags |= 0x10u;
             if (exceedsClipPlane(m_state.vf[fs][2], 0x80000000u))
                 flags |= 0x20u;
+            // Diagnostics: PS2X_VU1_NOCLIP=1 reports every vertex as inside the
+            // clip volume, to tell VU-side culling apart from missing input.
+            static const bool s_noClip = std::getenv("PS2X_VU1_NOCLIP") != nullptr;
+            if (s_noClip && m_unit == Unit::VU1)
+                flags = 0u;
             queueClip(flags);
             return;
         }

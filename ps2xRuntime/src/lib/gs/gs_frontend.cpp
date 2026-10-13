@@ -34,6 +34,33 @@ namespace
         return tick >= s_traceTick && tick < s_traceTick + s_traceCount;
     }
 
+    // Diagnostics: PS2X_GS_SKIP_TBP=<tbp>[,<tbp>...] drops textured primitives that
+    // sample one of these TBP0 values, to find which draws produce part of a frame.
+    bool drawSkippedForDiagnostics(const GSPrimitiveBatch &batch)
+    {
+        static const std::vector<uint32_t> s_skipTbp = []()
+        {
+            std::vector<uint32_t> tbps;
+            if (const char *value = std::getenv("PS2X_GS_SKIP_TBP"))
+            {
+                for (const char *p = value; *p;)
+                {
+                    char *end = nullptr;
+                    const unsigned long tbp = std::strtoul(p, &end, 0);
+                    if (end == p)
+                        break;
+                    tbps.push_back(static_cast<uint32_t>(tbp));
+                    p = (*end == ',') ? end + 1 : end;
+                }
+            }
+            return tbps;
+        }();
+        if (s_skipTbp.empty() || !batch.state.prim.tme)
+            return false;
+        const uint32_t tbp = batch.state.context.tex0.tbp0;
+        return std::find(s_skipTbp.begin(), s_skipTbp.end(), tbp) != s_skipTbp.end();
+    }
+
     static constexpr uint32_t kHostFrameWidth = 640u;
 
     GSPrimReg decodePrimRegister(uint64_t value)
@@ -1691,9 +1718,21 @@ void GS::vertexKick(bool drawing)
                          vl.x, vl.y, vl.r, vl.g, vl.b, vl.a, vl.u >> 4, vl.v >> 4,
                          static_cast<unsigned long long>(m_privRegs->pmode), static_cast<unsigned long long>(m_privRegs->dispfb1),
                          static_cast<unsigned long long>(m_privRegs->dispfb2), static_cast<unsigned long long>(m_privRegs->display2));
+            std::fprintf(stderr, "[gs:verts] cbp=%u cpsm=%x csm=%u csa=%u texa=%u,%u,%u",
+                         c.tex0.cbp, static_cast<uint32_t>(c.tex0.cpsm), static_cast<uint32_t>(c.tex0.csm),
+                         static_cast<uint32_t>(c.tex0.csa), static_cast<uint32_t>(batch.state.texa.ta0),
+                         static_cast<uint32_t>(batch.state.texa.aem), static_cast<uint32_t>(batch.state.texa.ta1));
+            for (uint32_t i = 0; i < needed; ++i)
+            {
+                const auto &v = batch.vertices[i];
+                std::fprintf(stderr, " (%.2f,%.2f,%u a=%u stq=%g,%g,%g uv=%u,%u)", v.x, v.y, static_cast<uint32_t>(v.z), v.a,
+                             v.s, v.t, v.q, v.u >> 4, v.v >> 4);
+            }
+            std::fputc('\n', stderr);
         }
         updatePreferredDisplaySourceForDraw(batch);
-        m_backend->Submit(batch);
+        if (!drawSkippedForDiagnostics(batch))
+            m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
 

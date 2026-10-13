@@ -28,6 +28,83 @@
 #include <unordered_map>
 #include <sstream>
 
+namespace
+{
+    struct WatchRange
+    {
+        uint32_t start = 0u;
+        uint32_t length = 0u;
+        uint64_t fromVsync = 0u;
+    };
+
+    WatchRange parseWatchRange()
+    {
+        WatchRange range;
+        const char *value = std::getenv("PS2X_WATCH");
+        if (!value || !*value)
+            return range;
+        char *end = nullptr;
+        range.start = static_cast<uint32_t>(std::strtoul(value, &end, 0)) & 0x1FFFFFFFu;
+        range.length = 4u;
+        if (end && *end == ':')
+            range.length = static_cast<uint32_t>(std::strtoul(end + 1, &end, 0));
+        if (end && *end == ':')
+            range.fromVsync = std::strtoull(end + 1, nullptr, 0);
+        return range;
+    }
+
+    const WatchRange kWatchRange = parseWatchRange();
+    const uint8_t *s_watchRdram = nullptr;
+    const GSRegisters *s_watchGs = nullptr;
+
+    bool looksLikeReturnAddress(const uint8_t *rdram, uint32_t value)
+    {
+        if ((value & 3u) != 0u || value < 0x00100008u || value >= PS2_RAM_SIZE)
+            return false;
+        uint32_t call = 0u;
+        std::memcpy(&call, rdram + value - 8u, sizeof(call));
+        const bool isJal = (call >> 26) == 3u;
+        const bool isJalr = (call >> 26) == 0u && (call & 0x3Fu) == 9u;
+        return isJal || isJalr;
+    }
+}
+
+uint32_t g_ps2WatchStart = kWatchRange.start;
+uint32_t g_ps2WatchLength = kWatchRange.length;
+
+void ps2ReportWatchedWrite(uint32_t guestAddr, uint32_t size, uint64_t valueLo, uint64_t valueHi,
+                           const char *op, const R5900Context *ctx)
+{
+    if (kWatchRange.fromVsync != 0u &&
+        (!s_watchGs || s_watchGs->vsyncTick.load(std::memory_order_relaxed) < kWatchRange.fromVsync))
+        return;
+    static std::atomic<uint32_t> s_reports{0u};
+    if (s_reports.fetch_add(1u, std::memory_order_relaxed) >= 4000u)
+        return;
+    std::fprintf(stderr, "[watch] %s addr=0x%08x size=%u value=0x%016llx%016llx pc=0x%08x ra=0x%08x\n",
+                 op, guestAddr, size, static_cast<unsigned long long>(valueHi),
+                 static_cast<unsigned long long>(valueLo), ctx ? ctx->pc : 0u,
+                 ctx ? getRegU32(ctx, 31) : 0u);
+    if (!ctx || !s_watchRdram)
+        return;
+    // Saved return addresses found in the stack frame give a rough backtrace.
+    const uint32_t sp = getRegU32(ctx, 29) & 0x1FFFFFFFu;
+    std::fprintf(stderr, "[watch]   a0-a3=%08x %08x %08x %08x s0-s8=%08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+                 getRegU32(ctx, 4), getRegU32(ctx, 5), getRegU32(ctx, 6), getRegU32(ctx, 7),
+                 getRegU32(ctx, 16), getRegU32(ctx, 17), getRegU32(ctx, 18), getRegU32(ctx, 19),
+                 getRegU32(ctx, 20), getRegU32(ctx, 21), getRegU32(ctx, 22), getRegU32(ctx, 23),
+                 getRegU32(ctx, 30));
+    std::fprintf(stderr, "[watch]   sp=0x%08x stack:", sp);
+    for (uint32_t offset = 0u; offset < 0x400u && sp + offset + 4u <= PS2_RAM_SIZE; offset += 4u)
+    {
+        uint32_t value = 0u;
+        std::memcpy(&value, s_watchRdram + sp + offset, sizeof(value));
+        if (looksLikeReturnAddress(s_watchRdram, value))
+            std::fprintf(stderr, " +0x%x=0x%08x", offset, value);
+    }
+    std::fputc('\n', stderr);
+}
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -2606,6 +2683,8 @@ void PS2Runtime::run()
     ps2_stubs::resetAudioStubState();
     ps2_stubs::resetMpegStubState();
     initializeEeKernelState(m_memory.getRDRAM());
+    s_watchRdram = m_memory.getRDRAM();
+    s_watchGs = &m_memory.gs();
     m_cpuContext.r[4] = _mm_setzero_si128();
     m_cpuContext.r[5] = _mm_setzero_si128();
     m_cpuContext.r[29] = _mm_set_epi64x(0, static_cast<int64_t>(PS2_RAM_SIZE - 0x10u));
