@@ -583,6 +583,50 @@ void register_ps2_gs_tests()
                      "sceGsSwapDBuffDc should preserve the display width from the seeded env");
         });
 
+        tc.Run("sceGsSetDefDBuffDc uses the libgraph buffer layout", [](TestCase &t)
+        {
+            PS2Runtime runtime;
+            t.IsTrue(runtime.memory().initialize(), "runtime memory initialize should succeed");
+
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            constexpr uint32_t kEnvAddr = 0x4800u;
+            constexpr uint32_t kDBuffSize = 0x330u;
+
+            // Real libgraph places buffer 1 at sceGszbufaddr(psm, w, h) / 2. Games such as
+            // Devil Kings patch disp[1], draw01 and draw02 afterwards and rely on disp[0],
+            // draw11 and draw12 staying on page 0.
+            R5900Context zctx{};
+            setRegU32(zctx, 4, 0u);
+            setRegU32(zctx, 5, 512u);
+            setRegU32(zctx, 6, 224u);
+            ps2_stubs::sceGszbufaddr(rdram.data(), &zctx, &runtime);
+            const uint32_t zbuf = getRegU32Test(zctx, 2);
+            t.IsTrue(zbuf == 56u || zbuf == 112u, "sceGszbufaddr should take psm, w and h from a0..a2");
+
+            R5900Context ctx{};
+            setRegU32(ctx, 4, kEnvAddr);
+            setRegU32(ctx, 5, 0u);
+            setRegU32(ctx, 6, 512u);
+            setRegU32(ctx, 7, 224u);
+            std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
+            ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
+
+            auto read64 = [&](uint32_t offset)
+            {
+                uint64_t value = 0u;
+                std::memcpy(&value, rdram.data() + kEnvAddr + offset, sizeof(value));
+                return value;
+            };
+            const uint64_t fbp1 = zbuf == 112u ? 56u : 0u;
+            t.Equals(read64(0x10u) & 0x1FFu, 0ull, "disp[0] should show page 0");
+            t.Equals(read64(0x38u) & 0x1FFu, fbp1, "disp[1] should show buffer 1 at zbuf / 2");
+            t.Equals(read64(0x60u) & 0x1FFu, fbp1, "draw01 FRAME_1 should draw into buffer 1");
+            t.Equals(read64(0xE0u) & 0x1FFu, fbp1, "draw02 FRAME_2 should draw into buffer 1");
+            t.Equals(read64(0x1D0u) & 0x1FFu, 0ull, "draw11 FRAME_1 should draw into page 0");
+            t.Equals(read64(0x250u) & 0x1FFu, 0ull, "draw12 FRAME_2 should draw into page 0");
+            t.Equals(read64(0x70u) & 0x1FFu, static_cast<uint64_t>(zbuf), "draw01 ZBUF_1 should use sceGszbufaddr");
+        });
+
         tc.Run("sceGsSetDefDBuffDc seeds a clear packet and swap clears the draw buffer", [](TestCase &t)
         {
             PS2Runtime runtime;
@@ -613,8 +657,13 @@ void register_ps2_gs_tests()
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
             std::memcpy(rdram.data() + kStackAddr + 16u, &kZTest, sizeof(kZTest));
             std::memcpy(rdram.data() + kStackAddr + 24u, &kEnableClear, sizeof(kEnableClear));
-            std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
+            std::memset(runtime.memory().getGSVRAM(), 0xAB, PS2_GS_VRAM_SIZE);
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
+
+            // Environment 0 draws into buffer 1, whose page is the one displayed by disp[1].
+            uint64_t dispfb1 = 0u;
+            std::memcpy(&dispfb1, rdram.data() + kEnvAddr + 40u + 16u, sizeof(dispfb1));
+            const uint32_t drawBase = static_cast<uint32_t>(dispfb1 & 0x1FFu) * 8192u;
 
             uint64_t testAAddr = 0u;
             uint64_t primAddr = 0u;
@@ -645,7 +694,7 @@ void register_ps2_gs_tests()
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
             uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM() + drawBase, sizeof(clearedPixel));
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should execute the seeded clear packet against the active draw buffer");
 
@@ -653,7 +702,7 @@ void register_ps2_gs_tests()
             constexpr uint32_t kMidY = 200u;
             const uint32_t kMidOffset = ((kMidY * 640u) + kMidX) * 4u;
             uint32_t clearedMidPixel = 0u;
-            std::memcpy(&clearedMidPixel, runtime.memory().getGSVRAM() + kMidOffset, sizeof(clearedMidPixel));
+            std::memcpy(&clearedMidPixel, runtime.memory().getGSVRAM() + drawBase + kMidOffset, sizeof(clearedMidPixel));
             t.Equals(clearedMidPixel, kClearColor,
                      "sceGsSwapDBuffDc should clear the interior of the active draw buffer, not just the first pixel");
         });
@@ -682,9 +731,13 @@ void register_ps2_gs_tests()
             setRegU32(ctx, 10, 1u);
             setRegU32(ctx, 29, kStackAddr);
             std::memset(rdram.data() + kEnvAddr, 0xCD, kDBuffSize);
-            std::memset(runtime.memory().getGSVRAM(), 0xAB, 16u);
+            std::memset(runtime.memory().getGSVRAM(), 0xAB, PS2_GS_VRAM_SIZE);
 
             ps2_stubs::sceGsSetDefDBuffDc(rdram.data(), &ctx, &runtime);
+
+            uint64_t dispfb1 = 0u;
+            std::memcpy(&dispfb1, rdram.data() + kEnvAddr + 40u + 16u, sizeof(dispfb1));
+            const uint32_t drawBase = static_cast<uint32_t>(dispfb1 & 0x1FFu) * 8192u;
 
             uint64_t rgbaqAddr = 0u;
             std::memcpy(&rgbaqAddr, rdram.data() + kEnvAddr + kRgbaqAddrOffset, sizeof(rgbaqAddr));
@@ -700,7 +753,7 @@ void register_ps2_gs_tests()
             ps2_stubs::sceGsSwapDBuffDc(rdram.data(), &ctx, &runtime);
 
             uint32_t clearedPixel = 0u;
-            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM(), sizeof(clearedPixel));
+            std::memcpy(&clearedPixel, runtime.memory().getGSVRAM() + drawBase, sizeof(clearedPixel));
             t.Equals(clearedPixel, kClearColor,
                      "sceGsSwapDBuffDc should honor a clear packet seeded from register-based trailing args");
         });

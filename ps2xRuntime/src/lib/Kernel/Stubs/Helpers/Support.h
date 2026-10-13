@@ -1594,6 +1594,17 @@ namespace
     constexpr uint32_t kGsParamScratchOffset = 0x100;
     GsGParam g_gparam{1, 2, 1, 3}; // Default: interlaced NTSC, frame mode.
 
+    // libgraph sceGszbufaddr(psm, w, h): page address just past the frame buffers.
+    // Two buffers are reserved except in interlaced field mode, where one is shared.
+    static int32_t gsZbufAddr(uint32_t psm, int32_t w, int32_t h)
+    {
+        const int32_t pagesWide = (w + 63) / 64;
+        const int32_t pagesHigh = (psm & 2u) != 0u ? (h + 63) / 64 : (h + 31) / 32;
+        const int32_t pages = pagesWide * pagesHigh;
+        const bool fieldInterlace = g_gparam.interlace == 1u && g_gparam.ffmode == 0u;
+        return static_cast<int16_t>(fieldInterlace ? pages : pages * 2);
+    }
+
     static uint64_t makePmode(uint32_t en1, uint32_t en2, uint32_t mmod, uint32_t amod, uint32_t slbg, uint32_t alp)
     {
         return (static_cast<uint64_t>(en1 & 1) << 0) |

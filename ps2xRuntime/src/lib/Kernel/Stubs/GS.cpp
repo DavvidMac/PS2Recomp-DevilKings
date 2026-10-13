@@ -898,16 +898,15 @@ namespace ps2_stubs
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
 
-        uint32_t zbufAddr = 0u;
-        {
-            R5900Context temp = *ctx;
-            sceGszbufaddr(rdram, &temp, runtime);
-            zbufAddr = getRegU32(&temp, 2);
-        }
-
-        const uint32_t fbp1 = zbufAddr;
-        const uint64_t dispfb0 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
-        const uint64_t dispfb1 = makeDispFb(0u, fbw, psm, 0u, 0u);
+        // Like libgraph: buffer 0 sits at page 0 and buffer 1 just below the Z buffer.
+        // Environment 0 displays buffer 0 while drawing into buffer 1, and vice versa.
+        // Games patch these fields afterwards (Devil Kings moves buffer 1 to page 64),
+        // so the layout has to match. Interlaced field mode shares a single buffer.
+        const uint32_t zbufAddr = static_cast<uint32_t>(gsZbufAddr(psm, drawWidth, drawHeight));
+        const bool fieldInterlace = g_gparam.interlace == 1u && g_gparam.ffmode == 0u;
+        const uint32_t fbp1 = fieldInterlace ? 0u : (zbufAddr >> 1);
+        const uint64_t dispfb0 = makeDispFb(0u, fbw, psm, 0u, 0u);
+        const uint64_t dispfb1 = makeDispFb(fbp1, fbw, psm, 0u, 0u);
 
         GsDBuffDcMem db{};
         db.disp[0].pmode = pmode;
@@ -920,11 +919,11 @@ namespace ps2_stubs
 
         const bool seedClear = clear != 0u;
         db.giftag0 = {makeGiftagAplusD(seedClear ? 22u : 16u), 0xEULL};
-        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw01, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw02, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
         db.giftag1 = db.giftag0;
-        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
-        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, fbp1, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv1(db.draw11, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
+        seedGsDrawEnv2(db.draw12, drawWidth, drawHeight, 0u, fbw, psm, zbufAddr, zpsm, ztest, false);
         if (seedClear)
         {
             seedGsClearPacket(db.clear0, drawWidth, drawHeight, 0u, ztest, false);
@@ -970,12 +969,7 @@ namespace ps2_stubs
         const int32_t drawWidth = static_cast<int32_t>(w);
         const int32_t drawHeight = static_cast<int32_t>(h);
 
-        uint32_t zbufAddr = 0u;
-        {
-            R5900Context temp = *ctx;
-            sceGszbufaddr(rdram, &temp, runtime);
-            zbufAddr = getRegU32(&temp, 2);
-        }
+        const uint32_t zbufAddr = static_cast<uint32_t>(gsZbufAddr(psm, drawWidth, drawHeight));
 
         GsDBuffMem db{};
         db.disp[0].pmode = pmode;
@@ -1038,8 +1032,7 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        const int32_t zbuf = gsZbufAddr(param_2, w, h);
 
         GsDrawEnv1Mem env{};
         seedGsDrawEnv1(env,
@@ -1081,8 +1074,7 @@ namespace ps2_stubs
 
         uint32_t psm = param_2 & 0xFU;
         uint32_t fbw = ((static_cast<uint32_t>(w) + 63u) >> 6) & 0x3FU;
-        sceGszbufaddr(rdram, ctx, runtime);
-        int32_t zbuf = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 2) & 0xFFFF));
+        const int32_t zbuf = gsZbufAddr(param_2, w, h);
 
         GsDrawEnv2Mem env{};
         seedGsDrawEnv2(env,
@@ -1321,47 +1313,11 @@ namespace ps2_stubs
     void sceGszbufaddr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         (void)rdram;
-        uint32_t param_1 = getRegU32(ctx, 4);
-        int32_t w = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFF));
-        int32_t h = static_cast<int32_t>(static_cast<int16_t>(getRegU32(ctx, 7) & 0xFFFF));
-
-        int32_t width_blocks = (w + 63) >> 6;
-        if (w + 63 < 0)
-            width_blocks = (w + 126) >> 6;
-
-        int32_t height_blocks;
-        if ((param_1 & 2) != 0)
-        {
-            int32_t v = (h + 63) >> 6;
-            if (h + 63 < 0)
-                v = (h + 126) >> 6;
-            height_blocks = v;
-        }
-        else
-        {
-            int32_t v = (h + 31) >> 5;
-            if (h + 31 < 0)
-                v = (h + 62) >> 5;
-            height_blocks = v;
-        }
-
-        int32_t product = width_blocks * height_blocks;
-
-        uint64_t gparam_val = 0;
-        if (runtime)
-        {
-            uint8_t *scratch = runtime->memory().getScratchpad();
-            if (scratch)
-            {
-                std::memcpy(&gparam_val, scratch + 0x100, sizeof(gparam_val));
-            }
-        }
-        if ((gparam_val & 0xFFFF0000FFFFULL) == 1ULL)
-            product = (product * 0x10000) >> 16;
-        else
-            product = (product * 0x20000) >> 16;
-
-        setReturnS32(ctx, product);
+        (void)runtime;
+        const uint32_t psm = getRegU32(ctx, 4);
+        const int32_t w = static_cast<int16_t>(getRegU32(ctx, 5) & 0xFFFFu);
+        const int32_t h = static_cast<int16_t>(getRegU32(ctx, 6) & 0xFFFFu);
+        setReturnS32(ctx, gsZbufAddr(psm, w, h));
     }
 
     void Ps2SwapDBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
