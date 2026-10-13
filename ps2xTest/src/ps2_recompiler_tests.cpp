@@ -807,6 +807,37 @@ void register_ps2_recompiler_tests()
 {
     MiniTest::Case("PS2Recompiler", [](TestCase &tc)
                    {
+        tc.Run("config manager loads force_recompile prefixes", [](TestCase &t) {
+            const auto uniqueSuffix = std::to_string(
+                static_cast<unsigned long long>(std::chrono::steady_clock::now().time_since_epoch().count()));
+            const std::filesystem::path configPath =
+                std::filesystem::temp_directory_path() / ("ps2recomp-force-recompile-" + uniqueSuffix + ".toml");
+
+            std::ofstream configFile(configPath);
+            t.IsTrue(static_cast<bool>(configFile), "temp config file should be writable");
+            if (!configFile)
+            {
+                return;
+            }
+
+            configFile << "[general]\n";
+            configFile << "input = \"dummy.elf\"\n";
+            configFile << "output = \"out\"\n";
+            configFile << "force_recompile = [\"sceVu0\", \"_sceVu0\"]\n";
+            configFile.close();
+
+            ConfigManager manager(configPath.string());
+            const RecompilerConfig config = manager.loadConfig();
+
+            t.Equals(config.forceRecompilePrefixes.size(), static_cast<size_t>(2),
+                     "force_recompile prefixes should load");
+            t.IsTrue(config.forceRecompilePrefixes[0] == "sceVu0" && config.forceRecompilePrefixes[1] == "_sceVu0",
+                     "force_recompile prefixes should keep their order");
+
+            std::error_code removeError;
+            std::filesystem::remove(configPath, removeError);
+        });
+
         tc.Run("game helpers are not classified as runtime stubs", [](TestCase &t) {
             t.IsFalse(ps2_runtime_calls::isStubName("Pad_init"),
                       "Pad_init should be recompiled as game code");

@@ -848,6 +848,7 @@ namespace ps2recomp
             m_skipFunctionStarts.clear();
             m_stubFunctions.clear();
             m_stubFunctionStarts.clear();
+            m_forceRecompilePrefixes = m_config.forceRecompilePrefixes;
             m_stubHandlerBindingsByStart.clear();
             m_entryPointHintStarts.clear();
             m_correctnessCriticalFunctionStarts.clear();
@@ -2272,6 +2273,13 @@ namespace ps2recomp
         if (m_stubFunctions.contains(function.name))
         {
             return true;
+        }
+        // Library code the game ships can be more faithful than the runtime's
+        // HLE replacement; config can opt such names out of automatic stubbing.
+        for (const std::string &prefix : m_forceRecompilePrefixes)
+        {
+            if (!prefix.empty() && function.name.rfind(prefix, 0u) == 0u)
+                return false;
         }
         return ps2_runtime_calls::isStubName(function.name);
     }

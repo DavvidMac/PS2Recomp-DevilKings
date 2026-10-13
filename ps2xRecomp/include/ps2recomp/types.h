@@ -187,6 +187,9 @@ namespace ps2recomp
         std::vector<std::string> skipFunctions;
         std::unordered_map<uint32_t, std::string> patches;
         std::vector<std::string> stubImplementations;
+        // Name prefixes recompiled from the game's own code even though the
+        // runtime has an HLE handler for the name (e.g. "sceVu0").
+        std::vector<std::string> forceRecompilePrefixes;
         std::vector<std::string> entryPointHints;
         std::unordered_map<uint32_t, uint32_t> mmioByInstructionAddress;
         std::vector<JumpTable> jumpTables;
