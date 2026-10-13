@@ -450,6 +450,14 @@ elseif(EXISTS "${ROOT_MAIN_CPP}")
     list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
 endif()
 
+# Code recompiled separately for modules the game loads at runtime goes in
+# src/runner/modules. It comes last so that adding a module only changes the
+# final unity batches, not the ones holding the main executable's code.
+file(GLOB_RECURSE RUNNER_MODULE_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/modules/*.cpp"
+)
+list(APPEND RUNNER_SRC_FILES ${RUNNER_MODULE_SRC_FILES})
+
 if(PS2X_IS_ANDROID)
     add_library(ps2EntryRunner SHARED
         ${RUNNER_SRC_FILES}
