@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <cstdio>
 
 namespace
 {
@@ -1349,7 +1350,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // Guards against malformed (looping) chains only: a real frame chain can
+                    // hold thousands of tags (Devil Kings' skinned characters use ~2000 each).
+                    const int kMaxChainTags = 1 << 20;
+                    const size_t kMaxChainBytes = 64u * 1024u * 1024u;
                     std::vector<uint8_t> chainBuf;
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -1410,7 +1414,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     int tagsProcessed = 0;
                     uint32_t lastTagUpper = (chcr >> 16) & 0xFFFFu;
 
-                    while (tagsProcessed < kMaxChainTags)
+                    bool chainEnded = false;
+                    while (tagsProcessed < kMaxChainTags && chainBuf.size() < kMaxChainBytes)
                     {
                         const uint32_t currentTagAddr = tagAddr;
                         const bool tagInSPR = isScratchpad(tagAddr);
@@ -1523,7 +1528,17 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
+                        {
+                            chainEnded = true;
                             break;
+                        }
+                    }
+                    if (!chainEnded && (tagsProcessed >= kMaxChainTags || chainBuf.size() >= kMaxChainBytes))
+                    {
+                        static std::atomic<uint32_t> s_truncatedChains{0u};
+                        if (s_truncatedChains.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                            std::fprintf(stderr, "[dma] chain on channel %08x stopped after %d tags (%zu bytes), tadr=%08x\n",
+                                         channelBase, tagsProcessed, chainBuf.size(), tagAddr);
                     }
 
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
