@@ -391,8 +391,10 @@ namespace ps2_stubs
                     state.ly = backendData[7];
                     usedBackend = true;
                 }
-                else
+                else if (padScript().empty())
                 {
+                    // A scripted run (PS2X_PAD_SCRIPT) ignores the host keyboard and gamepad,
+                    // so it plays the same whatever window has the focus.
                     applyGamepadState(state);
                     applyKeyboardState(state, portState.analogMode);
                 }
