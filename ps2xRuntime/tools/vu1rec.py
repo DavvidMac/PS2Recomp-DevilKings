@@ -423,6 +423,8 @@ class Emitter:
         self.pairs = pairs
         self.all_pairs = all_pairs
         self.out = []
+        # Without FSSET an FDIV result may land ahead of queued flag writes (Exec::commitQ).
+        self.has_fsset = any(not q.i_bit and q.op_hi == 0x15 for q in all_pairs.values())
 
     def line(self, text=''):
         self.out.append(text)
@@ -751,8 +753,10 @@ class Emitter:
             else:
                 reads_q = op in q_ops
         lower_reads_flags = (not p.i_bit) and p.op_hi in (0x10, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C)
-        if reads_q or lower_reads_flags or p.lo.pipeline == 'fdiv':
+        if lower_reads_flags or ((reads_q or p.lo.pipeline == 'fdiv') and self.has_fsset):
             out.append('x.commitTo(t);')
+        elif reads_q or p.lo.pipeline == 'fdiv':
+            out.append('x.commitQ(t);')
 
         out.extend(up_compute)
         out.extend(lo_compute)

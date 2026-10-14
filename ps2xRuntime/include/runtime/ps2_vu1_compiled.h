@@ -382,8 +382,68 @@ namespace ps2x::vu1c
                 commitDue(t);
         }
 
+        // Lands a due FDIV result (Q and its status bits) ahead of queued flag writes.
+        // Those only replace status bits 0-3 and OR into sticky bits 6-9, while FDIV
+        // replaces bits 4-5 and ORs into 10-11, so the order does not matter, unless an
+        // FSSET (which replaces all sticky bits) is queued: programs with FSSET use
+        // commitTo instead.
+        PS2X_VU1C_INLINE void commitQ(uint64_t t)
+        {
+            if (fdivPending && fdivReady <= t)
+            {
+                q = fdivValue;
+                const uint32_t currentDi = fdivStatusDi & 0x30u;
+                status = (status & 0xFCFu) | currentDi | (currentDi << 6);
+                fdivPending = false;
+            }
+        }
+
         PS2X_VU1C_NOINLINE void commitDue(uint64_t t)
         {
+            // Nothing observes the values between the writes applied here, so without an
+            // FSSET among them they fold: MAC and clip take the last value written, status
+            // bits 0-3 the last current flags, and the sticky bits collect every write
+            // (FDIV commutes with them, see commitQ).
+            bool fold = true;
+            uint32_t due = 0u;
+            while (due < flagCount && flags[(flagHead + due) & 15u].ready <= t)
+            {
+                if (flags[(flagHead + due) & 15u].writesSticky)
+                    fold = false;
+                ++due;
+            }
+            if (fold)
+            {
+                uint32_t newMac = mac;
+                uint32_t newClip = clip;
+                uint32_t current = 0u;
+                uint32_t sticky = 0u;
+                bool statusWritten = false;
+                for (uint32_t index = 0; index < due; ++index)
+                {
+                    const FlagEntry &entry = flags[(flagHead + index) & 15u];
+                    if (entry.writesMac)
+                        newMac = entry.mac;
+                    if (entry.writesStatus)
+                    {
+                        current = entry.status & 0xFu;
+                        sticky |= current | entry.extraSticky;
+                        statusWritten = true;
+                    }
+                    if (entry.writesClip)
+                        newClip = entry.clip;
+                }
+                mac = newMac;
+                clip = newClip;
+                if (statusWritten)
+                    status = (status & 0xFF0u) | current | (sticky << 6);
+                flagHead = (flagHead + due) & 15u;
+                flagCount -= due;
+                commitQ(t);
+                nextCommit = std::min(flagCount != 0u ? flags[flagHead].ready : kNever,
+                                      fdivPending ? fdivReady : kNever);
+                return;
+            }
             for (;;)
             {
                 const uint64_t nextFlag = flagCount != 0u ? flags[flagHead].ready : kNever;
