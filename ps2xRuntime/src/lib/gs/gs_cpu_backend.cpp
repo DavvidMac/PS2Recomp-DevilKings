@@ -949,6 +949,13 @@ GSCpuBackend::~GSCpuBackend()
     if (m_worker.joinable())
         m_worker.join();
     {
+        std::lock_guard<std::mutex> jobLock(m_presentJobMutex);
+        m_stopPresenter = true;
+    }
+    m_presentJobCv.notify_all();
+    if (m_presenter.joinable())
+        m_presenter.join();
+    {
         std::lock_guard<std::mutex> bandLock(m_bandMutex);
         m_stopBands = true;
     }
@@ -961,6 +968,8 @@ void GSCpuBackend::WorkerLoop()
 {
     s_onGsWorker = true;
     std::vector<QueuedWork> batches;
+    // The batch before: a list handed to the band threads may still point into it.
+    std::vector<QueuedWork> previousBatches;
     for (;;)
     {
         {
@@ -979,6 +988,7 @@ void GSCpuBackend::WorkerLoop()
             gsStats().batches.fetch_add(1u, std::memory_order_relaxed);
             gsStats().batchItems.fetch_add(batches.size(), std::memory_order_relaxed);
         }
+        const uint64_t submittedBefore = m_submittedLists;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             for (QueuedWork &work : batches)
@@ -1012,35 +1022,49 @@ void GSCpuBackend::WorkerLoop()
                 }
                 const GsStatsClock::time_point presentStart =
                     collectStats ? GsStatsClock::now() : GsStatsClock::time_point{};
-                PresentationFrame frame{};
-                if (m_vram && m_vramSize != 0u)
+                PresentJob job;
                 {
-                    thread_local std::vector<uint8_t> snapshot;
-                    thread_local GSCpuBackend snapshotBackend;
-                    snapshot.assign(m_vram, m_vram + m_vramSize);
-                    snapshotBackend.Initialize(snapshot.data(), static_cast<uint32_t>(snapshot.size()));
-                    frame = snapshotBackend.PresentFromLocalMemory(work.request);
+                    std::lock_guard<std::mutex> jobLock(m_presentJobMutex);
+                    if (!m_presentBuffers.empty())
+                    {
+                        job.vram = std::move(m_presentBuffers.back());
+                        m_presentBuffers.pop_back();
+                    }
+                    if (!m_presenter.joinable())
+                        m_presenter = std::thread([this]() { PresentLoop(); });
                 }
-                if (work.sink)
-                    work.sink(std::move(frame));
+                if (m_vram && m_vramSize != 0u)
+                    job.vram.assign(m_vram, m_vram + m_vramSize);
+                else
+                    job.vram.clear();
+                job.request = work.request;
+                job.sink = std::move(work.sink);
+                {
+                    std::lock_guard<std::mutex> jobLock(m_presentJobMutex);
+                    m_presentJobs.push_back(std::move(job));
+                }
+                m_presentJobCv.notify_one();
                 if (collectStats)
                     gsStats().presentNs.fetch_add(gsStatsNanoseconds(presentStart), std::memory_order_relaxed);
-                {
-                    std::lock_guard<std::mutex> queueLock(m_queueMutex);
-                    if (m_pendingPresents != 0u)
-                        --m_pendingPresents;
-                }
-                m_presentCv.notify_all();
             }
             FlushPendingDrawsUnlocked(FlushReason::BatchEnd);
-            // The batch's draws (and the queue's idle state) must outlive the list.
-            JoinInflightUnlocked();
+            // Going idle means every queued draw is in VRAM. Otherwise the list in flight
+            // can keep going while the next batch is queued, unless it was handed over
+            // during the previous batch, whose storage is dropped below.
+            bool moreWork = false;
+            {
+                std::lock_guard<std::mutex> queueLock(m_queueMutex);
+                moreWork = !m_queue.empty();
+            }
+            if (!moreWork || m_submittedLists == submittedBefore)
+                JoinInflightUnlocked();
         }
         if (collectStats)
         {
             gsStats().workerBusyNs.fetch_add(gsStatsNanoseconds(busyStart), std::memory_order_relaxed);
             maybePrintGsStats(m_bandCount);
         }
+        previousBatches.swap(batches);
         batches.clear();
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
@@ -1050,6 +1074,41 @@ void GSCpuBackend::WorkerLoop()
                 m_idleCv.notify_all();
             m_presentCv.notify_all();
         }
+    }
+}
+
+void GSCpuBackend::PresentLoop()
+{
+    GSCpuBackend snapshotBackend;
+    for (;;)
+    {
+        PresentJob job;
+        {
+            std::unique_lock<std::mutex> jobLock(m_presentJobMutex);
+            m_presentJobCv.wait(jobLock, [this]() { return m_stopPresenter || !m_presentJobs.empty(); });
+            if (m_presentJobs.empty())
+                return;
+            job = std::move(m_presentJobs.front());
+            m_presentJobs.erase(m_presentJobs.begin());
+        }
+        PresentationFrame frame{};
+        if (!job.vram.empty())
+        {
+            snapshotBackend.Initialize(job.vram.data(), static_cast<uint32_t>(job.vram.size()));
+            frame = snapshotBackend.PresentFromLocalMemory(job.request);
+        }
+        if (job.sink)
+            job.sink(std::move(frame));
+        {
+            std::lock_guard<std::mutex> jobLock(m_presentJobMutex);
+            m_presentBuffers.push_back(std::move(job.vram));
+        }
+        {
+            std::lock_guard<std::mutex> queueLock(m_queueMutex);
+            if (m_pendingPresents != 0u)
+                --m_pendingPresents;
+        }
+        m_presentCv.notify_all();
     }
 }
 
@@ -2195,6 +2254,7 @@ void GSCpuBackend::FlushPendingDrawsUnlocked(FlushReason reason)
         }
         m_inflightWritePages = m_pendingWritePages;
         m_inflight = true;
+        ++m_submittedLists;
         if (collectStats)
             m_inflightSubmitted = GsStatsClock::now();
         if (collectStats)

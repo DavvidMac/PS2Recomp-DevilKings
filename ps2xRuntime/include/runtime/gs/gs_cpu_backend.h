@@ -258,6 +258,24 @@ private:
     std::vector<PendingDraw> m_inflightDraws;
     std::bitset<512> m_inflightWritePages;
     bool m_inflight = false;
+    // Lists handed to the band threads so far (tells the worker which batch a list uses).
+    uint64_t m_submittedLists = 0;
+
+    // Presentations are converted to host pixels on their own thread: the worker only
+    // copies VRAM (complete up to the presentation) and goes on queueing draws.
+    struct PresentJob
+    {
+        std::vector<uint8_t> vram;
+        GSPresentationRequest request{};
+        PresentSink sink;
+    };
+    void PresentLoop();
+    std::mutex m_presentJobMutex;
+    std::condition_variable m_presentJobCv;
+    std::vector<PresentJob> m_presentJobs;
+    std::vector<std::vector<uint8_t>> m_presentBuffers;
+    bool m_stopPresenter = false;
+    std::thread m_presenter;
     // PS2X_GS_STATS: when the in-flight list was handed over, and when its last band finished.
     std::chrono::steady_clock::time_point m_inflightSubmitted{};
     std::chrono::steady_clock::time_point m_inflightFinished{};
