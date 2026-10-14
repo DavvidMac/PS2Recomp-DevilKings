@@ -467,8 +467,53 @@ void EeScheduler::accountCycles(uint32_t cycles) noexcept
     m_runtime.advanceIopEeCycles(std::max<uint32_t>(1u, cycles));
 }
 
+namespace
+{
+    struct GuestPoke
+    {
+        uint32_t address;
+        uint32_t value;
+    };
+
+    // PS2X_POKE=<addr>=<value>[,<addr>=<value>...] (hex) writes each 32-bit value to
+    // EE RAM on every VSync, the way a CodeBreaker constant-write code does.
+    const std::vector<GuestPoke> &guestPokes()
+    {
+        static const std::vector<GuestPoke> s_pokes = []()
+        {
+            std::vector<GuestPoke> pokes;
+            const char *env = std::getenv("PS2X_POKE");
+            for (const char *cursor = env; cursor && *cursor;)
+            {
+                char *end = nullptr;
+                const unsigned long address = std::strtoul(cursor, &end, 16);
+                if (!end || *end != '=')
+                {
+                    std::cerr << "[poke] ignoring malformed PS2X_POKE at '" << cursor << "'" << std::endl;
+                    break;
+                }
+                const unsigned long value = std::strtoul(end + 1, &end, 16);
+                pokes.push_back({static_cast<uint32_t>(address) & 0x1FFFFFFCu, static_cast<uint32_t>(value)});
+                std::cerr << std::hex << "[poke] 0x" << pokes.back().address << " = 0x" << pokes.back().value
+                          << std::dec << " every VSync" << std::endl;
+                cursor = (end && *end == ',') ? end + 1 : end;
+            }
+            return pokes;
+        }();
+        return s_pokes;
+    }
+}
+
 void EeScheduler::dumpThreadsForDiagnostics() const
 {
+    for (const GuestPoke &poke : guestPokes())
+    {
+        if (m_rdram && poke.address <= PS2_RAM_SIZE - sizeof(uint32_t))
+        {
+            std::memcpy(m_rdram + poke.address, &poke.value, sizeof(poke.value));
+        }
+    }
+
     // PS2X_THREAD_DUMP=<n>: print every guest thread's state every n VSyncs.
     // PS2X_RDRAM_DUMP=<vsync>:<path> writes the 32 MiB of EE RAM at that VSync.
     static const char *rdramDump = std::getenv("PS2X_RDRAM_DUMP");

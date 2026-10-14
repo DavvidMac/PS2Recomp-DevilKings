@@ -68,6 +68,7 @@ These debugging switches are read once at startup from the environment (some are
 | Variable | Syntax | What it does |
 |---|---|---|
 | `PS2X_PAD_SCRIPT` | `<from>-<to>:<BUTTON>[+<BUTTON>...][;...]` | Holds named pad buttons on port 0 for inclusive VSync ranges. Names include directions, face buttons, START/SELECT, and L1/R1/L2/R2/L3/R3. |
+| `PS2X_POKE` | `<addr>=<value>[,<addr>=<value>...]` (hex) | Writes each 32-bit value to EE RAM on every VSync, like a CodeBreaker constant-write code; prints each as `[poke]` at startup. |
 
 ## Examples
 
