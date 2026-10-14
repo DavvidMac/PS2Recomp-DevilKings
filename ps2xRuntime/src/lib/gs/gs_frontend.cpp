@@ -414,7 +414,7 @@ void GS::recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint
     recordDebugEventUnlocked(entry);
 }
 
-void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
+void GS::recordRegisterDebugEventSlow(uint8_t regAddr, uint64_t value)
 {
     if (m_debugHistoryPaused)
     {
@@ -457,7 +457,7 @@ void GS::recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
     recordDebugEventUnlocked(entry);
 }
 
-void GS::recordDrawDebugEventUnlocked(int vertexCount)
+void GS::recordDrawDebugEventSlow(int vertexCount)
 {
     if (m_debugHistoryPaused)
     {
@@ -571,6 +571,13 @@ GSPresentationRequest GS::buildPresentationRequestUnlocked() const
     request.preferredDestFbp = m_preferredDisplayDestFbp;
     request.hasPreferredSource = m_hasPreferredDisplaySource;
     return request;
+}
+
+void GS::kickBackend()
+{
+    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (m_backend)
+        m_backend->Flush();
 }
 
 void GS::latchPresentationOnDisplaySwap()

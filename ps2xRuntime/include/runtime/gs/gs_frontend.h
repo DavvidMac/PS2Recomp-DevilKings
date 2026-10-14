@@ -136,6 +136,8 @@ public:
     // the presentation frame when DISPFB changes (the buffer was just finished)
     // and report whether such swaps are driving presentation.
     void latchPresentationOnDisplaySwap();
+    // Hands the draws queued so far to the raster backend (wakes a CPU backend's worker).
+    void kickBackend();
     bool isPresentationSwapDriven(uint64_t vsyncTick) const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
@@ -170,8 +172,19 @@ private:
     void recordDebugEventUnlocked(GSDebugHistoryEntry entry);
     GSDebugHistoryEntry makeDebugEventUnlocked(GSDebugEventKind kind) const;
     void recordGifTagDebugEventUnlocked(uint32_t sizeBytes, uint32_t nloop, uint8_t flg, uint32_t nreg);
-    void recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value);
-    void recordDrawDebugEventUnlocked(int vertexCount);
+    // Called for every register write and every primitive: the paused check stays inline.
+    void recordRegisterDebugEventUnlocked(uint8_t regAddr, uint64_t value)
+    {
+        if (!m_debugHistoryPaused)
+            recordRegisterDebugEventSlow(regAddr, value);
+    }
+    void recordDrawDebugEventUnlocked(int vertexCount)
+    {
+        if (!m_debugHistoryPaused)
+            recordDrawDebugEventSlow(vertexCount);
+    }
+    void recordRegisterDebugEventSlow(uint8_t regAddr, uint64_t value);
+    void recordDrawDebugEventSlow(int vertexCount);
     void recordTransferDebugEventUnlocked();
     void recordPresentDebugEventUnlocked(uint32_t displayFbp, uint32_t sourceFbp, uint32_t width, uint32_t height, bool usedPreferred);
 

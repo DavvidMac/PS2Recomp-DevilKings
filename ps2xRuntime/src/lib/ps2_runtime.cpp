@@ -956,6 +956,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                      m_eeScheduler->postEvent(EeEvent{EeEventType::Dmac, 1u, 0u}); });
     // While guest code waits for the VIF1 thread, pull the EE clock to host time as a
     // checkpoint would, so the IOP runs during the wait instead of in one burst after it.
+    m_memory.setGsKickHook([this]() { m_gs.kickBackend(); });
     m_memory.setVif1WaitHook([this]()
                              {
                                  if (m_eeScheduler && m_eeScheduler->isExecutingGuest())

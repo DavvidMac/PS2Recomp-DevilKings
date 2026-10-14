@@ -314,6 +314,8 @@ private:
             Upload
         };
         Kind kind = Kind::Draw;
+        // Entries of m_drawQueue queued ahead of this item (same worker batch).
+        size_t drawIndex = 0u;
         GSPrimitiveBatch batch{};
         GSPresentationRequest request{};
         PresentSink sink;
@@ -323,11 +325,24 @@ private:
         std::vector<uint8_t> payload;
     };
     bool EnqueueWork(const std::function<void(QueuedWork &)> &fill);
+    // Queues a draw for the worker (false when the backend runs synchronously).
+    bool QueueDraw(const GSPrimitiveBatch &batch);
+    bool AsyncEnabled();
     void LoadClutStateUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
     void TextureFlushUnlocked();
     void BeginTransferUnlocked(const GSTransferCommand &command);
     void UploadImageUnlocked(const uint8_t *data, uint32_t sizeBytes);
     std::vector<QueuedWork> m_queue;
+    // Draws, in order, between the items of m_queue (each item records how many came first):
+    // a draw costs a copy of its batch instead of a whole QueuedWork.
+    std::vector<GSPrimitiveBatch> m_drawQueue;
+    // Draws queued since the worker was last woken: Submit wakes it every kDrawsPerWake
+    // draws, Flush() (end of every GIF packet) and the waits below for the rest.
+    static constexpr size_t kDrawsPerWake = 64u;
+    mutable size_t m_unnotifiedDraws = 0u;
+    // The worker is waiting for work (m_queueMutex): a busy worker needs no wake-up, it
+    // takes everything queued when it finishes its batch.
+    bool m_workerWaiting = false;
     bool m_workerBusy = false;
     // Presentation snapshots queued but not yet taken. The producer may run at
     // most kMaxPendingPresents frames ahead of the rasteriser.

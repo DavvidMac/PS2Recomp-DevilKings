@@ -2270,6 +2270,8 @@ void PS2Memory::processPendingTransfers()
 
     if (m_gifArbiter)
         m_gifArbiter->drain();
+    if ((hadGif || hadVif1) && m_gsKickHook)
+        m_gsKickHook();
 
     static constexpr uint32_t GIF_CHANNEL = 0x1000A000;
     static constexpr uint32_t VIF0_CHANNEL = 0x10008000;
@@ -2398,6 +2400,8 @@ void PS2Memory::vif1ThreadMain()
                 processVIF1Data(job.data.data(), static_cast<uint32_t>(job.data.size()));
             if (m_gifArbiter)
                 m_gifArbiter->drain();
+            if (m_gsKickHook)
+                m_gsKickHook();
         }
         catch (const std::exception &error)
         {

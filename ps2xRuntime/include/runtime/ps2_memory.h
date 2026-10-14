@@ -390,6 +390,9 @@ public:
     // Called about every half millisecond while the EE waits for the VIF1 thread, to keep
     // the EE clock and the IOP on host time meanwhile (instead of catching up afterwards).
     void setVif1WaitHook(std::function<void()> hook) { m_vif1WaitHook = std::move(hook); }
+    // Called once VIF1/GIF transfers have been handed to the GS (end of a VIF1 thread job,
+    // end of processPendingTransfers), so the raster backend starts on the last draws.
+    void setGsKickHook(std::function<void()> hook) { m_gsKickHook = std::move(hook); }
 
     int pollDmaRegisters();
 
@@ -499,6 +502,7 @@ public:
     std::function<void(uint32_t)> m_applyVu1Stop;
     std::function<void()> m_vif1IdleHook;
     std::function<void()> m_vif1WaitHook;
+    std::function<void()> m_gsKickHook;
     void vif1ThreadMain();
     void queueVif1Transfers();
     void applyVif1Completions();

@@ -901,7 +901,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     if (batch.vertexCount == 0u)
         return;
     gsRecordWrite(this, GsRecordKind::Submit, &batch, sizeof(batch));
-    if (EnqueueWork([&](QueuedWork &work) { work.batch = batch; }))
+    if (QueueDraw(batch))
         return;
     std::lock_guard<std::mutex> lock(m_mutex);
     if (!m_vram)
@@ -909,7 +909,7 @@ void GSCpuBackend::Submit(const GSPrimitiveBatch &batch)
     DrawPrimitive(batch);
 }
 
-bool GSCpuBackend::EnqueueWork(const std::function<void(QueuedWork &)> &fill)
+bool GSCpuBackend::AsyncEnabled()
 {
     if (!m_asyncResolved)
     {
@@ -917,24 +917,63 @@ bool GSCpuBackend::EnqueueWork(const std::function<void(QueuedWork &)> &fill)
         const char *value = std::getenv("PS2X_GS_ASYNC");
         m_async = value && value[0] == '1';
     }
-    if (!m_async)
+    return m_async;
+}
+
+bool GSCpuBackend::EnqueueWork(const std::function<void(QueuedWork &)> &fill)
+{
+    if (!AsyncEnabled())
         return false;
     std::unique_lock<std::mutex> queueLock(m_queueMutex);
     if (!m_worker.joinable())
         m_worker = std::thread([this]() { WorkerLoop(); });
-    if (gsStatsEnabled() && m_queue.size() + m_inFlightWork >= kMaxQueuedWork)
+    auto hasRoom = [this]()
+    { return m_queue.size() + m_drawQueue.size() + m_inFlightWork < kMaxQueuedWork || m_stopWorker; };
+    if (!hasRoom())
     {
-        const GsStatsClock::time_point waitStart = GsStatsClock::now();
-        m_presentCv.wait(queueLock, [this]()
-                         { return m_queue.size() + m_inFlightWork < kMaxQueuedWork || m_stopWorker; });
-        gsStats().producerQueueWaitNs.fetch_add(gsStatsNanoseconds(waitStart), std::memory_order_relaxed);
+        m_unnotifiedDraws = 0u;
+        m_queueCv.notify_one();
+        const GsStatsClock::time_point waitStart = gsStatsEnabled() ? GsStatsClock::now() : GsStatsClock::time_point{};
+        m_presentCv.wait(queueLock, hasRoom);
+        if (gsStatsEnabled())
+            gsStats().producerQueueWaitNs.fetch_add(gsStatsNanoseconds(waitStart), std::memory_order_relaxed);
     }
-    m_presentCv.wait(queueLock, [this]()
-                     { return m_queue.size() + m_inFlightWork < kMaxQueuedWork || m_stopWorker; });
     m_queue.emplace_back();
     fill(m_queue.back());
+    m_queue.back().drawIndex = m_drawQueue.size();
+    m_unnotifiedDraws = 0u;
     queueLock.unlock();
     m_queueCv.notify_one();
+    return true;
+}
+
+bool GSCpuBackend::QueueDraw(const GSPrimitiveBatch &batch)
+{
+    if (!AsyncEnabled())
+        return false;
+    std::unique_lock<std::mutex> queueLock(m_queueMutex);
+    if (!m_worker.joinable())
+        m_worker = std::thread([this]() { WorkerLoop(); });
+    auto hasRoom = [this]()
+    { return m_queue.size() + m_drawQueue.size() + m_inFlightWork < kMaxQueuedWork || m_stopWorker; };
+    if (!hasRoom())
+    {
+        m_unnotifiedDraws = 0u;
+        m_queueCv.notify_one();
+        const GsStatsClock::time_point waitStart = gsStatsEnabled() ? GsStatsClock::now() : GsStatsClock::time_point{};
+        m_presentCv.wait(queueLock, hasRoom);
+        if (gsStatsEnabled())
+            gsStats().producerQueueWaitNs.fetch_add(gsStatsNanoseconds(waitStart), std::memory_order_relaxed);
+    }
+    m_drawQueue.push_back(batch);
+    // A busy worker takes every queued draw when it finishes its batch; a sleeping one is
+    // woken only every kDrawsPerWake draws (and by Flush), not for each triangle.
+    const bool wake = ++m_unnotifiedDraws >= kDrawsPerWake && m_workerWaiting;
+    if (wake)
+        m_unnotifiedDraws = 0u;
+    queueLock.unlock();
+    if (wake)
+        m_queueCv.notify_one();
     return true;
 }
 
@@ -968,17 +1007,25 @@ void GSCpuBackend::WorkerLoop()
 {
     s_onGsWorker = true;
     std::vector<QueuedWork> batches;
+    std::vector<GSPrimitiveBatch> draws;
     // The batch before: a list handed to the band threads may still point into it.
     std::vector<QueuedWork> previousBatches;
+    std::vector<GSPrimitiveBatch> previousDraws;
     for (;;)
     {
         {
             std::unique_lock<std::mutex> queueLock(m_queueMutex);
-            m_queueCv.wait(queueLock, [this]() { return m_stopWorker || !m_queue.empty(); });
-            if (m_queue.empty() && m_stopWorker)
+            // Draws can be queued without a wake-up (see QueueDraw): never sleep long on them.
+            m_workerWaiting = true;
+            while (!m_stopWorker && m_queue.empty() && m_drawQueue.empty())
+                m_queueCv.wait_for(queueLock, std::chrono::milliseconds(2));
+            m_workerWaiting = false;
+            if (m_queue.empty() && m_drawQueue.empty() && m_stopWorker)
                 return;
             batches.swap(m_queue);
-            m_inFlightWork = batches.size();
+            draws.swap(m_drawQueue);
+            m_unnotifiedDraws = 0u;
+            m_inFlightWork = batches.size() + draws.size();
             m_workerBusy = true;
         }
         const bool collectStats = gsStatsEnabled();
@@ -986,13 +1033,23 @@ void GSCpuBackend::WorkerLoop()
         if (collectStats)
         {
             gsStats().batches.fetch_add(1u, std::memory_order_relaxed);
-            gsStats().batchItems.fetch_add(batches.size(), std::memory_order_relaxed);
+            gsStats().batchItems.fetch_add(batches.size() + draws.size(), std::memory_order_relaxed);
         }
         const uint64_t submittedBefore = m_submittedLists;
         {
             std::lock_guard<std::mutex> lock(m_mutex);
+            size_t nextDraw = 0u;
+            auto drawUpTo = [&](size_t end)
+            {
+                for (; nextDraw < end && nextDraw < draws.size(); ++nextDraw)
+                {
+                    if (m_vram)
+                        QueueDrawUnlocked(draws[nextDraw]);
+                }
+            };
             for (QueuedWork &work : batches)
             {
+                drawUpTo(work.drawIndex);
                 switch (work.kind)
                 {
                 case QueuedWork::Kind::Draw:
@@ -1047,6 +1104,7 @@ void GSCpuBackend::WorkerLoop()
                 if (collectStats)
                     gsStats().presentNs.fetch_add(gsStatsNanoseconds(presentStart), std::memory_order_relaxed);
             }
+            drawUpTo(draws.size());
             FlushPendingDrawsUnlocked(FlushReason::BatchEnd);
             // Going idle means every queued draw is in VRAM. Otherwise the list in flight
             // can keep going while the next batch is queued, unless it was handed over
@@ -1054,7 +1112,7 @@ void GSCpuBackend::WorkerLoop()
             bool moreWork = false;
             {
                 std::lock_guard<std::mutex> queueLock(m_queueMutex);
-                moreWork = !m_queue.empty();
+                moreWork = !m_queue.empty() || !m_drawQueue.empty();
             }
             if (!moreWork || m_submittedLists == submittedBefore)
                 JoinInflightUnlocked();
@@ -1066,11 +1124,13 @@ void GSCpuBackend::WorkerLoop()
         }
         previousBatches.swap(batches);
         batches.clear();
+        previousDraws.swap(draws);
+        draws.clear();
         {
             std::lock_guard<std::mutex> queueLock(m_queueMutex);
             m_workerBusy = false;
             m_inFlightWork = 0u;
-            if (m_queue.empty())
+            if (m_queue.empty() && m_drawQueue.empty())
                 m_idleCv.notify_all();
             m_presentCv.notify_all();
         }
@@ -1126,6 +1186,8 @@ void GSCpuBackend::QueuePresent(const GSPresentationRequest &request, PresentSin
                                  { return m_pendingPresents < kMaxPendingPresents || m_stopWorker; });
                 gsStats().producerPresentWaitNs.fetch_add(gsStatsNanoseconds(waitStart), std::memory_order_relaxed);
             }
+            if (m_pendingPresents >= kMaxPendingPresents)
+                m_queueCv.notify_one();
             m_presentCv.wait(queueLock, [this]()
                              { return m_pendingPresents < kMaxPendingPresents || m_stopWorker; });
             ++m_pendingPresents;
@@ -1133,7 +1195,9 @@ void GSCpuBackend::QueuePresent(const GSPresentationRequest &request, PresentSin
             work.kind = QueuedWork::Kind::Present;
             work.request = request;
             work.sink = std::move(sink);
+            work.drawIndex = m_drawQueue.size();
             m_queue.push_back(std::move(work));
+            m_unnotifiedDraws = 0u;
             queueLock.unlock();
             m_queueCv.notify_one();
             return;
@@ -1147,14 +1211,20 @@ void GSCpuBackend::QueuePresent(const GSPresentationRequest &request, PresentSin
 void GSCpuBackend::DrainQueue() const
 {
     std::unique_lock<std::mutex> queueLock(m_queueMutex);
-    if (gsStatsEnabled() && !(m_queue.empty() && !m_workerBusy))
+    auto idle = [this]() { return m_queue.empty() && m_drawQueue.empty() && !m_workerBusy; };
+    if (!idle())
+    {
+        m_unnotifiedDraws = 0u;
+        m_queueCv.notify_one();
+    }
+    if (gsStatsEnabled() && !idle())
     {
         const GsStatsClock::time_point waitStart = GsStatsClock::now();
-        m_idleCv.wait(queueLock, [this]() { return m_queue.empty() && !m_workerBusy; });
+        m_idleCv.wait(queueLock, idle);
         gsStats().producerDrainWaitNs.fetch_add(gsStatsNanoseconds(waitStart), std::memory_order_relaxed);
         gsStats().producerDrains.fetch_add(1u, std::memory_order_relaxed);
     }
-    m_idleCv.wait(queueLock, [this]() { return m_queue.empty() && !m_workerBusy; });
+    m_idleCv.wait(queueLock, idle);
 }
 
 void GSCpuBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
@@ -1263,7 +1333,15 @@ void GSCpuBackend::LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &t
 
 void GSCpuBackend::Flush()
 {
-    // CPU backend is immediate. GPU backends may submit command buffers here.
+    // Wakes the worker for the draws Submit queued without waking it.
+    bool wake = false;
+    {
+        std::lock_guard<std::mutex> queueLock(m_queueMutex);
+        wake = m_unnotifiedDraws != 0u && m_workerWaiting;
+        m_unnotifiedDraws = 0u;
+    }
+    if (wake)
+        m_queueCv.notify_one();
 }
 
 void GSCpuBackend::TextureFlush()
