@@ -20,6 +20,16 @@
 #include <cstring>
 #include <limits>
 
+// Hot helpers are forced inline into the (very large) translated run functions,
+// where the inliner would otherwise give up; their rare slow paths stay out of line.
+#if defined(_MSC_VER) && !defined(__clang__)
+#define PS2X_VU1C_INLINE __forceinline
+#define PS2X_VU1C_NOINLINE __declspec(noinline)
+#else
+#define PS2X_VU1C_INLINE inline __attribute__((always_inline))
+#define PS2X_VU1C_NOINLINE __attribute__((noinline))
+#endif
+
 namespace ps2x::vu1c
 {
     constexpr uint64_t kNever = ~0ull;
@@ -84,7 +94,12 @@ namespace ps2x::vu1c
     // Same as VU1Interpreter::normalizeFmacExactResult.
     inline uint8_t exactFlags(float &value, long double exact)
     {
+#if defined(__clang__) || defined(__GNUC__)
+        // std::signbit(long double) is an out-of-line CRT call (_ldsign) on MSVC targets.
+        const bool negative = __builtin_signbit(exact);
+#else
         const bool negative = std::signbit(exact);
+#endif
         const long double magnitude = std::fabs(exact);
         uint8_t flags = negative ? 0x2u : 0u;
         uint32_t bits = negative ? 0x80000000u : 0u;
@@ -227,6 +242,10 @@ namespace ps2x::vu1c
         float fdivValue;
         uint32_t fdivStatusDi;
 
+        // No queued flag write or FDIV result lands before this cycle (kNever when
+        // nothing is queued); lets commitTo return without looking at the queues.
+        uint64_t nextCommit;
+
         // A branch right after an integer op reads that op's old VI value.
         bool viBackupValid;
         uint8_t viBackupReg;
@@ -306,7 +325,13 @@ namespace ps2x::vu1c
 
         // Applies every MAC/status/clip and Q write that the interpreter would have
         // committed by cycle t, in its order: flags first, then FDIV, per cycle.
-        void commitTo(uint64_t t)
+        PS2X_VU1C_INLINE void commitTo(uint64_t t)
+        {
+            if (t >= nextCommit)
+                commitDue(t);
+        }
+
+        PS2X_VU1C_NOINLINE void commitDue(uint64_t t)
         {
             for (;;)
             {
@@ -314,7 +339,10 @@ namespace ps2x::vu1c
                 const uint64_t nextDiv = fdivPending ? fdivReady : kNever;
                 const uint64_t next = std::min(nextFlag, nextDiv);
                 if (next > t)
+                {
+                    nextCommit = next;
                     return;
+                }
                 while (flagCount != 0u && flags[flagHead].ready <= next)
                 {
                     const FlagEntry &entry = flags[flagHead];
@@ -342,7 +370,7 @@ namespace ps2x::vu1c
             }
         }
 
-        FlagEntry *pushFlag(uint64_t t)
+        PS2X_VU1C_INLINE FlagEntry *pushFlag(uint64_t t)
         {
             // Entries due by now have left the interpreter's slots before this issue.
             commitTo(t);
@@ -357,11 +385,14 @@ namespace ps2x::vu1c
             entry = {};
             entry.issue = t;
             entry.ready = t + 4u;
+            // Ready cycles never decrease, so this only matters when the queue was empty.
+            if (entry.ready < nextCommit)
+                nextCommit = entry.ready;
             noteReady(entry.ready);
             return &entry;
         }
 
-        void fmacFlags(uint64_t t, const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky)
+        PS2X_VU1C_INLINE void fmacFlags(uint64_t t, const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky)
         {
             if (dest == 0u)
                 return;
@@ -369,18 +400,13 @@ namespace ps2x::vu1c
             uint32_t newStatus = 0u;
             for (uint32_t component = 0; component < 4u; ++component)
             {
-                const uint8_t bit = lane(component);
-                if ((dest & bit) == 0u)
+                if ((dest & lane(component)) == 0u)
                     continue;
+                // Z, S, U and O of a lane land in MAC bits 0-3, 4-7, 8-11 and 12-15 (x highest).
                 const uint32_t flagsOfLane = laneFlags[component];
-                if ((flagsOfLane & 0x1u) != 0u)
-                    newMac |= bit;
-                if ((flagsOfLane & 0x2u) != 0u)
-                    newMac |= static_cast<uint32_t>(bit) << 4;
-                if ((flagsOfLane & 0x4u) != 0u)
-                    newMac |= static_cast<uint32_t>(bit) << 8;
-                if ((flagsOfLane & 0x8u) != 0u)
-                    newMac |= static_cast<uint32_t>(bit) << 12;
+                const uint32_t spread = (flagsOfLane & 0x1u) | ((flagsOfLane & 0x2u) << 3) |
+                                        ((flagsOfLane & 0x4u) << 6) | ((flagsOfLane & 0x8u) << 9);
+                newMac |= spread << (3u - component);
                 newStatus |= flagsOfLane;
             }
             if (FlagEntry *entry = pushFlag(t))
@@ -441,6 +467,8 @@ namespace ps2x::vu1c
             fdivReady = t + latency;
             fdivValue = normResult(value, ignored);
             fdivStatusDi = statusDi & 0x30u;
+            if (fdivReady < nextCommit)
+                nextCommit = fdivReady;
             noteReady(fdivReady);
         }
 
@@ -462,8 +490,16 @@ namespace ps2x::vu1c
                 return;
             }
             const uint32_t qwordOffset = xgCopied;
-            for (uint32_t index = 0; index < 16u; ++index)
-                xgPacket[xgCopied + index] = mem[(xgSource + xgCopied + index) % memSize];
+            const uint32_t sourceOffset = (xgSource + xgCopied) % memSize;
+            if (sourceOffset + 16u <= memSize)
+            {
+                std::memcpy(xgPacket + xgCopied, mem + sourceOffset, 16u);
+            }
+            else
+            {
+                for (uint32_t index = 0; index < 16u; ++index)
+                    xgPacket[xgCopied + index] = mem[(xgSource + xgCopied + index) % memSize];
+            }
             xgCopied += 16u;
 
             if (xgTagEnd == 0u)

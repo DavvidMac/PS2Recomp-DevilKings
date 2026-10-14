@@ -2247,6 +2247,7 @@ void VU1Interpreter::exportCompiledState(ps2x::vu1c::Exec &x, uint8_t *vuData, u
     x.fdivReady = 0u;
     x.fdivValue = 0.0f;
     x.fdivStatusDi = 0u;
+    x.nextCommit = ps2x::vu1c::kNever;
     x.viBackupValid = m_viBranchBackupValid;
     x.viBackupReg = m_viBranchBackupReg;
     x.viBackupValue = m_viBranchBackupValue;
