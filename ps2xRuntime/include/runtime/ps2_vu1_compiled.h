@@ -388,8 +388,30 @@ namespace ps2x::vu1c
         // committed by cycle t, in its order: flags first, then FDIV, per cycle.
         PS2X_VU1C_INLINE void commitTo(uint64_t t)
         {
-            if (t >= nextCommit)
-                commitDue(t);
+            if (t < nextCommit)
+                return;
+            // Usually a single write is due (a CLIP before an FCAND, often with a DIV still
+            // in flight): land it here, as commitDue's loop would, without the call.
+            if (flagCount == 1u && flags[flagHead].ready <= t && (!fdivPending || fdivReady > t))
+            {
+                const FlagEntry &entry = flags[flagHead];
+                if (entry.writesMac)
+                    mac = entry.mac;
+                if (entry.writesStatus)
+                {
+                    const uint32_t current = entry.status & 0xFu;
+                    status = (status & 0xFF0u) | current | ((current | entry.extraSticky) << 6);
+                }
+                if (entry.writesSticky)
+                    status = (status & 0x03Fu) | (entry.status & 0xFC0u);
+                if (entry.writesClip)
+                    clip = entry.clip;
+                flagHead = (flagHead + 1u) & 15u;
+                flagCount = 0u;
+                nextCommit = fdivPending ? fdivReady : kNever;
+                return;
+            }
+            commitDue(t);
         }
 
         // Lands a due FDIV result (Q and its status bits) ahead of queued flag writes.
@@ -922,11 +944,47 @@ namespace ps2x::vu1c
             }
         }
 
+        // Payload qwords of the current GIF tag that can be copied in one run, at most
+        // `limit`: not the tag itself (xgCopyQword parses it) nor the tag's last qword
+        // (xgCopyQword ends the tag or the packet there).
+        uint32_t xgRunLength(uint64_t limit) const
+        {
+            if (xgTagEnd == 0u)
+                return 0u;
+            const uint32_t left = (xgTagEnd - xgCopied) / 16u;
+            if (left <= 1u)
+                return 0u;
+            return static_cast<uint32_t>(std::min<uint64_t>(left - 1u, limit));
+        }
+
+        // Copies `count` payload qwords as xgCopyQword would one by one (the tag was checked
+        // to fit the packet buffer; micro memory wraps on a qword boundary).
+        void xgCopyRun(uint32_t count)
+        {
+            const uint32_t bytes = count * 16u;
+            const uint32_t source = (xgSource + xgCopied) % memSize;
+            const uint32_t first = std::min(bytes, memSize - source);
+            std::memcpy(xgPacket + xgCopied, mem + source, first);
+            if (first < bytes)
+                std::memcpy(xgPacket + xgCopied + first, mem, bytes - first);
+            xgCopied += bytes;
+        }
+
+        PS2X_VU1C_NOINLINE void xgProgressSlow(uint64_t boundary) { xgProgressTo(boundary); }
+
         // Performs every qword copy scheduled at or before cycle `boundary`.
         void xgProgressTo(uint64_t boundary)
         {
-            while (xgActive && xgIssue + 1u + 2u * static_cast<uint64_t>(xgCopied / 16u) <= boundary)
-                xgCopyQword();
+            while (xgActive)
+            {
+                const uint64_t next = xgIssue + 1u + 2u * static_cast<uint64_t>(xgCopied / 16u);
+                if (next > boundary)
+                    return;
+                if (const uint32_t run = xgRunLength((boundary - next) / 2u + 1u))
+                    xgCopyRun(run);
+                else
+                    xgCopyQword();
+            }
         }
 
         // Finishes the transfer and returns the cycle at which it became idle.
@@ -935,7 +993,14 @@ namespace ps2x::vu1c
             uint64_t idle = 0;
             while (xgActive)
             {
-                idle = xgIssue + 1u + 2u * static_cast<uint64_t>(xgCopied / 16u);
+                const uint64_t index = xgCopied / 16u;
+                if (const uint32_t run = xgRunLength(~0ull))
+                {
+                    xgCopyRun(run);
+                    idle = xgIssue + 1u + 2u * (index + run - 1u);
+                    continue;
+                }
+                idle = xgIssue + 1u + 2u * index;
                 xgCopyQword();
             }
             return idle;
@@ -953,10 +1018,10 @@ namespace ps2x::vu1c
         }
 
         // Stores land at cycle t + 1, after the PATH1 copies of cycles <= t.
-        void store(uint64_t t, uint32_t address, const uint32_t words[4], uint8_t dest)
+        PS2X_VU1C_INLINE void store(uint64_t t, uint32_t address, const uint32_t words[4], uint8_t dest)
         {
             if (xgActive)
-                xgProgressTo(t);
+                xgProgressSlow(t);
             uint32_t current[4];
             std::memcpy(current, mem + address, sizeof(current));
             for (uint32_t component = 0; component < 4u; ++component)
@@ -968,14 +1033,14 @@ namespace ps2x::vu1c
             noteReady(t + 1u);
         }
 
-        void storeVf(uint64_t t, uint32_t address, uint32_t reg, uint8_t dest)
+        PS2X_VU1C_INLINE void storeVf(uint64_t t, uint32_t address, uint32_t reg, uint8_t dest)
         {
             uint32_t words[4];
             std::memcpy(words, vf[reg], sizeof(words));
             store(t, address, words, dest);
         }
 
-        void storeVi(uint64_t t, uint32_t address, int32_t value, uint8_t dest)
+        PS2X_VU1C_INLINE void storeVi(uint64_t t, uint32_t address, int32_t value, uint8_t dest)
         {
             const uint32_t word = static_cast<uint32_t>(static_cast<uint16_t>(value & 0xFFFF));
             const uint32_t words[4] = {word, word, word, word};
