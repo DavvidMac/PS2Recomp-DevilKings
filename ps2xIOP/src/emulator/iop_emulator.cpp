@@ -1,6 +1,7 @@
 #include "iop_emulator.h"
 #include "imports/iop_cdvd.h"
 #include "core/iop_cpu.h"
+#include "core/iop_cpu_execute.h"
 #include "imports/iop_heaplib.h"
 #include "imports/iop_imports.h"
 #include "imports/iop_intrman.h"
@@ -385,7 +386,7 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
-        bool step(CpuState &cpu)
+        PS2X_IOP_INLINE bool step(CpuState &cpu)
         {
             if (cpu.stopped)
                 return false;
@@ -419,8 +420,9 @@ namespace ps2x::iop::detail
                 return !cpu.stopped;
             }
 
-            const bool running = cpuCore.executeInstruction(cpu);
-            schedulePendingDma();
+            const bool running = cpuCore.executeInstructionInline(cpu);
+            if (memory.hasDmaStart())
+                schedulePendingDma();
             ++totalInstructions;
             ++totalCycles;
             return running;
@@ -493,7 +495,14 @@ namespace ps2x::iop::detail
                 if (!step(cpu))
                     break;
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
-                    servicePendingDmaInterrupts();
+                {
+                    // Not due yet: only the critical-section bookkeeping that
+                    // servicePendingDmaInterrupts() would do before returning.
+                    if (totalCycles >= nextDmaInterruptCycle)
+                        servicePendingDmaInterrupts();
+                    else
+                        (void)inCriticalSection();
+                }
                 if (!servicingGuestCallbacks && !pendingGuestCallbacks.empty())
                     servicePendingGuestCallbacks();
             }

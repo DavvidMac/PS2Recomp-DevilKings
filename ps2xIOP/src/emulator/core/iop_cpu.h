@@ -31,6 +31,8 @@ namespace ps2x::iop::detail
         explicit IopCpuCore(IopMemory &memory) noexcept;
 
         [[nodiscard]] bool executeInstruction(IopCpuState &cpu);
+        // Same, inlined into the caller (defined in iop_cpu_execute.h).
+        [[nodiscard]] bool executeInstructionInline(IopCpuState &cpu);
         void raiseException(IopCpuState &cpu, uint32_t code, uint32_t faultPc, bool delaySlot, std::optional<uint32_t> badAddress = std::nullopt) const;
 
     private:
