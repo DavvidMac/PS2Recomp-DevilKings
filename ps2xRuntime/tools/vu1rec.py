@@ -574,7 +574,7 @@ class Emitter:
         def branch_vi(reg):
             if reg == 0:
                 return '0'
-            return f'(x.viBackupValid && x.viBackupReg == {reg} ? x.viBackupValue : x.vi[{reg}])'
+            return f'(vbValid && vbReg == {reg} ? vbValue : x.vi[{reg}])'
 
         if op_hi == 0x00:  # LQ
             compute.append(f'float lm[4]; x.load(x.address(x.vi[{vi_s}], {imm}), lm);')
@@ -719,12 +719,12 @@ class Emitter:
     # ---------------------------------------------------------------- one pair
 
     def pair_code(self, p, in_delay_slot):
-        """C++ for one instruction pair, ending with x.cycle = t + 1."""
+        """C++ for one instruction pair, ending with cyc = t + 1."""
         out = []
         up_compute, up_write = self.upper_op(p, out)
         lo_compute, lo_write, branch = self.lower_op(p)
 
-        out.append('t = x.cycle;')
+        out.append('t = cyc;')
         for reg, lanes in p.up.vf_read + p.lo.vf_read:
             if reg:
                 out.append(f't = x.vfStall(t, {reg}, {lanes}u);')
@@ -740,7 +740,7 @@ class Emitter:
         if p.lo.pipeline == 'xgkick':
             out.append('if (x.xgActive) t = std::max(t, x.xgFinish());')
         if not in_delay_slot:
-            out.append(f'if (t >= x.budgetEnd) {{ x.handoff(0x{p.pc:04x}u); return; }}')
+            out.append(f'if (t >= budget) {{ x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue; x.handoff(0x{p.pc:04x}u); return; }}')
 
         reads_q = False
         if not p.i_bit or True:
@@ -789,10 +789,10 @@ class Emitter:
         if written_vi and p.lo.delays_branch:
             # The old value is the one before this pair's write; recompute from the write list.
             out.insert(self.find_first_write(out), f'const int32_t loldvi = x.vi[{written_vi}];')
-            out.append(f'x.viBackupValid = true; x.viBackupReg = {written_vi}; x.viBackupValue = loldvi;')
+            out.append(f'vbValid = true; vbReg = {written_vi}; vbValue = loldvi;')
         else:
-            out.append('x.viBackupValid = false;')
-        out.append('x.cycle = t + 1u;')
+            out.append('vbValid = false;')
+        out.append('cyc = t + 1u;')
         return out, branch
 
     @staticmethod
@@ -825,6 +825,13 @@ class Emitter:
         L('void run(Exec &x, uint32_t entryPc)')
         L('{')
         L('    uint64_t t = 0;')
+        # Hot scalar state lives in locals the compiler can keep in registers (VU memory
+        # stores could alias the Exec fields); it is written back before every exit.
+        L('    uint64_t cyc = x.cycle;')
+        L('    const uint64_t budget = x.budgetEnd;')
+        L('    bool vbValid = x.viBackupValid;')
+        L('    uint8_t vbReg = x.viBackupReg;')
+        L('    int32_t vbValue = x.viBackupValue;')
         L('    switch (entryPc)')
         L('    {')
         for pc in self.pairs:
@@ -843,7 +850,8 @@ class Emitter:
                 L(f'        // E-bit delay slot 0x{pc + 8:04x}')
                 for text in slot_code:
                     L('        ' + text)
-                L(f'        x.end(x.cycle - 1u, 0x{(pc + 16) & 0x3FFF:04x}u);')
+                L('        x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue;')
+                L(f'        x.end(cyc - 1u, 0x{(pc + 16) & 0x3FFF:04x}u);')
                 L('        return;')
             elif branch:
                 kind, target = branch
@@ -868,13 +876,14 @@ class Emitter:
                     L('        {')
                     for other in self.pairs:
                         L(f'        case 0x{other:04x}: goto P{other:04x};')
-                    L('        default: x.handoff(jumpTarget); return;')
+                    L('        default: x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue; x.handoff(jumpTarget); return;')
                     L('        }')
             else:
                 nxt = (pc + 8) & 0x3FFF
                 if nxt in self.pairs:
                     L(f'        goto P{nxt:04x};')
                 else:
+                    L('        x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue;')
                     L(f'        x.handoff(0x{nxt:04x}u);')
                     L('        return;')
             L('    }')
