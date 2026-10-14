@@ -23,6 +23,13 @@
 #include <string>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace
 {
     enum class RecordKind : uint8_t
@@ -38,6 +45,22 @@ namespace
         ConsumeLocalToHost = 9,
         Reset = 10,
     };
+
+    // CPU time of the whole process in milliseconds (0 where unsupported). Unlike wall
+    // time it hardly moves when other programs compete for the cores.
+    double processCpuMs()
+    {
+#if defined(_WIN32)
+        FILETIME creation, exit, kernel, user;
+        if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user))
+            return 0.0;
+        const auto toTicks = [](const FILETIME &time)
+        { return (static_cast<uint64_t>(time.dwHighDateTime) << 32) | time.dwLowDateTime; };
+        return static_cast<double>(toTicks(kernel) + toTicks(user)) / 10000.0;
+#else
+        return 0.0;
+#endif
+    }
 
     uint64_t fnv1a(const uint8_t *data, size_t size)
     {
@@ -138,11 +161,15 @@ int main(int argc, char **argv)
     }
     const size_t firstRecord = header.pos;
 
+    // One backend for every run, so its worker and band threads persist (and show
+    // up as single threads in a PS2X_PROFILE report); Reset clears its caches.
+    std::vector<uint8_t> vram = initialVram;
+    auto backend = std::make_unique<GSCpuBackend>();
+    backend->Initialize(vram.data(), vramSize);
     for (int run = 0; run < repeat; ++run)
     {
-        std::vector<uint8_t> vram = initialVram;
-        auto backend = std::make_unique<GSCpuBackend>();
-        backend->Initialize(vram.data(), vramSize);
+        backend->Reset();
+        std::memcpy(vram.data(), initialVram.data(), vramSize);
         backend->RestoreClutForReplay(clut, clutCbp);
 
         Reader reader{bytes, firstRecord};
@@ -151,6 +178,7 @@ int main(int argc, char **argv)
         std::vector<uint8_t> scratch;
         std::vector<uint8_t> snapshot;
         const auto start = std::chrono::steady_clock::now();
+        const double cpuStart = processCpuMs();
         bool ok = true;
         while (ok && reader.pos < bytes.size())
         {
@@ -253,8 +281,9 @@ int main(int argc, char **argv)
         backend->SnapshotVram(snapshot);
         const double ms =
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-        std::printf("run %d: %llu draws, %u presents, %.1f ms (%.2f ms/present), final vram %016llx%s\n", run + 1,
-                    static_cast<unsigned long long>(draws), presents, ms, presents ? ms / presents : 0.0,
+        const double cpuMs = processCpuMs() - cpuStart;
+        std::printf("run %d: %llu draws, %u presents, %.1f ms (%.2f ms/present), cpu %.0f ms, final vram %016llx%s\n",
+                    run + 1, static_cast<unsigned long long>(draws), presents, ms, presents ? ms / presents : 0.0, cpuMs,
                     static_cast<unsigned long long>(fnv1a(snapshot.data(), snapshot.size())),
                     ok ? "" : " (stopped at a bad record)");
         if (!ok)

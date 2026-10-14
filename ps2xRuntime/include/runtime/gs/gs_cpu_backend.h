@@ -63,7 +63,13 @@ private:
     void DrawTriangle(const GSPrimitiveBatch &batch);
     void DrawLine(const GSPrimitiveBatch &batch);
     void WritePixel(const GSDrawState &state, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a, uint8_t fog);
-    uint32_t SampleTexture(const GSDrawState &state, float s, float t, float q, uint16_t u, uint16_t v);
+    struct PixelWriter;
+    void SetupPixelWriter(const GSDrawState &state, PixelWriter &writer);
+    void WritePixel(const PixelWriter &writer, int x, int y, int z, uint8_t r, uint8_t g, uint8_t b, uint8_t a,
+                    uint8_t fog);
+    struct TextureSampler;
+    uint32_t SampleTexture(const GSDrawState &state, const TextureSampler &sampler, float s, float t, float q,
+                           uint16_t u, uint16_t v);
     uint32_t LookupCLUT(const GSDrawState &state, const std::array<uint16_t, 512> &clut,
                         uint8_t index, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t sourcePsm);
 
@@ -132,10 +138,75 @@ private:
         uint32_t pendingRefs = 0;
         std::vector<uint32_t> texels;
         std::vector<uint8_t> tileReady;
+        // Tiles marked ready since the last reset (updated atomically by band threads).
+        uint32_t readyTiles = 0;
         // Palette the tiles decode with, copied when the entry is created.
         std::array<uint16_t, 512> clut{};
     };
-    std::array<DecodedTexture, 32> m_decodedTextures{};
+    // A Devil Kings battle frame samples about 60 textures; with 32 entries every
+    // frame evicted and decoded dozens of them again.
+    std::array<DecodedTexture, 128> m_decodedTextures{};
+    // Entry the previous draw prepared; consecutive draws mostly share one.
+    DecodedTexture *m_lastPreparedTexture = nullptr;
+    // Texture state one primitive samples with, gathered once per primitive.
+    struct TextureSampler
+    {
+        // Entry sampled by the primitive (s_activeTexture), or nullptr.
+        DecodedTexture *texture = nullptr;
+        // texture->texels when every tile was already decoded at setup.
+        const uint32_t *texels = nullptr;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        int texW = 1;
+        int texH = 1;
+        uint8_t wrapU = 0;
+        uint8_t wrapV = 0;
+        uint16_t minU = 0;
+        uint16_t maxU = 0;
+        uint16_t minV = 0;
+        uint16_t maxV = 0;
+    };
+    static void SetupSampler(const GSDrawState &state, TextureSampler &sampler);
+    // Everything WritePixel needs that only changes between primitives.
+    struct PixelWriter
+    {
+        uint8_t *vram = nullptr;
+        uint8_t *depthMemory = nullptr;
+        ReadVramFunc readFrame = nullptr;
+        WriteVramFunc writeFrame = nullptr;
+        ReadVramFunc readDepth = nullptr;
+        WriteVramFunc writeDepth = nullptr;
+        uint64_t test = 0;
+        int scissorX0 = 0;
+        int scissorX1 = 0;
+        int scissorY0 = 0;
+        int scissorY1 = 0;
+        uint32_t fbp = 0;
+        uint32_t fbw = 1;
+        uint32_t fpsm = 0;
+        uint32_t zbp = 0;
+        uint32_t zpsm = 0;
+        uint32_t fbmsk = 0;
+        uint32_t ztestMethod = 1;
+        bool depthWrites = false;
+        bool fog = false;
+        bool blend = false;
+        bool pabe = false;
+        bool forceAlphaMsb = false;
+        bool frame16 = false;
+        bool frame24 = false;
+        bool dateNeedsRead = false;
+        bool markFrameWrites = false;
+        bool markDepthWrites = false;
+        uint8_t asel = 0;
+        uint8_t bsel = 0;
+        uint8_t csel = 0;
+        uint8_t dsel = 0;
+        uint8_t fix = 0;
+        uint8_t fogR = 0;
+        uint8_t fogG = 0;
+        uint8_t fogB = 0;
+    };
     std::array<uint64_t, 512> m_pageWriteEpoch{};
     uint64_t m_writeEpoch = 1;
     uint64_t m_clutVersion = 0;
