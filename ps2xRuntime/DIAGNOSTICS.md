@@ -8,7 +8,7 @@ These debugging switches are read once at startup from the environment (some are
 |---|---|---|
 | `PS2X_WATCH` | `<addr>[:<bytes>[:<vsync>]]` | Reports writes overlapping the watched EE RAM range from the selected VSync. Address uses C-style base detection; omitted byte length defaults to 4 and omitted VSync to 0. Prints `[watch]` with registers and a stack scan; capped at 4,000 reports. |
 | `PS2X_RDRAM_DUMP` | `<vsync>:<path>` | Writes 32 MiB of EE RAM to the file at that VSync; prints `[rdram-dump]`. |
-| `PS2X_PROFILE` | `<delaySeconds>:<seconds>:<path>` | Windows only. A sampling profiler starts `<delaySeconds>` after start-up, records the instruction pointer of every thread about once per millisecond for `<seconds>`, then writes the 40 busiest functions of each thread to `<path>`; prints `[profile]`. |
+| `PS2X_PROFILE` | `<delaySeconds>:<seconds>:<path>` | Windows only. A sampling profiler starts `<delaySeconds>` after start-up, records the instruction pointer of every thread about once per millisecond for `<seconds>`, then writes the 40 busiest functions of each thread, and the busiest source lines of its top four functions, to `<path>`; prints `[profile]`. |
 | `PS2X_PEEK` | `<hex-addr>[:<words>][,...]` | At each thread dump, prints memory words for each address. Word count defaults to 1 and is capped at 64 per address. |
 | `PS2X_THREAD_DUMP` | `<vsync-interval>` | Prints guest thread state every N VSyncs as `[thread-dump]`; 0 or omitted disables it. |
 | `PS2X_WAKE_TRACE` | `<tid>` | Logs wakeups directed at the thread ID as `[wake]`; omitted disables tracing. |
@@ -39,7 +39,7 @@ These debugging switches are read once at startup from the environment (some are
 | `PS2X_FRAME_DUMP_FROM` | `<vsync>` | Sets first eligible frame dump VSync; default 0. |
 | `PS2X_DEINTERLACE` | `0` or other | Disables deinterlacing only when the first character is `0`; otherwise enabled by default. |
 | `PS2X_GS_ASYNC` | `1` or other | Enables asynchronous GS execution only when the first character is `1`; default off. |
-| `PS2X_GS_THREADS` | `<count>` | Sets GS worker band count, clamped to 1-16; default is half the hardware concurrency, at least 1. |
+| `PS2X_GS_THREADS` | `<count>` | Sets the number of GS band threads, clamped to 1-16; default is three quarters of the hardware concurrency, at least 1. With 1, the worker draws everything itself. |
 | `PS2X_SEPARATE_ZBUFFER` | `1` or other | Enables a separate depth plane only when the first character is `1`; default off. |
 | `PS2X_GS_STATS` | Any value | About once a second prints `[gs-stats]`: queued draws, worker batches, rasterised lists (`flushes`, of which `inline` ran on the worker alone) and why each list was cut, texture tiles decoded ahead (`predecode`) or on first use, time waiting on the decode lock, busy shares of the worker and band threads, and how long the EE waited for a full queue, a pending presentation or a drain. |
 | `PS2X_GS_RECORD` | `<path>[:<vsync>[:<count>]]` | Records every call the GS frontend makes on the CPU backend, from the first presentation at or after VSync `<vsync>` (default 0) for `<count>` presentations (default 30), after a snapshot of VRAM and the palette; prints `[gs-record]`. `ps2_gs_replay <path> [--hash] [--repeat <n>]` (built with the GS cache tests) replays it, timing the rasteriser and hashing VRAM to compare builds. |
@@ -50,6 +50,7 @@ These debugging switches are read once at startup from the environment (some are
 |---|---|---|
 | `PS2X_IOP_HOST_SYNC` | `0` or other | Disables IOP host synchronization when first character is `0`; enabled by default. |
 | `PS2X_IOP_MODULE_ARGS` | `<path-fragment>:<arg>[,<arg>...][;...]` | Appends arguments to matching IOP module loads; path fragment matching is case-insensitive. |
+| `PS2X_IOP_PC_STATS` | Any value | Samples the IOP program counter every 1024 instructions and about every five seconds prints `[iop-pc]` with the IOP instruction rate and the 16 busiest addresses, each with the module (IRX) and offset holding it. |
 | `PS2X_IOPHEAP_TRACE` | Any value | Logs IOP heap allocation and free operations with `[iopheap]`; enabled by presence. |
 | `PS2X_SIF_TRACE` | `<level>` | Logs SIF transfers as `[sif:dma]`; level 2 also prints the first 64 payload bytes. Default 0. |
 | `PS2X_AUDIO_DUMP` | `<file>` | Writes played audio as 48 kHz stereo signed 16-bit PCM to the file (opened for overwrite). |

@@ -104,11 +104,31 @@ namespace
         return "?";
     }
 
+    // file:line of an instruction (the innermost inlined source line), or "?".
+    std::string describeLine(HANDLE process, DWORD64 address)
+    {
+        IMAGEHLP_LINE64 line{};
+        line.SizeOfStruct = sizeof(line);
+        DWORD displacement = 0;
+        if (!SymGetLineFromAddr64(process, address, &displacement, &line) || !line.FileName)
+            return "?";
+        std::string file(line.FileName);
+        const size_t slash = file.find_last_of("/\\");
+        if (slash != std::string::npos)
+            file.erase(0, slash + 1u);
+        return file + ":" + std::to_string(line.LineNumber);
+    }
+
+    bool isWaitFunction(const std::string &name)
+    {
+        return name.rfind("Zw", 0) == 0 || name.rfind("Nt", 0) == 0 || name.rfind("Rtl", 0) == 0 || name == "?";
+    }
+
     void writeReport(const ProfileRequest &request, std::map<DWORD, SampledThread> &threads, uint64_t rounds,
                      double seconds)
     {
         HANDLE process = GetCurrentProcess();
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         const bool symbols = SymInitialize(process, nullptr, TRUE) != FALSE;
 
         std::unordered_map<DWORD64, std::string> names;
@@ -157,6 +177,33 @@ namespace
                 std::fprintf(out, "  %6.2f%%  %7llu  %s\n",
                              100.0 * static_cast<double>(functions[i].second) / static_cast<double>(thread->samples),
                              static_cast<unsigned long long>(functions[i].second), functions[i].first.c_str());
+            }
+
+            // Source lines of the busiest functions (not counting waits).
+            if (!symbols)
+                continue;
+            size_t described = 0;
+            for (size_t i = 0; i < functions.size() && described < 4u; ++i)
+            {
+                if (isWaitFunction(functions[i].first) ||
+                    functions[i].second * 100u < thread->samples) // under 1%
+                    continue;
+                ++described;
+                std::unordered_map<std::string, uint64_t> byLine;
+                for (const auto &[rip, count] : thread->ripCounts)
+                {
+                    if (nameOf(rip) == functions[i].first)
+                        byLine[describeLine(process, rip)] += count;
+                }
+                std::vector<std::pair<std::string, uint64_t>> lines(byLine.begin(), byLine.end());
+                std::sort(lines.begin(), lines.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
+                std::fprintf(out, "  lines of %s:\n", functions[i].first.c_str());
+                for (size_t j = 0; j < lines.size() && j < 12u; ++j)
+                {
+                    std::fprintf(out, "      %6.2f%%  %s\n",
+                                 100.0 * static_cast<double>(lines[j].second) / static_cast<double>(functions[i].second),
+                                 lines[j].first.c_str());
+                }
             }
         }
         std::fclose(out);

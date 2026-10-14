@@ -17,7 +17,12 @@
 #include "imports/iop_vblank.h"
 #include "iop_emulator_const.h"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <algorithm>
 #include <cctype>
@@ -421,13 +426,70 @@ namespace ps2x::iop::detail
             return running;
         }
 
+        // Diagnostics: PS2X_IOP_PC_STATS samples the IOP program counter every 1024
+        // instructions and, about every five seconds, prints the busiest addresses with
+        // the module holding them and the instruction rate.
+        static bool pcStatsEnabled()
+        {
+            static const bool s_enabled = std::getenv("PS2X_IOP_PC_STATS") != nullptr;
+            return s_enabled;
+        }
+
+        void samplePc(uint32_t pc)
+        {
+            static std::unordered_map<uint32_t, uint64_t> s_samples;
+            static auto s_last = std::chrono::steady_clock::now();
+            static uint64_t s_lastInstructions = 0;
+            ++s_samples[pc];
+            const auto now = std::chrono::steady_clock::now();
+            const double seconds = std::chrono::duration<double>(now - s_last).count();
+            if (seconds < 5.0)
+                return;
+            std::vector<std::pair<uint64_t, uint32_t>> ranked;
+            uint64_t total = 0;
+            for (const auto &[address, count] : s_samples)
+            {
+                ranked.push_back({count, address});
+                total += count;
+            }
+            std::sort(ranked.rbegin(), ranked.rend());
+            std::fprintf(stderr, "[iop-pc] %.1f M instructions/s, %llu samples\n",
+                         static_cast<double>(totalInstructions - s_lastInstructions) / seconds / 1.0e6,
+                         static_cast<unsigned long long>(total));
+            for (size_t i = 0; i < ranked.size() && i < 16u; ++i)
+            {
+                const uint32_t address = ranked[i].second;
+                const char *name = "?";
+                uint32_t offset = address;
+                for (const auto &[id, module] : modules)
+                {
+                    const uint32_t phys = address & 0x1FFFFFFFu;
+                    if (phys >= module.base && phys < module.base + module.size)
+                    {
+                        name = module.name.c_str();
+                        offset = phys - module.base;
+                        break;
+                    }
+                }
+                std::fprintf(stderr, "[iop-pc]   %5.1f%%  %08x  %s+%x\n",
+                             100.0 * static_cast<double>(ranked[i].first) / static_cast<double>(total), address, name,
+                             offset);
+            }
+            s_samples.clear();
+            s_last = now;
+            s_lastInstructions = totalInstructions;
+        }
+
         uint32_t runCpu(CpuState &cpu, uint32_t instructionBudget)
         {
             CpuState *previous = activeCpu;
             activeCpu = &cpu;
             const uint64_t start = totalInstructions;
+            const bool samplePcs = pcStatsEnabled();
             while (!cpu.stopped && !cpu.yielded && totalInstructions - start < instructionBudget)
             {
+                if (samplePcs && (totalInstructions & 1023u) == 0u)
+                    samplePc(cpu.pc);
                 if (!step(cpu))
                     break;
                 if (!servicingDmaInterrupts && !pendingDmaInterrupts.empty())
