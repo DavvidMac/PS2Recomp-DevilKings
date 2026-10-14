@@ -444,6 +444,46 @@ def comps(mask):
     return [c for c in range(4) if mask & lane(c)]
 
 
+class RegCache:
+    """VF registers and ACC held in __m128 locals inside a fast block. Writes go through to
+    Exec as well, so code outside the cache (lower instructions, helpers, exits) always reads
+    current values from memory. `norm` holds, per register, the DEST lanes known to be
+    normalised (written by an FMAC in this block); ACC always is."""
+
+    def __init__(self):
+        self.cached = set()
+        self.declared = set()
+        self.norm = {}
+        self.acc_cached = False
+        self.acc_declared = False
+        self.vec_written = set()
+
+    def get(self, reg, lines):
+        name = f'v{reg}'
+        self.declared.add(reg)
+        if reg not in self.cached:
+            lines.append(f'{name} = _mm_loadu_ps(x.vf[{reg}]);')
+            self.cached.add(reg)
+        return name
+
+    def get_acc(self, lines):
+        self.acc_declared = True
+        if not self.acc_cached:
+            lines.append('aacc = _mm_loadu_ps(x.acc);')
+            self.acc_cached = True
+        return 'aacc'
+
+    def invalidate(self, reg):
+        self.cached.discard(reg)
+        self.norm.pop(reg, None)
+
+    def declarations(self):
+        names = [f'v{reg}' for reg in sorted(self.declared)]
+        if self.acc_declared:
+            names.append('aacc')
+        return [f'__m128 {", ".join(names)};'] if names else []
+
+
 class Emitter:
     def __init__(self, name, pairs, all_pairs):
         self.name = name
@@ -504,8 +544,18 @@ class Emitter:
         registers written earlier in the block come from the locals t<j> + latency, the rest
         from Exec (loaded once per block); every write still stores its ready cycle, so the
         state is exact at every exit."""
-        up_compute, up_write = self.upper_op(p, [])
+        cache = self.cache
+        cache.vec_written = set()
+        up_compute, up_write = self.upper_op(p, [], cache)
         lo_compute, lo_write, branch = self.lower_op(p)
+        # Registers written outside the cache (lower instructions, the other upper ones) are
+        # read from memory again by later pairs.
+        up_reg = p.up.vf_write[0]
+        if up_reg and up_reg not in cache.vec_written:
+            cache.invalidate(up_reg)
+        lo_reg = p.lo.vf_write[0]
+        if lo_reg and p.suppressed != lo_reg:
+            cache.invalidate(lo_reg)
         tk = f't{k}'
         terms = []
 
@@ -592,6 +642,7 @@ class Emitter:
         """Code entered at block head `head` (label F<head>): the block's pairs with their
         stall timing in locals, then the branch, E-bit end or fall-through to the next head."""
         out = [f'F{head:04x}:', '    {', '        uint64_t lrl = 0u;']
+        self.cache = RegCache()
         prod = {}
         liveins = set()
         k = 0
@@ -648,7 +699,7 @@ class Emitter:
                     out.append(f'        default: {self.writeback} x.handoff(jumpTarget); return;')
                     out.append('        }')
                 out.append('    }')
-                return out
+                return self.with_declarations(out)
             out.append('        {')
             add(body, '            ')
             out.append('        }')
@@ -662,7 +713,11 @@ class Emitter:
             out.append(f'        x.handoff(0x{nxt:04x}u);')
             out.append('        return;')
         out.append('    }')
-        return out
+        return self.with_declarations(out)
+
+    def with_declarations(self, out):
+        """Puts the block's vector locals after its opening lines (label, brace, lrl)."""
+        return out[:3] + ['        ' + line for line in self.cache.declarations()] + out[3:]
 
     def lite_fmacs(self):
         """FMAC pairs whose MAC and status writes no flag read can observe (Exec::fmacLite).
@@ -753,7 +808,7 @@ class Emitter:
 
     # ---------------------------------------------------------------- upper
 
-    def upper_op(self, p, lines):
+    def upper_op(self, p, lines, cache=None):
         """Returns (code computing temporaries, code writing results) for the upper word."""
         u = p.upper
         op = u & 0x3F
@@ -793,7 +848,7 @@ class Emitter:
                         write.append(f'x.vf[{ft}][{c}] = ur{c};')
                 return compute, write
             kind, product_sum = self.fmac_kind(special, True)
-            return self.fmac(p.pc, u, kind, product_sum, fs, ft, dest, 'acc', special)
+            return self.fmac(p.pc, u, kind, product_sum, fs, ft, dest, 'acc', special, cache)
         if 0x10 <= op <= 0x17 or op in (0x1D, 0x1F, 0x2B, 0x2F):  # MAX / MINI
             is_max = op in (0x10, 0x11, 0x12, 0x13, 0x1D, 0x2B)
             cmp = '>' if is_max else '<'
@@ -811,7 +866,7 @@ class Emitter:
                     write.append(f'x.vf[{fd}][{c}] = ur{c};')
             return compute, write
         kind, product_sum = self.fmac_kind(op, False)
-        return self.fmac(p.pc, u, kind, product_sum, fs, ft, dest, 'vf', op)
+        return self.fmac(p.pc, u, kind, product_sum, fs, ft, dest, 'vf', op, cache)
 
     def fmac_kind(self, op, special):
         if op not in FMAC_TABLE:
@@ -822,44 +877,97 @@ class Emitter:
             kind = ('opmula', 'v')
         return kind, product_sum
 
-    def fmac(self, pc, u, kind, product_sum, fs, ft, dest, target, op):
+    def fmac(self, pc, u, kind, product_sum, fs, ft, dest, target, op, cache=None):
         (operation, source) = kind
         compute, write = [], []
-        lanes = comps(dest)
         kinds = {'add': 'kFmacAdd', 'sub': 'kFmacSub', 'mul': 'kFmacMul', 'madd': 'kFmacMadd',
                  'msub': 'kFmacMsub', 'op': 'kFmacOpmsub', 'opmula': 'kFmacOpmula'}
-        # Operands are normalised on all four lanes; broadcasts and the cross product's
+        # Operands are normalised on the lanes that count; broadcasts and the cross product's
         # lane order (left y z x w, right z x y w) are applied before the operation.
-        left = f'norm4(_mm_loadu_ps(x.vf[{fs}]))'
+        cross = operation in ('op', 'opmula')
+        lanes_needed = 0xE if cross else dest
+        left = self.vf_operand(fs, lanes_needed, cache, compute)
         if source == 'bc':
-            right = f'_mm_set1_ps(norm(x.vf[{ft}][{op & 3}]))'
+            right = self.bc_operand(ft, op & 3, cache, compute)
         elif source == 'q':
             right = '_mm_set1_ps(norm(x.q))'
         elif source == 'i':
             right = '_mm_set1_ps(norm(x.i))'
         else:
-            right = f'norm4(_mm_loadu_ps(x.vf[{ft}]))'
-        if operation in ('op', 'opmula'):
+            right = self.vf_operand(ft, lanes_needed, cache, compute)
+        if cross:
             compute.append(f'const __m128 uls = {left}; const __m128 urs = {right};')
             left = '_mm_shuffle_ps(uls, uls, _MM_SHUFFLE(3, 0, 2, 1))'
             right = '_mm_shuffle_ps(urs, urs, _MM_SHUFFLE(3, 1, 0, 2))'
-        if pc in self.lite:
-            compute.append(f'float urv[4]; x.fmacLite<{kinds[operation]}, {"true" if product_sum else "false"}>'
-                           f'({dest}u, {left}, {right}, urv, liteSign, liteMinAbs);')
+        if operation in ('madd', 'msub', 'op'):
+            accv = cache.get_acc(compute) if cache else '_mm_loadu_ps(x.acc)'
         else:
-            compute.append(f'float urv[4]; x.fmacVec<{kinds[operation]}, {"true" if product_sum else "false"}>'
-                           f'(t, {dest}u, {left}, {right}, urv);')
-        for c in lanes:
-            compute.append(f'const float ur{c} = urv[{c}];')
+            accv = '_mm_setzero_ps()'
+        ps = 'true' if product_sum else 'false'
+        if pc in self.lite:
+            compute.append(f'const __m128 urv = x.fmacLite<{kinds[operation]}, {ps}>'
+                           f'({dest}u, {left}, {right}, {accv}, liteSign, liteMinAbs);')
+        else:
+            compute.append(f'const __m128 urv = x.fmacVec<{kinds[operation]}, {ps}>'
+                           f'(t, {dest}u, {left}, {right}, {accv});')
         if target == 'acc':
-            for c in lanes:
-                write.append(f'x.acc[{c}] = ur{c};')
+            write.extend(self.vec_write(None, dest, cache))
         else:
             fd = FD(u)
             if fd:
-                for c in lanes:
-                    write.append(f'x.vf[{fd}][{c}] = ur{c};')
+                write.extend(self.vec_write(fd, dest, cache))
         return compute, write
+
+    def vf_operand(self, reg, lanes, cache, lines):
+        """VF[reg] as an FMAC operand whose DEST `lanes` must be normalised."""
+        if cache is None:
+            return f'norm4(_mm_loadu_ps(x.vf[{reg}]))'
+        name = cache.get(reg, lines)
+        if reg == 0 or (cache.norm.get(reg, 0) & lanes) == lanes:
+            return name
+        return f'norm4({name})'
+
+    def bc_operand(self, reg, comp, cache, lines):
+        """Component comp of VF[reg] broadcast to four lanes, normalised."""
+        if cache is None:
+            return f'_mm_set1_ps(norm(x.vf[{reg}][{comp}]))'
+        name = cache.get(reg, lines)
+        splat = f'_mm_shuffle_ps({name}, {name}, _MM_SHUFFLE({comp}, {comp}, {comp}, {comp}))'
+        if reg == 0 or (cache.norm.get(reg, 0) & lane(comp)):
+            return splat
+        return f'norm4({splat})'
+
+    def vec_write(self, reg, dest, cache):
+        """Writes the DEST lanes of urv to VF[reg] (ACC when reg is None)."""
+        mask = sum(1 << c for c in comps(dest))
+        mem = 'x.acc' if reg is None else f'x.vf[{reg}]'
+        if cache is None:
+            if dest == 0xF:
+                return [f'_mm_storeu_ps({mem}, urv);']
+            return [f'_mm_storeu_ps({mem}, _mm_blend_ps(_mm_loadu_ps({mem}), urv, 0x{mask:x}));']
+        lines = []
+        if reg is None:
+            if dest == 0xF:
+                cache.acc_declared = True
+                cache.acc_cached = True
+                name = 'aacc'
+                lines.append('aacc = urv;')
+            else:
+                name = cache.get_acc(lines)
+                lines.append(f'aacc = _mm_blend_ps(aacc, urv, 0x{mask:x});')
+        else:
+            if dest == 0xF:
+                cache.declared.add(reg)
+                cache.cached.add(reg)
+                name = f'v{reg}'
+                lines.append(f'{name} = urv;')
+            else:
+                name = cache.get(reg, lines)
+                lines.append(f'{name} = _mm_blend_ps({name}, urv, 0x{mask:x});')
+            cache.norm[reg] = cache.norm.get(reg, 0) | dest
+            cache.vec_written.add(reg)
+        lines.append(f'_mm_storeu_ps({mem}, {name});')
+        return lines
 
     # ---------------------------------------------------------------- lower
 

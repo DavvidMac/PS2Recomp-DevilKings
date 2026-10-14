@@ -552,18 +552,19 @@ namespace ps2x::vu1c
             }
         }
 
-        // One FMAC instruction on all four lanes (only DEST lanes count): writes the results
-        // to out and queues the flags as fmacFlags does. left and right are the normalised
-        // operands, already broadcast or permuted. A lane whose result (and, for product
-        // sums, product) lies in the normal range reports only its sign in fmacLane and
-        // productSticky, so when every DEST lane does, the flags come from the sign bits;
+        // One FMAC instruction on all four lanes (only DEST lanes count): returns the result
+        // and queues the flags as fmacFlags does. left and right are the normalised operands,
+        // already broadcast or permuted; accv is ACC, which is always normalised (only FMAC
+        // results are written to it), so it needs no norm4. A lane whose result (and, for
+        // product sums, product) lies in the normal range reports only its sign in fmacLane
+        // and productSticky, so when every DEST lane does, the flags come from the sign bits;
         // otherwise the lanes go through fmacLane and productSticky as the scalar code did.
         template <int kKind, bool kProductSum>
-        PS2X_VU1C_INLINE void fmacVec(uint64_t t, uint8_t dest, __m128 left, __m128 right, float out[4])
+        PS2X_VU1C_INLINE __m128 fmacVec(uint64_t t, uint8_t dest, __m128 left, __m128 right, __m128 accv)
         {
             constexpr bool kUsesAcc = kKind == kFmacMadd || kKind == kFmacMsub || kKind == kFmacOpmsub;
-            const __m128 accRaw = _mm_loadu_ps(acc);
-            const __m128 accNorm = kUsesAcc ? norm4(accRaw) : _mm_setzero_ps();
+            const __m128 accRaw = accv;
+            const __m128 accNorm = kUsesAcc ? accv : _mm_setzero_ps();
             const __m128 product = _mm_mul_ps(left, right);
             __m128 result;
             if constexpr (kKind == kFmacAdd)
@@ -578,9 +579,8 @@ namespace ps2x::vu1c
                 result = _mm_sub_ps(accNorm, product);
             if constexpr (kKind == kFmacOpmsub || kKind == kFmacOpmula)
                 result = _mm_blend_ps(result, _mm_setzero_ps(), 0x8); // the cross product has no w
-            _mm_storeu_ps(out, result);
             if (dest == 0u)
-                return;
+                return result;
 
             const uint32_t lanes = destLaneBits(dest);
             const __m128i resultExponent = exponents4(result);
@@ -629,9 +629,12 @@ namespace ps2x::vu1c
                     entry->writesMac = true;
                     entry->writesStatus = true;
                 }
-                return;
+                return result;
             }
+            float out[4];
+            _mm_storeu_ps(out, result);
             fmacVecExact<kKind, kProductSum>(t, dest, left, right, accNorm, out);
+            return _mm_loadu_ps(out);
         }
 
         // fmacVec for an instruction whose MAC and status writes no flag read can observe
@@ -640,12 +643,12 @@ namespace ps2x::vu1c
         // would make sticky: sign bits of the DEST lanes in signAcc, and their magnitudes in
         // minAbsAcc, which a zero lane makes zero. foldLite adds those to status at exits.
         template <int kKind, bool kProductSum>
-        PS2X_VU1C_INLINE void fmacLite(uint8_t dest, __m128 left, __m128 right, float out[4], __m128i &signAcc,
-                                       __m128i &minAbsAcc)
+        PS2X_VU1C_INLINE __m128 fmacLite(uint8_t dest, __m128 left, __m128 right, __m128 accv, __m128i &signAcc,
+                                         __m128i &minAbsAcc)
         {
             constexpr bool kUsesAcc = kKind == kFmacMadd || kKind == kFmacMsub || kKind == kFmacOpmsub;
-            const __m128 accRaw = _mm_loadu_ps(acc);
-            const __m128 accNorm = kUsesAcc ? norm4(accRaw) : _mm_setzero_ps();
+            const __m128 accRaw = accv;
+            const __m128 accNorm = kUsesAcc ? accv : _mm_setzero_ps();
             const __m128 product = _mm_mul_ps(left, right);
             __m128 result;
             if constexpr (kKind == kFmacAdd)
@@ -660,9 +663,8 @@ namespace ps2x::vu1c
                 result = _mm_sub_ps(accNorm, product);
             if constexpr (kKind == kFmacOpmsub || kKind == kFmacOpmula)
                 result = _mm_blend_ps(result, _mm_setzero_ps(), 0x8);
-            _mm_storeu_ps(out, result);
             if (dest == 0u)
-                return;
+                return result;
 
             // The same test as fmacVec: lanes passing it keep the SSE result and only
             // report Z and S (plus the product's S and a zero operand's Z for product sums).
@@ -707,9 +709,12 @@ namespace ps2x::vu1c
                 }
                 signAcc = _mm_or_si128(signAcc, sign);
                 minAbsAcc = _mm_min_epu32(minAbsAcc, magnitude);
-                return;
+                return result;
             }
+            float out[4];
+            _mm_storeu_ps(out, result);
             fmacVecExact<kKind, kProductSum, true>(0u, dest, left, right, accNorm, out);
+            return _mm_loadu_ps(out);
         }
 
         // Adds the status bits gathered by fmacLite to the sticky bits (no FSSET or status
@@ -741,7 +746,8 @@ namespace ps2x::vu1c
             {
                 if ((dest & lane(c)) == 0u)
                     continue;
-                laneFlags[c] = fmacLane(out[c], kProductSum, acc[c], [&]() -> long double
+                // ACC is always normalised, so its raw value is accNorm.
+                laneFlags[c] = fmacLane(out[c], kProductSum, a[c], [&]() -> long double
                 {
                     const long double lv = l[c];
                     const long double rv = r[c];
