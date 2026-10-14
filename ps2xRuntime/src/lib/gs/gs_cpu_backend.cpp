@@ -185,6 +185,8 @@ namespace
         std::atomic<uint64_t> cacheMisses{0};
         std::atomic<uint64_t> cacheMissesClut{0};
         std::atomic<uint64_t> cacheEvictions{0};
+        std::atomic<uint64_t> listActiveNs{0};
+        std::atomic<uint64_t> lists{0};
     };
 
     GsStats &gsStats()
@@ -239,6 +241,8 @@ namespace
         const uint64_t cacheMisses = take(s.cacheMisses);
         const uint64_t cacheMissesClut = take(s.cacheMissesClut);
         const uint64_t cacheEvictions = take(s.cacheEvictions);
+        const double listActiveMs = static_cast<double>(take(s.listActiveNs)) * ms;
+        const uint64_t lists = take(s.lists);
         const double wall = seconds * 1000.0;
         std::fprintf(stderr,
                      "[gs-stats] %.2fs draws=%llu (tri=%llu sprite=%llu) area=%llu batches=%llu items=%llu "
@@ -247,7 +251,8 @@ namespace
                      "predecode=%llu draws/%llu tiles/%.1fms lazyTiles worker=%llu band=%llu decodeWait=%.1fms "
                      "worker busy=%.0f%% raster=%.0f%% bandWait=%.0f%% present=%.0f%% bands busy=%.0f%% of %u "
                      "| EE waits queue=%.0f%% present=%.0f%% drain=%.0f%% (%llu) "
-                     "| texcache hit=%llu reset=%llu miss=%llu (clut %llu) evict=%llu\n",
+                     "| texcache hit=%llu reset=%llu miss=%llu (clut %llu) evict=%llu "
+                     "| lists=%llu in flight %.0f%% (bands busy %.0f%% of that)\n",
                      seconds,
                      static_cast<unsigned long long>(draws), static_cast<unsigned long long>(triangles),
                      static_cast<unsigned long long>(sprites), static_cast<unsigned long long>(area),
@@ -264,12 +269,16 @@ namespace
                      static_cast<unsigned long long>(lazyTilesBand), decodeWaitMs,
                      100.0 * workerBusyMs / wall, 100.0 * workerRasterMs / wall, 100.0 * bandWaitMs / wall,
                      100.0 * presentMs / wall,
-                     bandCount > 1u ? 100.0 * bandBusyMs / (wall * static_cast<double>(bandCount - 1u)) : 0.0,
-                     bandCount > 1u ? bandCount - 1u : 0u,
+                     bandCount > 1u ? 100.0 * bandBusyMs / (wall * static_cast<double>(bandCount)) : 0.0,
+                     bandCount > 1u ? bandCount : 0u,
                      100.0 * queueWaitMs / wall, 100.0 * presentWaitMs / wall, 100.0 * drainWaitMs / wall,
                      static_cast<unsigned long long>(drains), static_cast<unsigned long long>(cacheHits),
                      static_cast<unsigned long long>(cacheEpochResets), static_cast<unsigned long long>(cacheMisses),
-                     static_cast<unsigned long long>(cacheMissesClut), static_cast<unsigned long long>(cacheEvictions));
+                     static_cast<unsigned long long>(cacheMissesClut), static_cast<unsigned long long>(cacheEvictions),
+                     static_cast<unsigned long long>(lists), 100.0 * listActiveMs / wall,
+                     listActiveMs > 0.0 && bandCount > 1u
+                         ? 100.0 * bandBusyMs / (listActiveMs * static_cast<double>(bandCount))
+                         : 0.0);
     }
 
     int wrapTextureCoordinate(int coordinate,
@@ -988,14 +997,17 @@ void GSCpuBackend::WorkerLoop()
                     continue;
                 case QueuedWork::Kind::Transfer:
                     FlushPendingDrawsUnlocked(FlushReason::Transfer);
+                    JoinInflightUnlocked();
                     BeginTransferUnlocked(work.transfer);
                     continue;
                 case QueuedWork::Kind::Upload:
                     FlushPendingDrawsUnlocked(FlushReason::Upload);
+                    JoinInflightUnlocked();
                     UploadImageUnlocked(work.payload.data(), static_cast<uint32_t>(work.payload.size()));
                     continue;
                 case QueuedWork::Kind::Present:
                     FlushPendingDrawsUnlocked(FlushReason::Present);
+                    JoinInflightUnlocked();
                     break;
                 }
                 const GsStatsClock::time_point presentStart =
@@ -1021,6 +1033,8 @@ void GSCpuBackend::WorkerLoop()
                 m_presentCv.notify_all();
             }
             FlushPendingDrawsUnlocked(FlushReason::BatchEnd);
+            // The batch's draws (and the queue's idle state) must outlive the list.
+            JoinInflightUnlocked();
         }
         if (collectStats)
         {
@@ -1204,6 +1218,7 @@ void GSCpuBackend::TextureFlush()
 
 void GSCpuBackend::TextureFlushUnlocked()
 {
+    JoinInflightUnlocked();
     m_texturePageCache.Invalidate();
     // Decoded tiles were read through the texture page buffer, so tiles whose
     // pages were written since the previous flush may hold data the flush now
@@ -1803,7 +1818,6 @@ void GSCpuBackend::WaitForTileUnlocked(const GSDrawState &state, DecodedTexture 
                 (s_onGsWorker ? gsStats().lazyTilesWorker : gsStats().lazyTilesBand)
                     .fetch_add(1u, std::memory_order_relaxed);
             DecodeTileUnlocked(state, entry, tileX, tileY, nullptr);
-            m_parallelDecoded.store(true, std::memory_order_relaxed);
             ready.store(kTileReady, std::memory_order_release);
             std::atomic_ref<uint32_t>(entry.readyTiles).fetch_add(1u, std::memory_order_acq_rel);
             return;
@@ -1990,6 +2004,7 @@ void GSCpuBackend::QueueDrawUnlocked(const GSPrimitiveBatch &batch)
     {
         // The draw samples what it renders: decode every tile now, as drawing
         // inline would on first use, so band threads never decode it late.
+        JoinInflightUnlocked();
         const GsStatsClock::time_point predecodeStart =
             collectStats ? GsStatsClock::now() : GsStatsClock::time_point{};
         std::fill(texture->tileReady.begin(), texture->tileReady.end(), uint8_t{0});
@@ -2039,7 +2054,9 @@ void GSCpuBackend::QueueDrawUnlocked(const GSPrimitiveBatch &batch)
 
 void GSCpuBackend::QueueClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
 {
-    if (tex0.cld >= 1u && tex0.cld <= 5u && m_pendingWritePages.any())
+    if (tex0.cld >= 1u && tex0.cld <= 5u && m_inflight && !m_parallelDecode)
+        JoinInflightUnlocked(); // the band threads read through the page buffer
+    if (tex0.cld >= 1u && tex0.cld <= 5u && (m_pendingWritePages.any() || m_inflight))
     {
         // The palette is read from VRAM a pending draw may still write.
         std::bitset<512> reads;
@@ -2056,16 +2073,18 @@ void GSCpuBackend::QueueClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &
         }
         if ((reads & m_pendingWritePages).any())
             FlushPendingDrawsUnlocked(FlushReason::Clut);
+        if ((reads & m_inflightWritePages).any())
+            JoinInflightUnlocked();
     }
     LoadClutStateUnlocked(tex0, texclut);
 }
 
-void GSCpuBackend::RunPendingBand(uint32_t band, uint32_t bandCount)
+void GSCpuBackend::RunPendingBand(const std::vector<PendingDraw> &draws, uint32_t band, uint32_t bandCount)
 {
     s_bandIndex = band;
     s_bandCount = bandCount;
     s_inBand = true;
-    for (const PendingDraw &draw : m_pendingDraws)
+    for (const PendingDraw &draw : draws)
     {
         s_activeTexture = draw.texture;
         RasterPrimitive(*draw.batch);
@@ -2091,13 +2110,17 @@ void GSCpuBackend::BandLoop(uint32_t band)
         }
         const bool collectStats = gsStatsEnabled();
         const GsStatsClock::time_point busyStart = collectStats ? GsStatsClock::now() : GsStatsClock::time_point{};
-        RunPendingBand(band, bandCount);
+        RunPendingBand(m_inflightDraws, band, bandCount);
         if (collectStats)
             gsStats().bandBusyNs.fetch_add(gsStatsNanoseconds(busyStart), std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> bandLock(m_bandMutex);
             if (--m_bandsRunning == 0u)
+            {
+                if (collectStats)
+                    m_inflightFinished = GsStatsClock::now();
                 m_bandDoneCv.notify_one();
+            }
         }
     }
 }
@@ -2106,6 +2129,8 @@ void GSCpuBackend::FlushPendingDrawsUnlocked(FlushReason reason)
 {
     if (m_pendingDraws.empty())
         return;
+    // Lists are rasterised one after another.
+    JoinInflightUnlocked();
     (void)DepthMemoryUnlocked();
     const bool collectStats = gsStatsEnabled();
     if (collectStats)
@@ -2122,20 +2147,26 @@ void GSCpuBackend::FlushPendingDrawsUnlocked(FlushReason reason)
         if (const char *value = std::getenv("PS2X_GS_THREADS"))
             count = static_cast<uint32_t>(std::max(1, std::atoi(value)));
         m_bandCount = std::min(count, 16u);
-        for (uint32_t band = 1u; band < m_bandCount; ++band)
-            m_bandThreads.emplace_back([this, band]() { BandLoop(band); });
+        if (m_bandCount > 1u)
+        {
+            for (uint32_t band = 0u; band < m_bandCount; ++band)
+                m_bandThreads.emplace_back([this, band]() { BandLoop(band); });
+        }
     }
 
     // Small lists are not worth waking the band threads for.
-    const GsStatsClock::time_point rasterStart = collectStats ? GsStatsClock::now() : GsStatsClock::time_point{};
     if (m_bandCount <= 1u || m_pendingArea < 16384u)
     {
-        RunPendingBand(0u, 1u);
+        const GsStatsClock::time_point rasterStart = collectStats ? GsStatsClock::now() : GsStatsClock::time_point{};
+        RunPendingBand(m_pendingDraws, 0u, 1u);
         if (collectStats)
         {
             gsStats().inlineFlushes.fetch_add(1u, std::memory_order_relaxed);
             gsStats().workerRasterNs.fetch_add(gsStatsNanoseconds(rasterStart), std::memory_order_relaxed);
         }
+        for (const PendingDraw &draw : m_pendingDraws)
+            if (draw.texture)
+                --draw.texture->pendingRefs;
     }
     else
     {
@@ -2147,40 +2178,65 @@ void GSCpuBackend::FlushPendingDrawsUnlocked(FlushReason reason)
         m_parallelDecode = bufferedPage == UINT32_MAX ||
                            std::memcmp(m_texturePageCache.Bytes(), m_vram + bufferedPage,
                                        GSMem::TexturePageCache::kPageSize) == 0;
-        m_parallelDecoded.store(false, std::memory_order_relaxed);
+        // Decoding one tile at a time would leave the buffer holding one of the pages
+        // the list reads; the worker reads on from VRAM instead.
+        if (m_parallelDecode)
+            m_texturePageCache.Invalidate();
+        m_inflightDraws.swap(m_pendingDraws);
+        for (const PendingDraw &draw : m_inflightDraws)
+        {
+            if (draw.texture)
+            {
+                --draw.texture->pendingRefs;
+                ++draw.texture->inflightRefs;
+            }
+        }
+        m_inflightWritePages = m_pendingWritePages;
+        m_inflight = true;
+        if (collectStats)
+            m_inflightSubmitted = GsStatsClock::now();
+        if (collectStats)
+            gsStats().parallelDraws.fetch_add(m_inflightDraws.size(), std::memory_order_relaxed);
         {
             std::lock_guard<std::mutex> bandLock(m_bandMutex);
-            m_bandsRunning = m_bandCount - 1u;
+            m_bandsRunning = m_bandCount;
             ++m_bandGeneration;
         }
         m_bandCv.notify_all();
-        RunPendingBand(0u, m_bandCount);
-        const GsStatsClock::time_point waitStart = collectStats ? GsStatsClock::now() : GsStatsClock::time_point{};
-        if (collectStats)
-        {
-            gsStats().parallelDraws.fetch_add(m_pendingDraws.size(), std::memory_order_relaxed);
-            gsStats().workerRasterNs.fetch_add(
-                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waitStart - rasterStart).count()),
-                std::memory_order_relaxed);
-        }
-        std::unique_lock<std::mutex> bandLock(m_bandMutex);
-        m_bandDoneCv.wait(bandLock, [this]() { return m_bandsRunning == 0u; });
-        if (collectStats)
-            gsStats().bandWaitNs.fetch_add(gsStatsNanoseconds(waitStart), std::memory_order_relaxed);
-        m_parallelDecode = false;
-        // Decoding one tile at a time would leave the buffer holding one of the pages
-        // just read, which one depending on thread timing; start over from VRAM.
-        if (m_parallelDecoded.load(std::memory_order_relaxed))
-            m_texturePageCache.Invalidate();
     }
 
-    for (const PendingDraw &draw : m_pendingDraws)
-        if (draw.texture)
-            draw.texture->pendingRefs = 0u;
     m_pendingDraws.clear();
     m_pendingWritePages.reset();
     m_pendingReadPages.reset();
     m_pendingArea = 0u;
+}
+
+void GSCpuBackend::JoinInflightUnlocked()
+{
+    if (!m_inflight)
+        return;
+    const bool collectStats = gsStatsEnabled();
+    const GsStatsClock::time_point waitStart = collectStats ? GsStatsClock::now() : GsStatsClock::time_point{};
+    {
+        std::unique_lock<std::mutex> bandLock(m_bandMutex);
+        m_bandDoneCv.wait(bandLock, [this]() { return m_bandsRunning == 0u; });
+    }
+    if (collectStats)
+    {
+        gsStats().bandWaitNs.fetch_add(gsStatsNanoseconds(waitStart), std::memory_order_relaxed);
+        gsStats().lists.fetch_add(1u, std::memory_order_relaxed);
+        gsStats().listActiveNs.fetch_add(
+            static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(m_inflightFinished - m_inflightSubmitted).count()),
+            std::memory_order_relaxed);
+    }
+    m_inflight = false;
+    m_parallelDecode = false;
+    for (const PendingDraw &draw : m_inflightDraws)
+        if (draw.texture)
+            --draw.texture->inflightRefs;
+    m_inflightDraws.clear();
+    m_inflightWritePages.reset();
 }
 
 void GSCpuBackend::MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
@@ -2194,6 +2250,7 @@ void GSCpuBackend::InvalidateDecodedTexturesUnlocked()
     {
         entry.valid = false;
         entry.pendingRefs = 0u;
+        entry.inflightRefs = 0u;
     }
     s_activeTexture = nullptr;
     ++m_clutVersion;
@@ -2242,7 +2299,7 @@ GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTextureCacheUnlocked(const GS
                 }
                 clutOnlyMismatch = true;
             }
-            if (candidate.pendingRefs != 0u)
+            if (candidate.pendingRefs != 0u || candidate.inflightRefs != 0u)
                 continue;
             if (!victim || (!candidate.valid && victim->valid) ||
                 (candidate.valid == victim->valid && candidate.lastUse < victim->lastUse))
@@ -2253,6 +2310,7 @@ GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTextureCacheUnlocked(const GS
     {
         // Every entry is pinned by a pending draw.
         FlushPendingDrawsUnlocked(FlushReason::Pinned);
+        JoinInflightUnlocked();
         return PrepareTextureCacheUnlocked(state, cacheSmall);
     }
 
@@ -2264,6 +2322,8 @@ GSCpuBackend::DecodedTexture *GSCpuBackend::PrepareTextureCacheUnlocked(const GS
         {
             if (m_pageWriteEpoch[(entry->firstPage + i) & 511u] >= entry->epoch)
             {
+                if (entry->inflightRefs != 0u)
+                    JoinInflightUnlocked();
                 std::fill(entry->tileReady.begin(), entry->tileReady.end(), uint8_t{0});
                 entry->readyTiles = 0u;
                 entry->epoch = ++m_writeEpoch;
@@ -2371,6 +2431,16 @@ uint32_t GSCpuBackend::SampleTexture(const GSDrawState &state, const TextureSamp
         }
         if (!active)
             return DecodeTexelUnlocked(state, m_clut, sampleU, sampleV);
+        if (s_inBand && m_parallelDecode)
+        {
+            const auto &tex = state.context.tex0;
+            uint32_t raw = 0u;
+            uint32_t texel = 0u;
+            GSMem::ReadTextureRect(nullptr, m_vram, tex.psm, tex.tbp0, tex.tbw, static_cast<uint32_t>(sampleU),
+                                   static_cast<uint32_t>(sampleV), 1u, 1u, &raw, 1u);
+            ConvertTexelsUnlocked(state, active->clut, &raw, &texel, 1u);
+            return texel;
+        }
         std::lock_guard<std::mutex> decodeLock(m_decodeMutex);
         return DecodeTexelUnlocked(state, active->clut, sampleU, sampleV);
     };

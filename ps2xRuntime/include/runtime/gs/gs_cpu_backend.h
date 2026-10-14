@@ -6,6 +6,7 @@
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <mutex>
@@ -136,6 +137,8 @@ private:
         // Draws queued for the band threads that sample this entry; a pinned
         // entry is never evicted.
         uint32_t pendingRefs = 0;
+        // Draws of the list the band threads are rasterising that sample this entry.
+        uint32_t inflightRefs = 0;
         std::vector<uint32_t> texels;
         std::vector<uint8_t> tileReady;
         // Tiles marked ready since the last reset (updated atomically by band threads).
@@ -245,9 +248,19 @@ private:
     void QueueDrawUnlocked(const GSPrimitiveBatch &batch);
     void QueueClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
     void FlushPendingDrawsUnlocked(FlushReason reason);
-    void RunPendingBand(uint32_t band, uint32_t bandCount);
+    // Waits for the list the band threads are rasterising (if any) and releases it.
+    void JoinInflightUnlocked();
+    void RunPendingBand(const std::vector<PendingDraw> &draws, uint32_t band, uint32_t bandCount);
     void BandLoop(uint32_t band);
     std::vector<PendingDraw> m_pendingDraws;
+    // Handed to the band threads by FlushPendingDrawsUnlocked; the worker queues the
+    // next list meanwhile and joins before anything that needs VRAM up to date.
+    std::vector<PendingDraw> m_inflightDraws;
+    std::bitset<512> m_inflightWritePages;
+    bool m_inflight = false;
+    // PS2X_GS_STATS: when the in-flight list was handed over, and when its last band finished.
+    std::chrono::steady_clock::time_point m_inflightSubmitted{};
+    std::chrono::steady_clock::time_point m_inflightFinished{};
     std::bitset<512> m_pendingWritePages;
     std::bitset<512> m_pendingReadPages;
     uint64_t m_pendingArea = 0;
@@ -322,7 +335,6 @@ private:
     // Set while band threads rasterise a list in which texture tiles may be decoded
     // in parallel, straight from VRAM (see FlushPendingDrawsUnlocked).
     bool m_parallelDecode = false;
-    std::atomic<bool> m_parallelDecoded{false};
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};
