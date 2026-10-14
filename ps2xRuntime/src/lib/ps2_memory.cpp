@@ -317,6 +317,8 @@ PS2Memory::PS2Memory()
     ps2SetScratchpadHostPtr(nullptr);
     const char *vif1Thread = std::getenv("PS2X_VIF1_THREAD");
     m_vif1Async = vif1Thread && vif1Thread[0] == '1';
+    const char *unpackGeneric = std::getenv("PS2X_VIF_UNPACK_GENERIC");
+    m_unpackGenericOnly = unpackGeneric && unpackGeneric[0] == '1';
 }
 
 PS2Memory::~PS2Memory()

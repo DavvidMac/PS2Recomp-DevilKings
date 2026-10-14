@@ -1523,6 +1523,64 @@ void register_ps2_memory_tests()
             t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "VIF1 QWC should be cleared after drain");
         });
 
+        tc.Run("VIF1 direct UNPACK path matches the generic loop", [](TestCase &t)
+        {
+            PS2Memory direct;
+            setTestEnv("PS2X_VIF_UNPACK_GENERIC", "1");
+            PS2Memory generic;
+            setTestEnv("PS2X_VIF_UNPACK_GENERIC", nullptr);
+            t.IsTrue(direct.initialize() && generic.initialize(), "PS2Memory initialize should succeed");
+
+            uint32_t seed = 0x12345678u;
+            auto next = [&seed]()
+            {
+                seed = seed * 1664525u + 1013904223u;
+                return seed >> 8;
+            };
+            uint32_t mismatches = 0u;
+            for (uint32_t round = 0; round < 400u; ++round)
+            {
+                // Same starting VU1 memory on both sides.
+                for (uint32_t offset = 0; offset < PS2_VU1_DATA_SIZE; offset += 4u)
+                {
+                    const uint32_t word = next();
+                    std::memcpy(direct.getVU1Data() + offset, &word, 4u);
+                    std::memcpy(generic.getVU1Data() + offset, &word, 4u);
+                }
+                const uint32_t vn = next() % 4u;
+                uint32_t vl = next() % 4u;
+                if (vl == 3u && vn != 3u)
+                    vl = next() % 3u;
+                const uint32_t wl = 1u + next() % 4u;
+                const uint32_t cl = wl + next() % 3u; // CL >= WL
+                const uint32_t num = 1u + next() % 64u;
+                const uint32_t addr = next() % 1024u;
+                const bool unsignedBit = (next() & 1u) != 0u;
+                const uint32_t opcode = 0x60u | (vn << 2) | vl;
+
+                std::vector<uint8_t> packet;
+                auto appendWord = [&](uint32_t word)
+                {
+                    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&word);
+                    packet.insert(packet.end(), bytes, bytes + 4);
+                };
+                appendWord(makeVifCmd(0x05u, 0u, 0u));                          // STMOD 0
+                appendWord(makeVifCmd(0x01u, 0u, static_cast<uint16_t>((wl << 8) | cl))); // STCYCL
+                appendWord(makeVifCmd(static_cast<uint8_t>(opcode), static_cast<uint8_t>(num & 0xFFu),
+                                      static_cast<uint16_t>(addr | (unsignedBit ? 0x4000u : 0u))));
+                const uint32_t bitsPerVector = (vl == 3u) ? 16u : (vn + 1u) * (32u >> vl);
+                const uint32_t bytes = ((num * bitsPerVector / 8u) + 3u) & ~3u;
+                for (uint32_t index = 0; index < bytes + 8u; index += 4u) // data, then a little more
+                    appendWord(next());
+
+                direct.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                generic.processVIF1Data(packet.data(), static_cast<uint32_t>(packet.size()));
+                if (std::memcmp(direct.getVU1Data(), generic.getVU1Data(), PS2_VU1_DATA_SIZE) != 0)
+                    ++mismatches;
+            }
+            t.Equals(mismatches, 0u, "direct and generic UNPACK should write the same VU1 memory");
+        });
+
         tc.Run("VIF1 DMA on the VIF1 thread completes when the EE looks at its results", [](TestCase &t)
         {
             setTestEnv("PS2X_VIF1_THREAD", "1");

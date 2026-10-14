@@ -483,6 +483,8 @@ public:
         uint32_t fbrst = 0u;
     };
     bool m_vif1Async = false;
+    // PS2X_VIF_UNPACK_GENERIC=1: every UNPACK takes the generic loop (to compare with the direct one).
+    bool m_unpackGenericOnly = false;
     std::thread m_vif1Thread;
     std::thread::id m_vif1Owner;           // the EE thread: queues transfers, completes them
     std::mutex m_vif1Mutex;

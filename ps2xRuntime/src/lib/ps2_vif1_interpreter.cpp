@@ -287,6 +287,145 @@ void PS2Memory::processVIF0Data(const uint8_t *data, uint32_t sizeBytes)
     }
 }
 
+namespace
+{
+    // UNPACK without mask, in mode 0 and with CL >= WL, where every write takes the next
+    // source vector and stores it decoded: what the generic loop in processVIF1Data does
+    // in that case, one format at a time. `src` is the first source vector, `end` the end
+    // of the whole VIF buffer (a V3 vector takes its w from the element after it, even past
+    // the UNPACK). Returns false for formats it does not cover.
+    bool unpackDirect(uint8_t *vuData, const uint8_t *src, const uint8_t *end, uint32_t vn, uint32_t vl,
+                      bool zeroExtend, uint32_t count, uint32_t vuAddr, uint32_t cl, uint32_t wl)
+    {
+        auto dest = [&](uint32_t index) -> uint8_t *
+        {
+            const uint32_t qword = (cl == wl) ? (vuAddr + index) : (vuAddr + (index / wl) * cl + index % wl);
+            return vuData + (qword & 0x3FFu) * 16u;
+        };
+        auto read32 = [](const uint8_t *p) -> uint32_t
+        {
+            uint32_t value = 0;
+            std::memcpy(&value, p, sizeof(value));
+            return value;
+        };
+        auto read16 = [zeroExtend](const uint8_t *p) -> uint32_t
+        {
+            uint16_t raw = 0;
+            std::memcpy(&raw, p, sizeof(raw));
+            return zeroExtend ? static_cast<uint32_t>(raw)
+                              : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(raw)));
+        };
+        auto read8 = [zeroExtend](const uint8_t *p) -> uint32_t
+        {
+            return zeroExtend ? static_cast<uint32_t>(*p)
+                              : static_cast<uint32_t>(static_cast<int32_t>(static_cast<int8_t>(*p)));
+        };
+        auto store = [&](uint32_t index, uint32_t x, uint32_t y, uint32_t z, uint32_t w)
+        {
+            const uint32_t lanes[4] = {x, y, z, w};
+            std::memcpy(dest(index), lanes, sizeof(lanes));
+        };
+        switch ((vn << 2) | vl)
+        {
+        case (3u << 2) | 0u: // V4-32
+            for (uint32_t i = 0; i < count; ++i)
+                std::memcpy(dest(i), src + i * 16u, 16u);
+            return true;
+        case (2u << 2) | 0u: // V3-32
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 12u;
+                store(i, read32(s), read32(s + 4), read32(s + 8), s + 16u <= end ? read32(s + 12) : 0u);
+            }
+            return true;
+        case (1u << 2) | 0u: // V2-32
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 8u;
+                const uint32_t x = read32(s), y = read32(s + 4);
+                store(i, x, y, x, y);
+            }
+            return true;
+        case (0u << 2) | 0u: // S-32
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t v = read32(src + i * 4u);
+                store(i, v, v, v, v);
+            }
+            return true;
+        case (3u << 2) | 1u: // V4-16
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 8u;
+                store(i, read16(s), read16(s + 2), read16(s + 4), read16(s + 6));
+            }
+            return true;
+        case (2u << 2) | 1u: // V3-16
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 6u;
+                store(i, read16(s), read16(s + 2), read16(s + 4), s + 8u <= end ? read16(s + 6) : 0u);
+            }
+            return true;
+        case (1u << 2) | 1u: // V2-16
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 4u;
+                const uint32_t x = read16(s), y = read16(s + 2);
+                store(i, x, y, x, y);
+            }
+            return true;
+        case (0u << 2) | 1u: // S-16
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t v = read16(src + i * 2u);
+                store(i, v, v, v, v);
+            }
+            return true;
+        case (3u << 2) | 2u: // V4-8
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 4u;
+                store(i, read8(s), read8(s + 1), read8(s + 2), read8(s + 3));
+            }
+            return true;
+        case (2u << 2) | 2u: // V3-8
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 3u;
+                store(i, read8(s), read8(s + 1), read8(s + 2), s + 4u <= end ? read8(s + 3) : 0u);
+            }
+            return true;
+        case (1u << 2) | 2u: // V2-8
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint8_t *s = src + i * 2u;
+                const uint32_t x = read8(s), y = read8(s + 1);
+                store(i, x, y, x, y);
+            }
+            return true;
+        case (0u << 2) | 2u: // S-8
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                const uint32_t v = read8(src + i);
+                store(i, v, v, v, v);
+            }
+            return true;
+        case (3u << 2) | 3u: // V4-5: RGBA5551 expanded to 8 bits per channel
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                uint16_t packed = 0;
+                std::memcpy(&packed, src + i * 2u, sizeof(packed));
+                store(i, (packed & 0x001Fu) << 3, (packed & 0x03E0u) >> 2, (packed & 0x7C00u) >> 7,
+                      (packed & 0x8000u) >> 8);
+            }
+            return true;
+        default:
+            return false;
+        }
+    }
+}
+
 void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u || srcPhys >= PS2_RAM_SIZE)
@@ -636,6 +775,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 }
             }
 
+            if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes && !maskEnable &&
+                (vif1_regs.mode & 3u) == 0u && cl >= wl && !m_unpackGenericOnly &&
+                unpackDirect(m_vu1Data, data + pos, data + sizeBytes, vn, vl, zeroExtend, writeVectorCount, vuAddr, cl,
+                             wl))
+            {
+                pos += totalBytes;
+                if (pos > sizeBytes)
+                    break;
+                continue;
+            }
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
                 const uint8_t *srcBase = data + pos;
