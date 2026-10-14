@@ -2143,7 +2143,9 @@ void GSCpuBackend::FlushPendingDrawsUnlocked(FlushReason reason)
 
     if (m_bandCount == 0u)
     {
-        uint32_t count = std::max(1u, std::thread::hardware_concurrency() / 2u);
+        // Band threads draw while the worker queues the next list and the EE thread runs
+        // the game; three quarters of the logical CPUs leaves room for those.
+        uint32_t count = std::max(1u, std::thread::hardware_concurrency() * 3u / 4u);
         if (const char *value = std::getenv("PS2X_GS_THREADS"))
             count = static_cast<uint32_t>(std::max(1, std::atoi(value)));
         m_bandCount = std::min(count, 16u);
