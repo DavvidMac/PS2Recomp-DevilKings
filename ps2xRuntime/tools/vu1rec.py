@@ -458,6 +458,211 @@ class Emitter:
         self.writeback = 'x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue;'
         if self.lite:
             self.writeback += ' x.foldLite(liteSign, liteMinAbs);'
+        self.heads = self.block_heads()
+
+    def block_heads(self):
+        """Pairs where control can arrive other than by falling through from the pair before:
+        each starts a block with a fast path (fast_block). The program entry, MSCNT resume
+        points, BAL/JALR return points and branch targets; a JR can reach any pair, so its
+        targets that are not heads take the per-pair code."""
+        labels = self.pairs
+        heads = set()
+        for pc, p in labels.items():
+            before = (pc - 8) & 0x3FFF
+            q = labels.get(before)
+            if q is None or q.is_branch or q.e_bit:
+                heads.add(pc)
+            if p.e_bit:
+                heads.add((pc + 16) & 0x3FFF)
+            elif p.is_branch:
+                if p.op_hi not in (0x24, 0x25):
+                    heads.add(p.branch_target())
+                if p.op_hi not in (0x20,):
+                    heads.add((pc + 16) & 0x3FFF)
+        return {pc for pc in heads if pc in labels}
+
+    def label(self, pc):
+        return f'F{pc:04x}' if pc in self.heads else f'P{pc:04x}'
+
+    def block_pcs(self, head):
+        """The pairs of the block starting at head (branch and E-bit delay slots excluded)."""
+        pcs = [head]
+        pc = head
+        while True:
+            p = self.pairs[pc]
+            if p.is_branch or p.e_bit:
+                return pcs
+            nxt = (pc + 8) & 0x3FFF
+            if nxt not in self.pairs or nxt in self.heads:
+                return pcs
+            pcs.append(nxt)
+            pc = nxt
+
+    def fast_pair(self, p, k, base, in_delay_slot, prod, liveins, out):
+        """Code for pair p as the k-th pair of a block (see fast_block). Appends the stall
+        computation of t<k> to out and returns (the pair's body, its branch). Ready cycles of
+        registers written earlier in the block come from the locals t<j> + latency, the rest
+        from Exec (loaded once per block); every write still stores its ready cycle, so the
+        state is exact at every exit."""
+        up_compute, up_write = self.upper_op(p, [])
+        lo_compute, lo_write, branch = self.lower_op(p)
+        tk = f't{k}'
+        terms = []
+
+        def need(key, load):
+            if key in prod:
+                j, lat = prod[key]
+                term = f't{j} + {lat}u'
+            else:
+                term = 'li_' + '_'.join(str(part) for part in key)
+                if term not in liveins:
+                    liveins.add(term)
+                    out.append(f'const uint64_t {term} = {load};')
+            if term not in terms:
+                terms.append(term)
+
+        for reg, lanes in p.up.vf_read + p.lo.vf_read:
+            if reg:
+                for c in comps(lanes):
+                    need(('vf', reg, c), f'x.vfReady[{reg}][{c}]')
+        vi_reads = (p.up.vi_read | p.lo.vi_read) & 0xFFFE
+        for reg in range(1, 16):
+            if vi_reads & (1 << reg):
+                need(('vi', reg), f'x.viReady[{reg}]')
+        for c in comps(p.up.acc_read | p.lo.acc_read):
+            need(('acc', c), f'x.accReady[{c}]')
+        out.append(f'uint64_t {tk} = {base};')
+        for term in terms:
+            out.append(f'{tk} = std::max({tk}, {term});')
+        if p.lo.pipeline == 'fdiv' or p.lo.wait_q:
+            out.append(f'if (x.fdivPending) {tk} = std::max({tk}, x.fdivReady);')
+        if p.lo.pipeline == 'xgkick':
+            out.append(f'if (x.xgActive) {tk} = std::max({tk}, x.xgFinish());')
+        if not in_delay_slot:
+            out.append(f'if ({tk} >= budget) {{ cyc = {base}; x.noteReady(lrl); {self.writeback} '
+                       f'x.handoff(0x{p.pc:04x}u); return; }}')
+
+        body = [f't = {tk};']
+        body.extend(self.commit_lines(p))
+        body.extend(up_compute)
+        body.extend(lo_compute)
+        if p.i_bit:
+            body.append(f'x.i = norm(bitsFloat(0x{p.lower:08x}u));')
+        body.extend(up_write)
+        body.extend(lo_write)
+
+        writes = []
+        lo_reg, lo_lanes = p.lo.vf_write
+        if lo_reg and p.suppressed != lo_reg:
+            lat = p.lo.vf_latency or p.lo.latency
+            for c in comps(lo_lanes):
+                body.append(f'x.vfReady[{lo_reg}][{c}] = t + {lat}u;')
+                writes.append((('vf', lo_reg, c), lat))
+        up_reg, up_lanes = p.up.vf_write
+        if up_reg:
+            lat = p.up.vf_latency or p.up.latency
+            for c in comps(up_lanes):
+                body.append(f'x.vfReady[{up_reg}][{c}] = t + {lat}u;')
+                writes.append((('vf', up_reg, c), lat))
+        vi_writes = p.lo.vi_write & 0xFFFE
+        written_vi = 0
+        for reg in range(1, 16):
+            if vi_writes & (1 << reg):
+                lat = p.lo.vi_latency or p.lo.latency
+                body.append(f'x.viReady[{reg}] = t + {lat}u;')
+                writes.append((('vi', reg), lat))
+                if not written_vi:
+                    written_vi = reg
+        if p.up.acc_write:
+            for c in comps(p.up.acc_write):
+                body.append(f'x.accReady[{c}] = t + {ACC_FORWARD_LATENCY}u;')
+                writes.append((('acc', c), ACC_FORWARD_LATENCY))
+        if writes:
+            body.append(f'lrl = std::max(lrl, t + {max(lat for _, lat in writes)}u);')
+        if written_vi and p.lo.delays_branch:
+            body.insert(self.find_first_write(body), f'const int32_t loldvi = x.vi[{written_vi}];')
+            body.append(f'vbValid = true; vbReg = {written_vi}; vbValue = loldvi;')
+        else:
+            body.append('vbValid = false;')
+        for key, lat in writes:
+            prod[key] = (k, lat)
+        return body, branch
+
+    def fast_block(self, head):
+        """Code entered at block head `head` (label F<head>): the block's pairs with their
+        stall timing in locals, then the branch, E-bit end or fall-through to the next head."""
+        out = [f'F{head:04x}:', '    {', '        uint64_t lrl = 0u;']
+        prod = {}
+        liveins = set()
+        k = 0
+        base = 'cyc'
+
+        def add(lines, indent='        '):
+            out.extend(indent + line for line in lines)
+
+        pcs = self.block_pcs(head)
+        for pc in pcs:
+            p = self.pairs[pc]
+            out.append(f'        // 0x{pc:04x} up={p.upper:08x} lo={p.lower:08x}')
+            pre = []
+            body, branch = self.fast_pair(p, k, base, False, prod, liveins, pre)
+            add(pre)
+            pair_k = k
+            k += 1
+            base = f't{pair_k} + 1u'
+            if p.e_bit or branch:
+                kind, target = branch if branch else ('end', None)
+                if kind == 'cond':
+                    out.append('        bool taken = false;')
+                    body.append('taken = ltaken;')
+                elif kind == 'jump':
+                    out.append('        uint32_t jumpTarget = 0u;')
+                    body.append('jumpTarget = ljump;')
+                out.append('        {')
+                add(body, '            ')
+                out.append('        }')
+                slot = self.all_pairs[(pc + 8) & 0x3FFF]
+                out.append(f'        // delay slot 0x{slot.pc:04x}')
+                pre = []
+                slot_body, _ = self.fast_pair(slot, k, base, True, prod, liveins, pre)
+                add(pre)
+                out.append('        {')
+                add(slot_body, '            ')
+                out.append('        }')
+                out.append(f'        cyc = t{k} + 1u;')
+                out.append('        x.noteReady(lrl);')
+                if p.e_bit:
+                    out.append(f'        {self.writeback}')
+                    out.append(f'        x.end(cyc - 1u, 0x{(pc + 16) & 0x3FFF:04x}u);')
+                    out.append('        return;')
+                elif kind == 'always':
+                    out.append(f'        goto {self.label(target)};')
+                elif kind == 'cond':
+                    out.append(f'        if (taken) goto {self.label(target)};')
+                    out.append(f'        goto {self.label((pc + 16) & 0x3FFF)};')
+                else:
+                    out.append('        switch (jumpTarget)')
+                    out.append('        {')
+                    for other in self.pairs:
+                        out.append(f'        case 0x{other:04x}: goto {self.label(other)};')
+                    out.append(f'        default: {self.writeback} x.handoff(jumpTarget); return;')
+                    out.append('        }')
+                out.append('    }')
+                return out
+            out.append('        {')
+            add(body, '            ')
+            out.append('        }')
+        nxt = (pcs[-1] + 8) & 0x3FFF
+        out.append(f'        cyc = t{k - 1} + 1u;')
+        out.append('        x.noteReady(lrl);')
+        if nxt in self.pairs:
+            out.append(f'        goto {self.label(nxt)};')
+        else:
+            out.append(f'        {self.writeback}')
+            out.append(f'        x.handoff(0x{nxt:04x}u);')
+            out.append('        return;')
+        out.append('    }')
+        return out
 
     def lite_fmacs(self):
         """FMAC pairs whose MAC and status writes no flag read can observe (Exec::fmacLite).
@@ -855,21 +1060,7 @@ class Emitter:
         if not in_delay_slot:
             out.append(f'if (t >= budget) {{ {self.writeback} x.handoff(0x{p.pc:04x}u); return; }}')
 
-        reads_q = False
-        if not p.i_bit or True:
-            u = p.upper
-            op = u & 0x3F
-            q_ops = {0x1C, 0x20, 0x21, 0x24, 0x25}
-            q_special = {0x1C, 0x20, 0x21, 0x24, 0x25}
-            if op >= 0x3C:
-                reads_q = upper_special(u) in q_special
-            else:
-                reads_q = op in q_ops
-        lower_reads_flags = (not p.i_bit) and p.op_hi in (0x10, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C)
-        if lower_reads_flags or ((reads_q or p.lo.pipeline == 'fdiv') and self.has_fsset):
-            out.append('x.commitTo(t);')
-        elif reads_q or p.lo.pipeline == 'fdiv':
-            out.append('x.commitQ(t);')
+        out.extend(self.commit_lines(p))
 
         out.extend(up_compute)
         out.extend(lo_compute)
@@ -907,6 +1098,23 @@ class Emitter:
             out.append('vbValid = false;')
         out.append('cyc = t + 1u;')
         return out, branch
+
+    def commit_lines(self, p):
+        """Flag and Q commits a pair needs before it runs (reads of flags or Q, FDIV issue)."""
+        u = p.upper
+        op = u & 0x3F
+        q_ops = {0x1C, 0x20, 0x21, 0x24, 0x25}
+        q_special = {0x1C, 0x20, 0x21, 0x24, 0x25}
+        if op >= 0x3C:
+            reads_q = upper_special(u) in q_special
+        else:
+            reads_q = op in q_ops
+        lower_reads_flags = (not p.i_bit) and p.op_hi in (0x10, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C)
+        if lower_reads_flags or ((reads_q or p.lo.pipeline == 'fdiv') and self.has_fsset):
+            return ['x.commitTo(t);']
+        if reads_q or p.lo.pipeline == 'fdiv':
+            return ['x.commitQ(t);']
+        return []
 
     @staticmethod
     def find_first_write(lines):
@@ -952,10 +1160,16 @@ class Emitter:
         L('    switch (entryPc)')
         L('    {')
         for pc in self.pairs:
-            L(f'    case 0x{pc:04x}: goto P{pc:04x};')
+            L(f'    case 0x{pc:04x}: goto {self.label(pc)};')
         L('    default: return;')
         L('    }')
         for pc, p in self.pairs.items():
+            if pc in self.heads:
+                # Blocks are entered at their head; the per-pair code below serves entries
+                # in the middle of a block (resuming after a handoff, a JR).
+                for text in self.fast_block(pc):
+                    L(text)
+                continue
             L(f'P{pc:04x}: // up={p.upper:08x} lo={p.lower:08x}')
             L('    {')
             code, branch = self.pair_code(p, False)
@@ -984,21 +1198,21 @@ class Emitter:
                     L('            ' + text)
                 L('        }')
                 if kind == 'always':
-                    L(f'        goto P{target:04x};')
+                    L(f'        goto {self.label(target)};')
                 elif kind == 'cond':
-                    L(f'        if (taken) goto P{target:04x};')
-                    L(f'        goto P{(pc + 16) & 0x3FFF:04x};')
+                    L(f'        if (taken) goto {self.label(target)};')
+                    L(f'        goto {self.label((pc + 16) & 0x3FFF)};')
                 else:
                     L('        switch (jumpTarget)')
                     L('        {')
                     for other in self.pairs:
-                        L(f'        case 0x{other:04x}: goto P{other:04x};')
+                        L(f'        case 0x{other:04x}: goto {self.label(other)};')
                     L(f'        default: {self.writeback} x.handoff(jumpTarget); return;')
                     L('        }')
             else:
                 nxt = (pc + 8) & 0x3FFF
                 if nxt in self.pairs:
-                    L(f'        goto P{nxt:04x};')
+                    L(f'        goto {self.label(nxt)};')
                 else:
                     L(f'        {self.writeback}')
                     L(f'        x.handoff(0x{nxt:04x}u);')
