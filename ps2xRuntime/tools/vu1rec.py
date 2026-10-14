@@ -1,11 +1,14 @@
 """Translate a VU1 micro program image to C++ (ahead-of-time VU1 recompilation).
 
-usage: python -I vu1rec.py <out_dir> <image.bin> [<image.bin> ...]
+usage: python -I vu1rec.py [--prune] <out_dir> <image.bin> [<image.bin> ...]
 
 Each 16 KB micro memory image (as written by PS2X_VU1_CAPTURE) becomes
 <out_dir>/vu1prog_<name>.cpp, which registers itself with the runtime
 (ps2_vu1_compiled.h). At MSCAL/MSCNT time VU1Interpreter runs the translated
-code when micro memory matches the image, and the interpreter otherwise.
+code when micro memory matches the image up to the end of the translated code,
+and the interpreter otherwise. <name> is a hash of those bytes, so images that
+only differ after the code (leftovers of earlier uploads) share one file.
+--prune deletes the other vu1prog_*.cpp files in <out_dir>, so pass every image.
 
 The generated code reproduces VU1Interpreter exactly: instruction usage
 (stall sources and latencies) is decoded here the same way as
@@ -919,17 +922,28 @@ class Emitter:
 image_bytes_full = b''
 
 
-def translate(path, out_dir):
+def fnv1a64(data):
+    value = 0xcbf29ce484222325
+    for byte in data:
+        value = ((value ^ byte) * 0x100000001b3) & 0xFFFFFFFFFFFFFFFF
+    return value
+
+
+def translate(path, out_dir, done):
     global image_bytes_full
     image = open(path, 'rb').read()
     image_bytes_full = image
     pairs, all_pairs = analyse(image)
     base = os.path.basename(path)
-    name = base.split('_')[-1].split('.')[0] if base.startswith('vu1code_') else os.path.splitext(base)[0]
     code_bytes = max(pairs) + 8
     for p in pairs.values():
         if p.is_branch or p.e_bit:
             code_bytes = max(code_bytes, p.pc + 16)
+    # The runtime matches only these bytes, so they name the program.
+    name = f'{fnv1a64(image[:code_bytes]):016x}'
+    if name in done:
+        return name, len(pairs), code_bytes, False
+    done.add(name)
     emitter = Emitter(name, pairs, all_pairs)
     text = emitter.emit(base, image, code_bytes)
     target = os.path.join(out_dir, f'vu1prog_{name}.cpp')
@@ -937,20 +951,31 @@ def translate(path, out_dir):
     if old != text:
         with open(target, 'w', encoding='utf-8', newline='\n') as out:
             out.write(text)
-    return name, len(pairs), code_bytes
+    return name, len(pairs), code_bytes, True
 
 
 def main():
-    if len(sys.argv) < 3:
+    args = sys.argv[1:]
+    prune = '--prune' in args
+    args = [arg for arg in args if arg != '--prune']
+    if len(args) < 2:
         raise SystemExit(__doc__)
-    out_dir = sys.argv[1]
+    out_dir = args[0]
     os.makedirs(out_dir, exist_ok=True)
-    for path in sys.argv[2:]:
+    done = set()
+    # Sorted, so the image named in each file's header does not depend on argument order.
+    for path in sorted(args[1:], key=os.path.basename):
         try:
-            name, count, size = translate(path, out_dir)
-            print(f'{os.path.basename(path)}: {count} pairs, {size} bytes -> vu1prog_{name}.cpp')
+            name, count, size, written = translate(path, out_dir, done)
+            note = '' if written else ' (same code as an earlier image)'
+            print(f'{os.path.basename(path)}: {count} pairs, {size} bytes -> vu1prog_{name}.cpp{note}')
         except Reject as error:
             print(f'{os.path.basename(path)}: not translated ({error})')
+    if prune:
+        for entry in sorted(os.listdir(out_dir)):
+            if entry.startswith('vu1prog_') and entry.endswith('.cpp') and entry[8:-4] not in done:
+                os.remove(os.path.join(out_dir, entry))
+                print(f'removed {entry}')
 
 
 if __name__ == '__main__':

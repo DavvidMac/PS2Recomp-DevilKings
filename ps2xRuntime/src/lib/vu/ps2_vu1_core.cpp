@@ -15,6 +15,8 @@
 #include <filesystem>
 #include <limits>
 #include <map>
+#include <mutex>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -123,16 +125,26 @@ namespace
             if (!s_saved[s_hash])
             {
                 s_saved[s_hash] = true;
-                char name[64];
-                std::snprintf(name, sizeof(name), "vu1code_%016llx.bin", static_cast<unsigned long long>(s_hash));
-                const std::string path = vu1CaptureDir() + "/" + name;
-                if (FILE *file = std::fopen(path.c_str(), "wb"))
+                // A translated program matching the image up to the end of its code
+                // already runs it (the rest is leftovers of earlier uploads).
+                if (const ps2x::vu1c::Program *program = ps2x::vu1c::findProgram(code, codeSize))
                 {
-                    std::fwrite(code, 1, codeSize, file);
-                    std::fclose(file);
+                    std::fprintf(stderr, "[vu1-capture] image %016llx runs as translated program %s\n",
+                                 static_cast<unsigned long long>(s_hash), program->name);
                 }
-                std::fprintf(stderr, "[vu1-capture] new image %016llx (generation %llu)\n",
-                             static_cast<unsigned long long>(s_hash), static_cast<unsigned long long>(generation));
+                else
+                {
+                    char name[64];
+                    std::snprintf(name, sizeof(name), "vu1code_%016llx.bin", static_cast<unsigned long long>(s_hash));
+                    const std::string path = vu1CaptureDir() + "/" + name;
+                    if (FILE *file = std::fopen(path.c_str(), "wb"))
+                    {
+                        std::fwrite(code, 1, codeSize, file);
+                        std::fclose(file);
+                    }
+                    std::fprintf(stderr, "[vu1-capture] new image %016llx (generation %llu)\n",
+                                 static_cast<unsigned long long>(s_hash), static_cast<unsigned long long>(generation));
+                }
             }
         }
         ++s_calls[{s_hash, startPC}];
@@ -2411,7 +2423,16 @@ bool VU1Interpreter::runCompiled(const ps2x::vu1c::Program &program, uint8_t *vu
     }
     program.run(x, m_state.pc);
     if (x.exit == ps2x::vu1c::Exit::Refused)
+    {
+        // The image matched, but the translator did not see this entry point.
+        static std::mutex s_refusedMutex;
+        static std::set<std::pair<const ps2x::vu1c::Program *, uint32_t>> s_refused;
+        std::lock_guard<std::mutex> lock(s_refusedMutex);
+        if (s_refused.insert({&program, m_state.pc}).second)
+            std::fprintf(stderr, "[vu1] %s has no entry at pc=%04x; the interpreter runs it\n", program.name,
+                         m_state.pc);
         return false;
+    }
     importCompiledState(x);
     return x.exit == ps2x::vu1c::Exit::Ended;
 }

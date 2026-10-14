@@ -460,6 +460,14 @@ file(GLOB_RECURSE RUNNER_MODULE_SRC_FILES CONFIGURE_DEPENDS
 )
 list(APPEND RUNNER_SRC_FILES ${RUNNER_MODULE_SRC_FILES})
 
+# VU1 micro programs translated by tools/vu1rec.py go in src/runner/vu1, after
+# the modules for the same reason: new programs keep turning up as more of a
+# game is played.
+file(GLOB RUNNER_VU1_SRC_FILES CONFIGURE_DEPENDS
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/vu1/*.cpp"
+)
+list(APPEND RUNNER_SRC_FILES ${RUNNER_VU1_SRC_FILES})
+
 if(PS2X_IS_ANDROID)
     add_library(ps2EntryRunner SHARED
         ${RUNNER_SRC_FILES}
