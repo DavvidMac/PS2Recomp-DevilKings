@@ -73,9 +73,12 @@ namespace
         if (s_lines++ < 4000u)
         {
             const double busyMs = std::chrono::duration<double, std::milli>(s_busy).count();
-            std::fprintf(stderr, "[vu1-stats] runs/s=%.0f pairs/s=%.0f cycles/s=%.0f busy=%.0f%% ns/pair=%.1f\n",
+            // Translated programs do not count pairs; ns/cycle covers both kinds of run.
+            std::fprintf(stderr, "[vu1-stats] runs/s=%.0f pairs/s=%.0f cycles/s=%.0f busy=%.0f%% ns/pair=%.1f "
+                                 "ns/cycle=%.2f\n",
                          s_runs / window, s_pairs / window, s_cycles / window, busyMs / (window * 10.0),
-                         s_pairs ? busyMs * 1.0e6 / static_cast<double>(s_pairs) : 0.0);
+                         s_pairs ? busyMs * 1.0e6 / static_cast<double>(s_pairs) : 0.0,
+                         s_cycles ? busyMs * 1.0e6 / static_cast<double>(s_cycles) : 0.0);
         }
         s_windowStart = now;
         s_runs = s_pairs = s_cycles = 0;

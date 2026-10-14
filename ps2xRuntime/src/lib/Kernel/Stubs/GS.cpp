@@ -1274,10 +1274,12 @@ namespace ps2_stubs
 
     void sceGsSyncV(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        dmaTrace("sceGsSyncV ra=%08x", getRegU32(ctx, 31));
         ps2_syscalls::WaitVSyncTick(rdram,
                                     ctx,
                                     runtime,
                                     g_gparam.interlace != 0u ? -1 : 1);
+        dmaTrace("sceGsSyncV returned");
     }
 
     void sceGsSyncVCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

@@ -11,7 +11,14 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <cstdarg>
 #include <chrono>
+
+namespace
+{
+    // VSync counter read by dmaTrace (PS2X_DMA_TRACE); set by PS2Memory::initialize.
+    const std::atomic<uint64_t> *g_traceVsync = nullptr;
+}
 
 namespace
 {
@@ -346,6 +353,7 @@ PS2Memory::~PS2Memory()
 
 bool PS2Memory::initialize(size_t ramSize)
 {
+    g_traceVsync = &gs_regs.vsyncTick;
     auto cleanup = [this]()
     {
         delete[] m_rdram;
@@ -1006,6 +1014,7 @@ void PS2Memory::write32(uint32_t address, uint32_t value)
     {
         uint32_t off = address & 7;
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        dmaTrace("gs-priv w32 %08x=%08x", address, value);
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 of the low dword are write-one-to-clear status bits.
@@ -1065,6 +1074,7 @@ void PS2Memory::write64(uint32_t address, uint64_t value)
     if (isGsPrivReg(address))
     {
         const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+        dmaTrace("gs-priv w64 %08x=%016llx", address, static_cast<unsigned long long>(value));
         if (regOff == kGsCsrRegOffset)
         {
             // CSR: bits 0..1 are write-one-to-clear status bits. Done as a single
@@ -1175,6 +1185,54 @@ void PS2Memory::write128(uint32_t address, __m128i value)
 
 namespace
 {
+    struct DmaTraceWindow
+    {
+        uint64_t from = ~0ull;
+        uint64_t until = 0u;
+        DmaTraceWindow()
+        {
+            const char *value = std::getenv("PS2X_DMA_TRACE");
+            if (!value)
+                return;
+            char *end = nullptr;
+            from = std::strtoull(value, &end, 10);
+            until = from + ((end && *end == ':') ? std::strtoull(end + 1, nullptr, 10) : 4u);
+        }
+    };
+
+    const DmaTraceWindow &dmaTraceWindow()
+    {
+        static const DmaTraceWindow window;
+        return window;
+    }
+}
+
+bool dmaTraceActive()
+{
+    const DmaTraceWindow &window = dmaTraceWindow();
+    if (window.from == ~0ull || !g_traceVsync)
+        return false;
+    const uint64_t vsync = g_traceVsync->load(std::memory_order_relaxed);
+    return vsync >= window.from && vsync < window.until;
+}
+
+void dmaTrace(const char *format, ...)
+{
+    if (!dmaTraceActive())
+        return;
+    static const auto s_start = std::chrono::steady_clock::now();
+    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - s_start).count();
+    char text[256];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(text, sizeof(text), format, args);
+    va_end(args);
+    std::fprintf(stderr, "[dma-trace] %10.1f v=%llu %s\n", us,
+                 static_cast<unsigned long long>(g_traceVsync->load(std::memory_order_relaxed)), text);
+}
+
+namespace
+{
     // Diagnostics: PS2X_DMA_TIMING=1 prints, every 5 s, the DMA kicks of the GIF, VIF0
     // and VIF1 channels and the host time the EE thread spent starting and processing them.
     struct DmaTiming
@@ -1217,6 +1275,8 @@ namespace
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if ((address >= 0x10003000u && address < 0x10004000u) || (address >= 0x10008000u && address < 0x1000F000u))
+        dmaTrace("wr %08x=%08x", address, value);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
@@ -1687,6 +1747,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 }
                 if (timeKick)
                     noteDmaKick(channelBase, kickBytes, kickStart, gs_regs.vsyncTick.load(std::memory_order_relaxed));
+                dmaTrace("kick %08x done bytes=%llu", channelBase, static_cast<unsigned long long>(kickBytes));
             }
         }
         return true;
@@ -2563,6 +2624,8 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    if ((address >= 0x10003000u && address < 0x10004000u) || (address >= 0x10008000u && address < 0x1000F000u))
+        dmaTrace("rd %08x", address);
     size_t timerIndex = 0u;
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))

@@ -258,6 +258,11 @@ struct JumpTable
     std::vector<uint32_t> targets; // Jump targets
 };
 
+// Diagnostics: PS2X_DMA_TRACE=<fromVsync>:<vsyncs> prints a timeline of DMA kicks and waits,
+// DMA/VIF/GIF register accesses, GS privileged writes and VSync waits as [dma-trace].
+bool dmaTraceActive();
+void dmaTrace(const char *format, ...);
+
 class PS2Memory
 {
 public:

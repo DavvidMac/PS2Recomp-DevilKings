@@ -1352,6 +1352,7 @@ namespace
         }
 
         const uint32_t payloadPhys = toDmaPhys(payloadArg);
+        dmaTrace("sceDmaSend ch=%08x ra=%08x", channelBase, getRegU32(ctx, 31));
         uint32_t madr = 0;
         uint32_t qwc = 0;
         uint32_t tadr = payloadPhys;
@@ -1452,6 +1453,7 @@ namespace
             return -1;
         }
 
+        dmaTrace("sceDmaSync ch=%08x mode=%u ra=%08x", channelBase, mode, getRegU32(ctx, 31));
         bool modelBusy = false;
         {
             std::lock_guard<std::mutex> lock(g_dmaStubMutex);
