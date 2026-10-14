@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <array>
 #include <optional>
 #include <span>
@@ -44,12 +45,75 @@ namespace ps2x::iop::detail
 
         void reset();
 
-        [[nodiscard]] uint8_t read8(uint32_t address) const;
-        [[nodiscard]] uint16_t read16(uint32_t address) const;
-        [[nodiscard]] uint32_t read32(uint32_t address) const;
-        void write8(uint32_t address, uint8_t value);
-        void write16(uint32_t address, uint16_t value);
-        void write32(uint32_t address, uint32_t value);
+        // RAM accesses take the inline paths; everything else (scratchpad, hardware,
+        // SPU2, unaligned or wrapping accesses) goes through the *Slow functions.
+        [[nodiscard]] uint8_t read8(uint32_t address) const
+        {
+            const uint32_t phys = physicalAddress(address);
+            if (phys < RamSize)
+                return m_ram[phys];
+            return read8Slow(address);
+        }
+
+        [[nodiscard]] uint16_t read16(uint32_t address) const
+        {
+            const uint32_t phys = physicalAddress(address);
+            if (phys + 1u < RamSize)
+            {
+                uint16_t value;
+                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
+                return value;
+            }
+            return read16Slow(address);
+        }
+
+        [[nodiscard]] uint32_t read32(uint32_t address) const
+        {
+            const uint32_t phys = physicalAddress(address);
+            if ((phys & 3u) == 0u && phys + 3u < RamSize)
+            {
+                uint32_t value;
+                std::memcpy(&value, m_ram.data() + phys, sizeof(value));
+                return value;
+            }
+            return read32Slow(address);
+        }
+
+        void write8(uint32_t address, uint8_t value)
+        {
+            const uint32_t phys = physicalAddress(address);
+            if (phys < RamSize)
+            {
+                m_ram[phys] = value;
+                m_owned[phys] = 1u;
+                return;
+            }
+            write8Slow(address, value);
+        }
+
+        void write16(uint32_t address, uint16_t value)
+        {
+            const uint32_t phys = physicalAddress(address);
+            if (phys + 1u < RamSize)
+            {
+                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+                std::memset(m_owned.data() + phys, 1, sizeof(value));
+                return;
+            }
+            write16Slow(address, value);
+        }
+
+        void write32(uint32_t address, uint32_t value)
+        {
+            const uint32_t phys = physicalAddress(address);
+            if ((phys & 3u) == 0u && phys + 3u < RamSize)
+            {
+                std::memcpy(m_ram.data() + phys, &value, sizeof(value));
+                std::memset(m_owned.data() + phys, 1, sizeof(value));
+                return;
+            }
+            write32Slow(address, value);
+        }
 
         [[nodiscard]] bool readRam(uint32_t address, void *destination, size_t size) const;
         [[nodiscard]] bool writeRam(uint32_t address, const void *source, size_t size);
@@ -70,10 +134,14 @@ namespace ps2x::iop::detail
         void setInterruptMask(uint32_t value) noexcept { m_interruptMask = value; }
         void setInterruptControl(uint32_t value) noexcept { m_interruptControl = value & 1u; }
 
+        [[nodiscard]] bool hasDmaStart() const noexcept { return m_dmaStart.has_value(); }
         [[nodiscard]] std::optional<DmaStart> takeDmaStart() noexcept;
         [[nodiscard]] std::span<const uint8_t> ram() const noexcept { return m_ram; }
 
-        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept;
+        [[nodiscard]] static uint32_t physicalAddress(uint32_t address) noexcept
+        {
+            return address & 0x1FFFFFFFu;
+        }
 
         // IOP cycle counter used to pace SPU2 AutoDMA transfers in real time.
         void setCycleCounter(const uint64_t *counter) noexcept { m_cycleCounter = counter; }
@@ -81,6 +149,12 @@ namespace ps2x::iop::detail
         [[nodiscard]] Spu2 &spu2() noexcept { return m_spu2; }
 
     private:
+        [[nodiscard]] uint8_t read8Slow(uint32_t address) const;
+        [[nodiscard]] uint16_t read16Slow(uint32_t address) const;
+        [[nodiscard]] uint32_t read32Slow(uint32_t address) const;
+        void write8Slow(uint32_t address, uint8_t value);
+        void write16Slow(uint32_t address, uint16_t value);
+        void write32Slow(uint32_t address, uint32_t value);
         [[nodiscard]] uint32_t readHardware32(uint32_t address) const;
         void writeHardware32(uint32_t address, uint32_t value);
         void markOwned(uint32_t address, size_t size);

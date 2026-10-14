@@ -127,6 +127,7 @@ namespace ps2x::iop::detail
             timrman.reset();
             ioman.reset();
             pendingDmaInterrupts.clear();
+            nextDmaInterruptCycle = UINT64_MAX;
             pendingGuestCallbacks.clear();
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
@@ -179,8 +180,20 @@ namespace ps2x::iop::detail
 
         void schedulePendingDma()
         {
+            if (!memory.hasDmaStart())
+                return;
             if (const auto dma = memory.takeDmaStart())
+            {
                 pendingDmaInterrupts[dma->irq] = totalCycles + dma->delayCycles;
+                updateNextDmaInterruptCycle();
+            }
+        }
+
+        void updateNextDmaInterruptCycle()
+        {
+            nextDmaInterruptCycle = UINT64_MAX;
+            for (const auto &[irq, completionCycle] : pendingDmaInterrupts)
+                nextDmaInterruptCycle = std::min(nextDmaInterruptCycle, completionCycle);
         }
 
         bool readRam(uint32_t address, void *destination, size_t size) const
@@ -387,7 +400,9 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
-            if (const auto import = imports.decode(cpu.pc))
+            // Import stubs start with jr ra (decode checks it too); skip the call otherwise.
+            if (const auto import = memory.read32(cpu.pc) == 0x03E00008u ? imports.decode(cpu.pc)
+                                                                          : std::optional<IopImportCall>{})
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
@@ -517,6 +532,8 @@ namespace ps2x::iop::detail
         {
             if (servicingDmaInterrupts || pendingDmaInterrupts.empty() || inCriticalSection())
                 return;
+            if (totalCycles < nextDmaInterruptCycle)
+                return;
 
             servicingDmaInterrupts = true;
 
@@ -531,6 +548,7 @@ namespace ps2x::iop::detail
                 completed.push_back(it->first);
                 it = pendingDmaInterrupts.erase(it);
             }
+            updateNextDmaInterruptCycle();
             try
             {
                 for (const int irq : completed)
@@ -765,6 +783,8 @@ namespace ps2x::iop::detail
         IopLoadcore loadcore;
         std::map<int, Module> modules;
         std::map<int, uint64_t> pendingDmaInterrupts;
+        // Earliest completion cycle in pendingDmaInterrupts (UINT64_MAX when empty).
+        uint64_t nextDmaInterruptCycle = UINT64_MAX;
         std::multimap<uint64_t, ScheduledGuestCallback> pendingGuestCallbacks;
         uint32_t nextModuleId = 1;
         uint32_t moduleCursor = kModuleLoadBase;
