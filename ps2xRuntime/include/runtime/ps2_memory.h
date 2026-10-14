@@ -387,6 +387,9 @@ public:
     }
     // Called on the VIF1 thread when every queued transfer has finished (wakes the EE).
     void setVif1IdleHook(std::function<void()> hook) { m_vif1IdleHook = std::move(hook); }
+    // Called about every half millisecond while the EE waits for the VIF1 thread, to keep
+    // the EE clock and the IOP on host time meanwhile (instead of catching up afterwards).
+    void setVif1WaitHook(std::function<void()> hook) { m_vif1WaitHook = std::move(hook); }
 
     int pollDmaRegisters();
 
@@ -495,6 +498,7 @@ public:
     std::function<uint32_t()> m_liveFbrst;
     std::function<void(uint32_t)> m_applyVu1Stop;
     std::function<void()> m_vif1IdleHook;
+    std::function<void()> m_vif1WaitHook;
     void vif1ThreadMain();
     void queueVif1Transfers();
     void applyVif1Completions();

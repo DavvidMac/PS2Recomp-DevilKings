@@ -21,6 +21,8 @@ namespace
 
     // True on the asynchronous VIF1 thread (PS2X_VIF1_THREAD).
     thread_local bool t_onVif1Thread = false;
+    // True while syncVif1 runs its wait hook (a nested wait does not run it again).
+    thread_local bool t_inVif1WaitHook = false;
 
     // Registers whose access waits for queued VIF1 transfers: GIF and VIF registers, the
     // VIF1 and GIF FIFOs, the VIF1 and GIF DMA channels and the DMA controller.
@@ -2387,6 +2389,7 @@ void PS2Memory::vif1ThreadMain()
         }
         const bool timed = dmaTiming().enabled;
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        dmaTrace("vif1-thread start bytes=%zu", job.data.size());
         m_vif1JobFbrst = job.fbrst;
         m_vif1JobRanVu1 = false;
         try
@@ -2402,6 +2405,7 @@ void PS2Memory::vif1ThreadMain()
         }
         if (timed)
             noteVif1ThreadBusy(start);
+        dmaTrace("vif1-thread done");
         bool idle = false;
         {
             std::lock_guard<std::mutex> lock(m_vif1Mutex);
@@ -2429,12 +2433,32 @@ void PS2Memory::syncVif1()
         return;
     const bool timed = dmaTiming().enabled;
     const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    dmaTrace("ee waits for vif1-thread");
     {
         std::unique_lock<std::mutex> lock(m_vif1Mutex);
-        m_vif1DoneCv.wait(lock, [this, queued]() { return m_vif1Stop || m_vif1Finished >= queued; });
+        auto done = [this, queued]() { return m_vif1Stop || m_vif1Finished >= queued; };
+        while (!done())
+        {
+            if (m_vif1WaitHook && owner && !t_inVif1WaitHook)
+            {
+                lock.unlock();
+                t_inVif1WaitHook = true;
+                m_vif1WaitHook();
+                t_inVif1WaitHook = false;
+                lock.lock();
+                if (done())
+                    break;
+                m_vif1DoneCv.wait_for(lock, std::chrono::microseconds(500), done);
+            }
+            else
+            {
+                m_vif1DoneCv.wait(lock, done);
+            }
+        }
     }
     if (timed)
         noteVif1Wait(start);
+    dmaTrace("ee resumes");
     if (owner)
         applyVif1Completions();
 }
