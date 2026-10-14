@@ -510,61 +510,27 @@ class Emitter:
         (operation, source) = kind
         compute, write = [], []
         lanes = comps(dest)
-        cross_left = [1, 2, 0, 3]
-        cross_right = [2, 0, 1, 3]
+        kinds = {'add': 'kFmacAdd', 'sub': 'kFmacSub', 'mul': 'kFmacMul', 'madd': 'kFmacMadd',
+                 'msub': 'kFmacMsub', 'op': 'kFmacOpmsub', 'opmula': 'kFmacOpmula'}
+        # Operands are normalised on all four lanes; broadcasts and the cross product's
+        # lane order (left y z x w, right z x y w) are applied before the operation.
+        left = f'norm4(_mm_loadu_ps(x.vf[{fs}]))'
         if source == 'bc':
-            compute.append(f'const float ubc = norm(x.vf[{ft}][{op & 3}]);')
+            right = f'_mm_set1_ps(norm(x.vf[{ft}][{op & 3}]))'
         elif source == 'q':
-            compute.append('const float ubc = norm(x.q);')
+            right = '_mm_set1_ps(norm(x.q))'
         elif source == 'i':
-            compute.append('const float ubc = norm(x.i);')
-        compute.append('uint8_t ulf[4] = {0, 0, 0, 0};')
-        compute.append('uint32_t usticky = 0u;')
+            right = '_mm_set1_ps(norm(x.i))'
+        else:
+            right = f'norm4(_mm_loadu_ps(x.vf[{ft}]))'
+        if operation in ('op', 'opmula'):
+            compute.append(f'const __m128 uls = {left}; const __m128 urs = {right};')
+            left = '_mm_shuffle_ps(uls, uls, _MM_SHUFFLE(3, 0, 2, 1))'
+            right = '_mm_shuffle_ps(urs, urs, _MM_SHUFFLE(3, 1, 0, 2))'
+        compute.append(f'float urv[4]; x.fmacVec<{kinds[operation]}, {"true" if product_sum else "false"}>'
+                       f'(t, {dest}u, {left}, {right}, urv);')
         for c in lanes:
-            if operation in ('op', 'opmula'):
-                left = f'norm(x.vf[{fs}][{cross_left[c]}])'
-                right = f'norm(x.vf[{ft}][{cross_right[c]}])'
-            else:
-                left = f'norm(x.vf[{fs}][{c}])'
-                right = 'ubc' if source in ('bc', 'q', 'i') else f'norm(x.vf[{ft}][{c}])'
-            compute.append(f'const float ul{c} = {left}; const float urt{c} = {right};')
-            accn = f'norm(x.acc[{c}])'
-            if operation == 'add':
-                expr, exact = f'ul{c} + urt{c}', f'(long double)ul{c} + (long double)urt{c}'
-            elif operation == 'sub':
-                expr, exact = f'ul{c} - urt{c}', f'(long double)ul{c} - (long double)urt{c}'
-            elif operation == 'mul':
-                expr, exact = f'ul{c} * urt{c}', f'(long double)ul{c} * (long double)urt{c}'
-            elif operation == 'madd':
-                expr, exact = (f'{accn} + ul{c} * urt{c}',
-                               f'(long double){accn} + (long double)ul{c} * (long double)urt{c}')
-            elif operation == 'msub':
-                expr, exact = (f'{accn} - ul{c} * urt{c}',
-                               f'(long double){accn} - (long double)ul{c} * (long double)urt{c}')
-            elif operation == 'op':
-                if c == 3:
-                    expr, exact = '0.0f', '0.0L'
-                else:
-                    expr, exact = (f'{accn} - ul{c} * urt{c}',
-                                   f'(long double){accn} - (long double)ul{c} * (long double)urt{c}')
-            else:  # opmula
-                if c == 3:
-                    expr, exact = '0.0f', '0.0L'
-                else:
-                    expr, exact = f'ul{c} * urt{c}', f'(long double)ul{c} * (long double)urt{c}'
-            compute.append(f'float ur{c} = {expr};')
-            compute.append(f'ulf[{c}] = fmacLane(ur{c}, {"true" if product_sum else "false"}, x.acc[{c}], '
-                           f'[&]() {{ return {exact}; }});')
-        if product_sum:
-            for c in lanes:
-                if operation == 'op':
-                    sl = f'norm(x.vf[{fs}][{cross_left[c]}])'
-                    sr = f'norm(x.vf[{ft}][{cross_right[c]}])'
-                else:
-                    sl = f'norm(x.vf[{fs}][{c}])'
-                    sr = 'ubc' if source in ('bc', 'q', 'i') else f'norm(x.vf[{ft}][{c}])'
-                compute.append(f'usticky |= productSticky({sl}, {sr});')
-        compute.append(f'x.fmacFlags(t, ulf, {dest}u, usticky);')
+            compute.append(f'const float ur{c} = urv[{c}];')
         if target == 'acc':
             for c in lanes:
                 write.append(f'x.acc[{c}] = ur{c};')

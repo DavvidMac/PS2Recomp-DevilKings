@@ -20,6 +20,12 @@
 #include <cstring>
 #include <limits>
 
+#if defined(USE_SSE2NEON)
+#include "sse2neon.h"
+#else
+#include <immintrin.h>
+#endif
+
 // Hot helpers are forced inline into the (very large) translated run functions,
 // where the inliner would otherwise give up; their rare slow paths stay out of line.
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -147,6 +153,39 @@ namespace ps2x::vu1c
         return exactFlags(product, static_cast<long double>(left) * static_cast<long double>(right)) & 0xFu;
     }
 
+    // DEST lanes (x = 8 ... w = 1) as vector lane bits (x = 1 ... w = 8). The mapping
+    // reverses four bits, so it also turns lane bits back into DEST order.
+    constexpr uint32_t destLaneBits(uint32_t dest)
+    {
+        return ((dest >> 3) & 1u) | ((dest >> 1) & 2u) | ((dest << 1) & 4u) | ((dest << 3) & 8u);
+    }
+
+    // norm() on four lanes.
+    inline __m128 norm4(__m128 value)
+    {
+        const __m128i bits = _mm_castps_si128(value);
+        const __m128i exponent = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+        const __m128i sign = _mm_and_si128(bits, _mm_set1_epi32(static_cast<int>(0x80000000u)));
+        const __m128i zeroExponent = _mm_cmpeq_epi32(exponent, _mm_setzero_si128());
+        const __m128i maxExponent = _mm_cmpeq_epi32(exponent, _mm_set1_epi32(0x7F800000));
+        __m128i result = _mm_blendv_epi8(bits, sign, zeroExponent);
+        result = _mm_blendv_epi8(result, _mm_or_si128(sign, _mm_set1_epi32(0x7F7FFFFF)), maxExponent);
+        return _mm_castsi128_ps(result);
+    }
+
+    // Biased exponents of four floats.
+    inline __m128i exponents4(__m128 value)
+    {
+        return _mm_srli_epi32(_mm_slli_epi32(_mm_castps_si128(value), 1), 24);
+    }
+
+    // Lanes whose exponent is in [2, 253]: there fmacLane and productSticky report only the sign.
+    inline __m128i midRange4(__m128i exponent)
+    {
+        return _mm_and_si128(_mm_cmpgt_epi32(exponent, _mm_set1_epi32(1)),
+                             _mm_cmplt_epi32(exponent, _mm_set1_epi32(254)));
+    }
+
     // Same as the FTOI helper in ps2_vu1_upper.cpp.
     inline int32_t floatToInt(float value, float scale)
     {
@@ -199,6 +238,18 @@ namespace ps2x::vu1c
         bool writesStatus = false;
         bool writesSticky = false;
         bool writesClip = false;
+    };
+
+    // FMAC operations translated with Exec::fmacVec.
+    enum FmacKind : int
+    {
+        kFmacAdd,
+        kFmacSub,
+        kFmacMul,
+        kFmacMadd,
+        kFmacMsub,
+        kFmacOpmsub,
+        kFmacOpmula
     };
 
     enum class Exit : uint8_t
@@ -370,11 +421,23 @@ namespace ps2x::vu1c
             }
         }
 
+        // Queued writes still in flight at cycle t (ready cycles never decrease).
+        uint32_t flagsInFlight(uint64_t t) const
+        {
+            uint32_t count = 0u;
+            while (count < flagCount && flags[(flagHead + flagCount - 1u - count) & 15u].ready > t)
+                ++count;
+            return count;
+        }
+
         PS2X_VU1C_INLINE FlagEntry *pushFlag(uint64_t t)
         {
-            // Entries due by now have left the interpreter's slots before this issue.
-            commitTo(t);
-            if (flagCount >= 8u)
+            // Writes are applied lazily, when an instruction reads flags or Q, at exits
+            // and when the queue fills up. They are applied in the same order either way,
+            // so every value the program or the interpreter observes is the same.
+            if (flagCount >= 12u)
+                commitTo(t);
+            if (flagCount >= 8u && flagsInFlight(t) >= 8u)
             {
                 // The interpreter has eight flag slots and stops the program when they overflow.
                 fail(0xFFFFFFFFu);
@@ -417,6 +480,103 @@ namespace ps2x::vu1c
                 entry->writesMac = true;
                 entry->writesStatus = true;
             }
+        }
+
+        // One FMAC instruction on all four lanes (only DEST lanes count): writes the results
+        // to out and queues the flags as fmacFlags does. left and right are the normalised
+        // operands, already broadcast or permuted. A lane whose result (and, for product
+        // sums, product) lies in the normal range reports only its sign in fmacLane and
+        // productSticky, so when every DEST lane does, the flags come from the sign bits;
+        // otherwise the lanes go through fmacLane and productSticky as the scalar code did.
+        template <int kKind, bool kProductSum>
+        PS2X_VU1C_INLINE void fmacVec(uint64_t t, uint8_t dest, __m128 left, __m128 right, float out[4])
+        {
+            constexpr bool kUsesAcc = kKind == kFmacMadd || kKind == kFmacMsub || kKind == kFmacOpmsub;
+            const __m128 accRaw = _mm_loadu_ps(acc);
+            const __m128 accNorm = kUsesAcc ? norm4(accRaw) : _mm_setzero_ps();
+            const __m128 product = _mm_mul_ps(left, right);
+            __m128 result;
+            if constexpr (kKind == kFmacAdd)
+                result = _mm_add_ps(left, right);
+            else if constexpr (kKind == kFmacSub)
+                result = _mm_sub_ps(left, right);
+            else if constexpr (kKind == kFmacMul || kKind == kFmacOpmula)
+                result = product;
+            else if constexpr (kKind == kFmacMadd)
+                result = _mm_add_ps(accNorm, product);
+            else
+                result = _mm_sub_ps(accNorm, product);
+            if constexpr (kKind == kFmacOpmsub || kKind == kFmacOpmula)
+                result = _mm_blend_ps(result, _mm_setzero_ps(), 0x8); // the cross product has no w
+            _mm_storeu_ps(out, result);
+            if (dest == 0u)
+                return;
+
+            const uint32_t lanes = destLaneBits(dest);
+            const __m128i resultExponent = exponents4(result);
+            __m128i fast = midRange4(resultExponent);
+            if constexpr (kProductSum)
+            {
+                fast = _mm_and_si128(fast, _mm_cmplt_epi32(exponents4(accRaw),
+                                                           _mm_add_epi32(resultExponent, _mm_set1_epi32(17))));
+                fast = _mm_and_si128(fast, midRange4(exponents4(product)));
+            }
+            if ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(fast))) & lanes) == lanes)
+            {
+                const uint32_t negative = static_cast<uint32_t>(_mm_movemask_ps(result)) & lanes;
+                uint32_t extraSticky = 0u;
+                if constexpr (kProductSum)
+                    extraSticky = (static_cast<uint32_t>(_mm_movemask_ps(product)) & lanes) != 0u ? 0x2u : 0u;
+                if (FlagEntry *entry = pushFlag(t))
+                {
+                    entry->mac = destLaneBits(negative) << 4; // S flags, x highest
+                    entry->status = negative != 0u ? 0x2u : 0u;
+                    entry->extraSticky = extraSticky;
+                    entry->writesMac = true;
+                    entry->writesStatus = true;
+                }
+                return;
+            }
+
+            float l[4], r[4], a[4];
+            _mm_storeu_ps(l, left);
+            _mm_storeu_ps(r, right);
+            _mm_storeu_ps(a, accNorm);
+            uint8_t laneFlags[4] = {0, 0, 0, 0};
+            for (uint32_t c = 0; c < 4u; ++c)
+            {
+                if ((dest & lane(c)) == 0u)
+                    continue;
+                laneFlags[c] = fmacLane(out[c], kProductSum, acc[c], [&]() -> long double
+                {
+                    const long double lv = l[c];
+                    const long double rv = r[c];
+                    if constexpr (kKind == kFmacAdd)
+                        return lv + rv;
+                    else if constexpr (kKind == kFmacSub)
+                        return lv - rv;
+                    else if constexpr (kKind == kFmacMul)
+                        return lv * rv;
+                    else if constexpr (kKind == kFmacMadd)
+                        return static_cast<long double>(a[c]) + lv * rv;
+                    else if constexpr (kKind == kFmacMsub)
+                        return static_cast<long double>(a[c]) - lv * rv;
+                    else if constexpr (kKind == kFmacOpmsub)
+                        return c == 3u ? 0.0L : static_cast<long double>(a[c]) - lv * rv;
+                    else
+                        return c == 3u ? 0.0L : lv * rv;
+                });
+            }
+            uint32_t sticky = 0u;
+            if constexpr (kProductSum)
+            {
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    if ((dest & lane(c)) != 0u)
+                        sticky |= productSticky(l[c], r[c]);
+                }
+            }
+            fmacFlags(t, laneFlags, dest, sticky);
         }
 
         void clipFlag(uint64_t t, uint32_t newClip)
@@ -657,6 +817,8 @@ namespace ps2x::vu1c
 
         void handoff(uint32_t pc)
         {
+            // Hand over only writes still in flight, as committing on every issue would.
+            commitTo(cycle);
             exitPc = pc;
             exit = Exit::Handoff;
         }
