@@ -1563,6 +1563,10 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const int kMaxChainTags = 1 << 20;
                     const size_t kMaxChainBytes = 64u * 1024u * 1024u;
                     std::vector<uint8_t> chainBuf;
+                    // Frame chains run to megabytes: start at the channel's previous size.
+                    const uint32_t channelIndex = ((channelBase >> 12) - 0x8u) & 0xFu;
+                    size_t &lastChainBytes = m_lastChainBytes[channelIndex < 10u ? channelIndex : 0u];
+                    chainBuf.reserve(lastChainBytes + lastChainBytes / 8u);
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
@@ -1762,6 +1766,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
                     kickBytes = chainBuf.size();
+                    lastChainBytes = chainBuf.size();
                     if (!chainBuf.empty())
                     {
                         PendingTransfer pt;
@@ -2567,13 +2572,12 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
         flushMaskedPath3Packets(false);
     }
 
-    if (m_gifArbiter)
+    if (m_gifArbiter && drainImmediately)
+        m_gifArbiter->submitAndDrain(pathId, data, sizeBytes, path2DirectHl);
+    else if (m_gifArbiter)
         m_gifArbiter->submit(pathId, data, sizeBytes, path2DirectHl);
     else if (m_gifPacketCallback)
         m_gifPacketCallback(data, sizeBytes);
-
-    if (m_gifArbiter && drainImmediately)
-        m_gifArbiter->drain();
 }
 
 void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)

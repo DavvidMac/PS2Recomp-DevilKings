@@ -32,6 +32,19 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
     m_queue.push_back(std::move(pkt));
 }
 
+void GifArbiter::submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl)
+{
+    if (!m_queue.empty())
+    {
+        submit(pathId, data, sizeBytes, path2DirectHl);
+        drain();
+        return;
+    }
+    if (!data || sizeBytes < 16 || !m_processFn)
+        return;
+    m_processFn(data, sizeBytes);
+}
+
 void GifArbiter::drain()
 {
     if (!m_processFn)

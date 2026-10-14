@@ -462,6 +462,8 @@ public:
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
     };
+    // Size of the last chain gathered per channel (DMA channel index): the next one reserves it.
+    std::array<size_t, 10> m_lastChainBytes{};
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif0Transfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;
