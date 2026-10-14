@@ -1376,6 +1376,13 @@ namespace
         mem.writeIORegister(channelBase + 0x10u, madr);
         mem.writeIORegister(channelBase + 0x30u, tadr);
         mem.writeIORegister(channelBase + 0x00u, chcr);
+        if (channelBase == 0x10009000u && mem.vif1Async())
+        {
+            // Queued on the VIF1 thread: it completes, and its DMAC handlers run, later.
+            std::lock_guard<std::mutex> lock(g_dmaStubMutex);
+            g_dmaPendingPolls[channelBase] = 1;
+            return 0;
+        }
         mem.processPendingTransfers();
 
         std::vector<uint32_t> completedCauses = mem.consumeCompletedDmacCauses();
@@ -1479,6 +1486,12 @@ namespace
 
         const uint32_t chcr = runtime->memory().readIORegister(channelBase + 0x00u);
         const bool hwBusy = (chcr & 0x100u) != 0;
+        if (runtime->memory().vif1Async())
+        {
+            // Reading CHCR waited for the VIF1 thread; run the handlers of what completed.
+            for (const uint32_t completedCause : runtime->memory().consumeCompletedDmacCauses())
+                ps2_syscalls::dispatchDmacHandlersForCause(rdram, runtime, completedCause);
+        }
         return ((modelBusy || hwBusy) && mode != 0) ? 1 : 0;
     }
 

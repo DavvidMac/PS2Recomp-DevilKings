@@ -497,6 +497,7 @@ void EeScheduler::dumpThreadsForDiagnostics() const
         if (pathStart && *pathStart == ':' && m_vsyncTick == dumpTick)
         {
             const std::string path = pathStart + 1;
+            m_runtime.memory().syncVif1();
             if (std::FILE *file = std::fopen(path.c_str(), "wb"))
             {
                 std::fwrite(m_runtime.memory().getVU1Data(), 1, PS2_VU1_DATA_SIZE, file);
@@ -2090,6 +2091,9 @@ void EeScheduler::processEvent(const EeEvent &event)
         dispatchIrq(false, 3u);
         break;
     case EeEventType::Dmac:
+        // The VIF1 thread (PS2X_VIF1_THREAD) finished its queue: complete the transfers.
+        m_runtime.memory().pollVif1();
+        m_runtime.drainCompletedDmacHandlers(m_rdram);
         break;
     case EeEventType::Alarm:
     {

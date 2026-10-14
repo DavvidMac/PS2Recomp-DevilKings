@@ -5,6 +5,8 @@ namespace ps2_syscalls
 {
     void GsSetCrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (runtime)
+            runtime->memory().syncVif1();
         int interlaced = getRegU32(ctx, 4); // $a0 - 0=non-interlaced, 1=interlaced
         int videoMode = getRegU32(ctx, 5);  // $a1 - 0=NTSC, 1=PAL, 2=VESA, 3=HiVision
         int frameMode = getRegU32(ctx, 6);  // $a2 - 0=field, 1=frame
@@ -60,6 +62,8 @@ namespace ps2_syscalls
 
     void GsPutIMR(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        if (runtime)
+            runtime->memory().syncVif1();
         const uint64_t newImr = GPR_U64(ctx, 4);
         uint64_t oldImr = 0;
         if (runtime)

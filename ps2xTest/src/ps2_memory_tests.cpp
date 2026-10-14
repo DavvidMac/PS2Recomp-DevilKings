@@ -9,11 +9,26 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 namespace
 {
+    // Sets or clears an environment variable read when a PS2Memory is constructed.
+    void setTestEnv(const char *name, const char *value)
+    {
+#if defined(_WIN32)
+        _putenv_s(name, value ? value : "");
+#else
+        if (value)
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+#endif
+    }
+
     uint32_t makeVifCmd(uint8_t opcode, uint8_t num, uint16_t imm)
     {
         return (static_cast<uint32_t>(opcode) << 24) |
@@ -1506,6 +1521,66 @@ void register_ps2_memory_tests()
             t.IsTrue(contentOk, "VIF1 DIRECT packet bytes should match payload");
             t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u, "VIF1 CHCR STR bit should be cleared after drain");
             t.Equals(mem.readIORegister(kVif1Ch + 0x20u), 0u, "VIF1 QWC should be cleared after drain");
+        });
+
+        tc.Run("VIF1 DMA on the VIF1 thread completes when the EE looks at its results", [](TestCase &t)
+        {
+            setTestEnv("PS2X_VIF1_THREAD", "1");
+            PS2Memory mem;
+            setTestEnv("PS2X_VIF1_THREAD", nullptr);
+            t.IsTrue(mem.initialize(), "PS2Memory initialize should succeed");
+            t.IsTrue(mem.vif1Async(), "PS2X_VIF1_THREAD=1 should enable the VIF1 thread");
+
+            constexpr uint32_t kVif1Ch = 0x10009000u;
+            constexpr uint32_t kDStat = 0x1000E010u;
+            constexpr uint32_t kSrc = 0x00026000u;
+            uint8_t *rdram = mem.getRDRAM();
+            std::memset(rdram + kSrc, 0, 48u);
+
+            // STCYCL 1/1, UNPACK V4-32 of two qwords to VU1 qword 0x10, then DIRECT of one qword.
+            std::vector<uint8_t> packet;
+            auto appendWord = [&](uint32_t word)
+            {
+                const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&word);
+                packet.insert(packet.end(), bytes, bytes + 4);
+            };
+            appendWord(makeVifCmd(0x01u, 0u, 0x0101u));
+            appendWord(makeVifCmd(0x6Cu, 2u, 0x0010u));
+            for (uint32_t word = 0; word < 8u; ++word)
+                appendWord(0xA0000000u + word);
+            appendWord(0u);
+            appendWord(makeVifCmd(0x50u, 0u, 1u));
+            for (uint32_t word = 0; word < 4u; ++word)
+                appendWord(0xB0000000u + word);
+            std::memcpy(rdram + kSrc, packet.data(), packet.size());
+
+            std::vector<std::vector<uint8_t>> captured;
+            std::thread::id gifThread;
+            mem.setGifPacketCallback([&](const uint8_t *data, uint32_t sizeBytes)
+            {
+                gifThread = std::this_thread::get_id();
+                captured.emplace_back(data, data + sizeBytes);
+            });
+
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x10u, kSrc), "write VIF1 MADR should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x20u, static_cast<uint32_t>(packet.size() / 16u)),
+                     "write VIF1 QWC should succeed");
+            t.IsTrue(mem.writeIORegister(kVif1Ch + 0x00u, 0x100u), "write VIF1 CHCR STR should succeed");
+            // The source may change once the transfer is queued: it was copied at the kick.
+            std::memset(rdram + kSrc, 0xEE, packet.size());
+
+            // Reading VU1 memory waits for the transfer.
+            bool unpacked = true;
+            for (uint32_t word = 0; word < 8u; ++word)
+                unpacked = unpacked && mem.read32(PS2_VU1_DATA_BASE + 0x100u + word * 4u) == 0xA0000000u + word;
+            t.IsTrue(unpacked, "UNPACK on the VIF1 thread should land in VU1 memory before the EE reads it");
+            t.Equals(captured.size(), static_cast<size_t>(1u), "DIRECT should reach the GIF once");
+            t.IsTrue(gifThread != std::this_thread::get_id(), "the GIF packet should come from the VIF1 thread");
+            t.IsTrue((mem.readIORegister(kVif1Ch + 0x00u) & 0x100u) == 0u, "VIF1 CHCR STR should be clear once done");
+            t.IsTrue((mem.readIORegister(kDStat) & 0x2u) != 0u, "D_STAT CIS1 should be set once done");
+            const std::vector<uint32_t> causes = mem.consumeCompletedDmacCauses();
+            t.Equals(causes.size(), static_cast<size_t>(1u), "one VIF1 completion should be queued");
+            t.Equals(causes.empty() ? 0u : causes[0], 1u, "the completion cause should be VIF1");
         });
 
         tc.Run("VIF1 DMA chain preserves compact tag high bytes for DIRECT packets", [](TestCase &t)

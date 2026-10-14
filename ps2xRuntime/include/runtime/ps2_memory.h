@@ -10,6 +10,9 @@
 #include <atomic>
 #include <iostream>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
 
 #include "gs/ps2_gif_arbiter.h"
 #if defined(_MSC_VER)
@@ -361,6 +364,30 @@ public:
     void processPendingTransfers();
     std::vector<uint32_t> consumeCompletedDmacCauses();
 
+    // Asynchronous VIF1 DMA (PS2X_VIF1_THREAD=1): a VIF1 transfer is gathered when the EE
+    // starts it and then processed (VIF commands, the VU1 programs they start, PATH1/PATH2
+    // output) on a thread of its own while the EE runs on, as on the console. Every other
+    // way into the VIF1, VU1, GIF or GS calls syncVif1() first: it waits until the queued
+    // transfers are done and completes them (D1_CHCR.STR, D_STAT, DMAC handler causes).
+    bool vif1Async() const { return m_vif1Async; }
+    void syncVif1();
+    // Completes the queued VIF1 transfers if they have all finished, without waiting.
+    void pollVif1();
+    // Stops the VIF1 thread (before the VU1 and GS it drives go away).
+    void shutdownVif1();
+    // VU0 FBRST (VU1 D/T bit enables) for the VU1 run being started: the value when the
+    // transfer was queued on the VIF1 thread, the live one otherwise.
+    uint32_t vu1RunFbrst() const;
+    // D/T stop bits (VPU-STAT) of a VU1 run, applied to the EE context on the EE thread.
+    void noteVu1RunStop(uint32_t stopBits);
+    void setVu1ContextHooks(std::function<uint32_t()> liveFbrst, std::function<void(uint32_t)> applyStop)
+    {
+        m_liveFbrst = std::move(liveFbrst);
+        m_applyVu1Stop = std::move(applyStop);
+    }
+    // Called on the VIF1 thread when every queued transfer has finished (wakes the EE).
+    void setVif1IdleHook(std::function<void()> hook) { m_vif1IdleHook = std::move(hook); }
+
     int pollDmaRegisters();
 
     // Track code modifications for self-modifying code
@@ -440,6 +467,35 @@ public:
     std::vector<PendingTransfer> m_pendingVif1Transfers;
     std::mutex m_completedDmacMutex;
     std::vector<uint32_t> m_completedDmacCauses;
+
+    // Asynchronous VIF1 (see syncVif1).
+    struct Vif1Job
+    {
+        std::vector<uint8_t> data;
+        uint32_t fbrst = 0u;
+    };
+    bool m_vif1Async = false;
+    std::thread m_vif1Thread;
+    std::thread::id m_vif1Owner;           // the EE thread: queues transfers, completes them
+    std::mutex m_vif1Mutex;
+    std::condition_variable m_vif1WorkCv;
+    std::condition_variable m_vif1DoneCv;
+    std::deque<Vif1Job> m_vif1Jobs;        // m_vif1Mutex
+    bool m_vif1Stop = false;               // m_vif1Mutex
+    uint64_t m_vif1Finished = 0u;          // m_vif1Mutex
+    uint32_t m_vif1StopBits = 0u;          // m_vif1Mutex: D/T stop bits of the last VU1 run
+    bool m_vif1StopPending = false;        // m_vif1Mutex
+    std::atomic<uint64_t> m_vif1Queued{0u};
+    uint64_t m_vif1Applied = 0u;           // EE thread
+    uint32_t m_vif1JobFbrst = 0u;          // VIF1 thread
+    uint32_t m_vif1JobStopBits = 0u;       // VIF1 thread
+    bool m_vif1JobRanVu1 = false;          // VIF1 thread
+    std::function<uint32_t()> m_liveFbrst;
+    std::function<void(uint32_t)> m_applyVu1Stop;
+    std::function<void()> m_vif1IdleHook;
+    void vif1ThreadMain();
+    void queueVif1Transfers();
+    void applyVif1Completions();
 
     struct CodeRegion
     {

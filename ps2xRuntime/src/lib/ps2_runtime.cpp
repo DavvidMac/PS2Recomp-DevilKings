@@ -784,6 +784,7 @@ PS2Runtime::~PS2Runtime()
     try
     {
         requestStop();
+        m_memory.shutdownVif1();
         g_spu2AudioSource.store(nullptr);
 #if !defined(PLATFORM_VITA)
         if (IsAudioDeviceReady() && IsAudioStreamValid(g_spu2Stream))
@@ -915,6 +916,8 @@ bool PS2Runtime::isIopMemoryRange(uint32_t address, size_t size) const
 
 bool PS2Runtime::syncCoreSubsystems()
 {
+    // The GS helpers that call this touch GS state: queued VIF1 transfers come first.
+    m_memory.syncVif1();
     uint8_t *const rdram = m_memory.getRDRAM();
     uint8_t *const gsVram = m_memory.getGSVRAM();
     if (!rdram || !gsVram)
@@ -931,42 +934,46 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+    // VU1 runs read the D/T enables from FBRST and report D/T stops in VPU-STAT of the EE
+    // context; with PS2X_VIF1_THREAD they run on the VIF1 thread, so PS2Memory hands them a
+    // copy of FBRST taken when the transfer was queued and applies the stops on the EE thread.
+    m_memory.setVu1ContextHooks(
+        [this]() -> uint32_t
+        {
+            R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            return (cpuContext ? cpuContext : &m_cpuContext)->vu0_fbrst;
+        },
+        [this](uint32_t stopBits)
+        {
+            R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
+            if (!cpuContext)
+                cpuContext = &m_cpuContext;
+            cpuContext->vu0_vpu_stat = (cpuContext->vu0_vpu_stat & ~0x0600u) | stopBits;
+        });
+    m_memory.setVif1IdleHook([this]()
+                             {
+                                 if (m_eeScheduler)
+                                     m_eeScheduler->postEvent(EeEvent{EeEventType::Dmac, 1u, 0u}); });
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
-                                     {
-                                         cpuContext = &m_cpuContext;
-                                     }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = m_memory.vu1RunFbrst();
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.execute(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                    m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     m_memory.noteVu1RunStop((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
-                                     R5900Context *cpuContext = m_eeScheduler ? m_eeScheduler->currentContext() : nullptr;
-                                     if (!cpuContext)
-                                     {
-                                         cpuContext = &m_cpuContext;
-                                     }
-                                     m_vu1.state().dBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 10)) != 0u;
-                                     m_vu1.state().tBitEnabled =
-                                         (cpuContext->vu0_fbrst & (1u << 11)) != 0u;
+                                     const uint32_t fbrst = m_memory.vu1RunFbrst();
+                                     m_vu1.state().dBitEnabled = (fbrst & (1u << 10)) != 0u;
+                                     m_vu1.state().tBitEnabled = (fbrst & (1u << 11)) != 0u;
                                      m_vu1.resume(m_memory.getVU1Code(), PS2_VU1_CODE_SIZE,
                                                   m_memory.getVU1Data(), PS2_VU1_DATA_SIZE,
                                                   m_gs, &m_memory, top, itop, 65536);
-                                     cpuContext->vu0_vpu_stat =
-                                         (cpuContext->vu0_vpu_stat & ~0x0600u) |
-                                         (m_vu1.state().stoppedByD ? 0x0200u : 0u) |
-                                         (m_vu1.state().stoppedByT ? 0x0400u : 0u); });
+                                     m_memory.noteVu1RunStop((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
+                                                             (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
     resetIop();
     m_vu0.reset();
     m_vu1.reset();
@@ -2531,6 +2538,7 @@ void PS2Runtime::kickGifDmaChainFromMMIO(uint8_t *rdram,
     constexpr uint32_t D_STAT = 0x1000E010u;
     constexpr uint32_t GIF_TADR = 0x1000A030u;
     constexpr uint32_t GIF_CHCR = 0x1000A000u;
+    m_memory.syncVif1();
 
     ps2TraceGuestWrite(rdram, D_PCR, 4u, dPcrValue, 0u, "WRITE32", ctx);
     m_memory.writeIORegister(D_PCR, dPcrValue);
@@ -2835,6 +2843,8 @@ void PS2Runtime::run()
     if (gameThread.joinable())
     {
         gameThread.join();
+        // The game thread may have been waiting for the VIF1 thread until it stopped.
+        m_memory.shutdownVif1();
     }
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
