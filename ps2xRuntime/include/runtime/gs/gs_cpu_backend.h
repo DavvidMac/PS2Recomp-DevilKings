@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_texture_page_cache.h"
 
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <condition_variable>
 #include <functional>
@@ -43,7 +44,13 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // Replay support (ps2_gs_replay): restores the palette a PS2X_GS_RECORD
+    // recording started with.
+    void RestoreClutForReplay(const std::array<uint16_t, 512> &clut, const std::array<uint32_t, 2> &clutCbp);
+
 private:
+    PresentationFrame PresentSnapshot(const GSPresentationRequest &request);
+    void NoteRecordedPresent(const GSPresentationRequest &request);
     void ResetUnlocked();
     void LoadClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
     uint32_t ReadVramUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const;
@@ -151,9 +158,22 @@ private:
         const GSPrimitiveBatch *batch = nullptr;
         DecodedTexture *texture = nullptr;
     };
+    // Why the pending list was rasterised (PS2X_GS_STATS).
+    enum class FlushReason : uint8_t
+    {
+        Hazard,
+        Clut,
+        Size,
+        Pinned,
+        Transfer,
+        Upload,
+        Present,
+        BatchEnd,
+        Count
+    };
     void QueueDrawUnlocked(const GSPrimitiveBatch &batch);
     void QueueClutUnlocked(const GSTex0Reg &tex0, const GSTexClutReg &texclut);
-    void FlushPendingDrawsUnlocked();
+    void FlushPendingDrawsUnlocked(FlushReason reason);
     void RunPendingBand(uint32_t band, uint32_t bandCount);
     void BandLoop(uint32_t band);
     std::vector<PendingDraw> m_pendingDraws;
@@ -222,7 +242,16 @@ private:
     void InvalidateDecodedTexturesUnlocked();
     DecodedTexture *PrepareTextureCacheUnlocked(const GSDrawState &state, bool cacheSmall);
     uint32_t DecodeTexelUnlocked(const GSDrawState &state, const std::array<uint16_t, 512> &clut, int u, int v);
+    void ConvertTexelsUnlocked(const GSDrawState &state, const std::array<uint16_t, 512> &clut,
+                               const uint32_t *raw, uint32_t *out, uint32_t count);
     uint32_t FetchDecodedTexelUnlocked(const GSDrawState &state, int u, int v);
+    void WaitForTileUnlocked(const GSDrawState &state, DecodedTexture &entry, uint32_t tileX, uint32_t tileY);
+    void DecodeTileUnlocked(const GSDrawState &state, DecodedTexture &entry, uint32_t tileX, uint32_t tileY,
+                            GSMem::TexturePageCache *cache);
+    // Set while band threads rasterise a list in which texture tiles may be decoded
+    // in parallel, straight from VRAM (see FlushPendingDrawsUnlocked).
+    bool m_parallelDecode = false;
+    std::atomic<bool> m_parallelDecoded{false};
 
     GSTransferCommand m_transfer{};
     GSTransferSnapshot m_transferState{};

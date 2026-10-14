@@ -255,6 +255,112 @@ namespace GSMem
         }
     }
 
+    namespace
+    {
+        template<PixelStorageMode psm>
+        void ReadRect(const typename PixelStorageTraits<psm>::PageLookupTableT& table, TexturePageCache* cache,
+                      const u8* data, u32 bp, u32 bw, u32 x0, u32 y0, u32 w, u32 h, u32* out, u32 stride)
+        {
+            using Traits = PixelStorageTraits<psm>;
+            using PackedT = typename Traits::PackedT;
+            constexpr u32 kPageMask = TexturePageCache::kPageSize - 1u;
+
+            // Texels come from the buffered page until the first texel on another page.
+            // That one reloads the buffer, and as VRAM does not change meanwhile, every
+            // later reload copies what VRAM holds now: those texels read VRAM directly.
+            const u32 bufferedPage = cache ? cache->PageBase() : UINT32_MAX;
+            bool buffered = cache != nullptr;
+            u32 lastAddress = 0u;
+            for (u32 row = 0; row < h; ++row)
+            {
+                for (u32 column = 0; column < w; ++column)
+                {
+                    const u32 pixel_addr = Traits::Address(table, bp, bw, x0 + column, y0 + row);
+                    const u32 bits = pixel_addr * UnpackedBitWidth(psm) + Traits::BitOffset();
+                    const u32 byte_addr = (bits / 8) & (MEMORY_SIZE - sizeof(PackedT));
+                    const u32 shift = bits % 8;
+                    const u8* source;
+                    if (buffered && (byte_addr & ~kPageMask) == bufferedPage)
+                    {
+                        source = cache->Bytes() + (byte_addr & kPageMask);
+                    }
+                    else
+                    {
+                        buffered = false;
+                        source = data + byte_addr;
+                    }
+                    PackedT v;
+                    std::memcpy(&v, source, sizeof(PackedT));
+
+                    u32 value;
+                    switch (psm)
+                    {
+                    case C24:
+                    case Z24:
+                        value = v & 0x00FFFFFF;
+                        break;
+                    case P4:
+                    case P4HL:
+                    case P4HH:
+                        value = (v >> shift) & 0x0F;
+                        break;
+                    default:
+                        value = v;
+                        break;
+                    }
+                    out[row * stride + column] = value;
+                    lastAddress = byte_addr;
+                }
+            }
+            if (cache && !buffered)
+            {
+                // The buffer ends up holding the last page read, freshly copied.
+                cache->Invalidate();
+                (void)cache->Resolve(data, lastAddress);
+            }
+        }
+    }
+
+    void ReadTextureRect(TexturePageCache* cache, const u8* data, u32 psm, u32 bp, u32 bw,
+                         u32 x0, u32 y0, u32 w, u32 h, u32* out, u32 stride)
+    {
+        switch (static_cast<PixelStorageMode>(psm & 0x3Fu))
+        {
+        case C32:
+            return ReadRect<C32>(PageTableC32, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case C24:
+            return ReadRect<C24>(PageTableC32, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case C16:
+            return ReadRect<C16>(PageTableC16, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case C16S:
+            return ReadRect<C16S>(PageTableC16S, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case P8:
+            return ReadRect<P8>(PageTableP8, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case P4:
+            return ReadRect<P4>(PageTableP4, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case P8H:
+            return ReadRect<P8H>(PageTableC32, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case P4HL:
+            return ReadRect<P4HL>(PageTableC32, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case P4HH:
+            return ReadRect<P4HH>(PageTableC32, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case Z32:
+            return ReadRect<Z32>(PageTableZ32, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case Z24:
+            return ReadRect<Z24>(PageTableZ32, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case Z16:
+            return ReadRect<Z16>(PageTableZ16, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        case Z16S:
+            return ReadRect<Z16S>(PageTableZ16S, cache, data, bp, bw, x0, y0, w, h, out, stride);
+        default:
+            // ReadTexture returns 0 without touching the buffer.
+            for (u32 row = 0; row < h; ++row)
+                for (u32 column = 0; column < w; ++column)
+                    out[row * stride + column] = 0u;
+            return;
+        }
+    }
+
     void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value)
     {
         PixelStorageTraits<C32>::Write(PageTableC32, data, bp, bw, x, y, value);

@@ -543,6 +543,13 @@ namespace GSMem
     // Shares swizzle, VRAM wrapping, and lane extraction with the direct reads.
     u32 ReadTexture(TexturePageCache& cache, const u8* data, u32 psm, u32 bp, u32 bw, u32 x, u32 y);
 
+    // Reads the w x h texels at (x0, y0) in row order into out[row * stride + column].
+    // Values and the final texture page buffer state are those of w * h ReadTexture
+    // calls in that order, as long as VRAM does not change in between. Without a
+    // buffer (cache == nullptr) the texels are read straight from VRAM.
+    void ReadTextureRect(TexturePageCache* cache, const u8* data, u32 psm, u32 bp, u32 bw,
+                         u32 x0, u32 y0, u32 w, u32 h, u32* out, u32 stride);
+
 	void WriteCT32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 	void WriteZ32(u8* data, u32 bp, u32 bw, u32 x, u32 y, u32 value);
 

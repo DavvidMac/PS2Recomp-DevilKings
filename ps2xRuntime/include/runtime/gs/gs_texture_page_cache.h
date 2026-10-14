@@ -17,6 +17,17 @@ namespace GSMem
             m_pageBase = UINT32_MAX;
         }
 
+        // Byte address of the buffered page, or UINT32_MAX when nothing is buffered.
+        uint32_t PageBase() const noexcept
+        {
+            return m_pageBase;
+        }
+
+        const uint8_t* Bytes() const noexcept
+        {
+            return m_bytes.data();
+        }
+
         // byteAddress is the wrapped, swizzled VRAM address. The returned
         // pointer is valid only until the next miss or invalidation.
         const uint8_t* Resolve(const uint8_t* vram, uint32_t byteAddress) noexcept

@@ -41,6 +41,8 @@ These debugging switches are read once at startup from the environment (some are
 | `PS2X_GS_ASYNC` | `1` or other | Enables asynchronous GS execution only when the first character is `1`; default off. |
 | `PS2X_GS_THREADS` | `<count>` | Sets GS worker band count, clamped to 1-16; default is half the hardware concurrency, at least 1. |
 | `PS2X_SEPARATE_ZBUFFER` | `1` or other | Enables a separate depth plane only when the first character is `1`; default off. |
+| `PS2X_GS_STATS` | Any value | About once a second prints `[gs-stats]`: queued draws, worker batches, rasterised lists (`flushes`, of which `inline` ran on the worker alone) and why each list was cut, texture tiles decoded ahead (`predecode`) or on first use, time waiting on the decode lock, busy shares of the worker and band threads, and how long the EE waited for a full queue, a pending presentation or a drain. |
+| `PS2X_GS_RECORD` | `<path>[:<vsync>[:<count>]]` | Records every call the GS frontend makes on the CPU backend, from the first presentation at or after VSync `<vsync>` (default 0) for `<count>` presentations (default 30), after a snapshot of VRAM and the palette; prints `[gs-record]`. `ps2_gs_replay <path> [--hash] [--repeat <n>]` (built with the GS cache tests) replays it, timing the rasteriser and hashing VRAM to compare builds. |
 
 ## IOP/audio/CD
 
