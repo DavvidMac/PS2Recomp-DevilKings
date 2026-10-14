@@ -1,0 +1,957 @@
+"""Translate a VU1 micro program image to C++ (ahead-of-time VU1 recompilation).
+
+usage: python -I vu1rec.py <out_dir> <image.bin> [<image.bin> ...]
+
+Each 16 KB micro memory image (as written by PS2X_VU1_CAPTURE) becomes
+<out_dir>/vu1prog_<name>.cpp, which registers itself with the runtime
+(ps2_vu1_compiled.h). At MSCAL/MSCNT time VU1Interpreter runs the translated
+code when micro memory matches the image, and the interpreter otherwise.
+
+The generated code reproduces VU1Interpreter exactly: instruction usage
+(stall sources and latencies) is decoded here the same way as
+decodeUpperUsage/decodeLowerUsage, and every instruction's arithmetic mirrors
+ps2_vu1_upper.cpp / ps2_vu1_lower.cpp. Programs using anything not handled
+here (EFU, R register, D/T breakpoints, branches in delay slots) are rejected
+and stay on the interpreter.
+"""
+import os
+import sys
+
+FMAC_LATENCY = 4
+ACC_FORWARD_LATENCY = 1
+
+
+class Reject(Exception):
+    pass
+
+
+def lane(component):
+    return 1 << (3 - component)
+
+
+def DEST(i):
+    return (i >> 21) & 0xF
+
+
+def FT(i):
+    return (i >> 16) & 0x1F
+
+
+def FS(i):
+    return (i >> 11) & 0x1F
+
+
+def FD(i):
+    return (i >> 6) & 0x1F
+
+
+def VIT(i):
+    return (i >> 16) & 0xF
+
+
+def VIS(i):
+    return (i >> 11) & 0xF
+
+
+def VID(i):
+    return (i >> 6) & 0xF
+
+
+def IMM11(i):
+    value = i & 0x7FF
+    return value - 0x800 if value & 0x400 else value
+
+
+class Usage:
+    def __init__(self):
+        self.vf_read = []          # [(reg, lanes)]
+        self.vf_write = (0, 0)     # (reg, lanes)
+        self.vi_read = 0
+        self.vi_write = 0
+        self.acc_read = 0
+        self.acc_write = 0
+        self.latency = 0
+        self.vf_latency = 0
+        self.vi_latency = 0
+        self.pipeline = 'none'
+        self.wait_q = False
+        self.wait_p = False
+        self.reads_clip = False
+        self.writes_clip = False
+        self.delays_branch = False
+        self.reserved = False
+
+    def add_vf_read(self, reg, lanes):
+        if lanes == 0:
+            return
+        for index, (existing, existing_lanes) in enumerate(self.vf_read):
+            if existing == reg:
+                self.vf_read[index] = (reg, existing_lanes | lanes)
+                return
+        if len(self.vf_read) < 2:
+            self.vf_read.append((reg, lanes))
+
+    def add_vf_write(self, reg, lanes):
+        if reg == 0 or lanes == 0:
+            return
+        current, current_lanes = self.vf_write
+        if current == 0:
+            self.vf_write = (reg, lanes)
+        elif current == reg:
+            self.vf_write = (reg, current_lanes | lanes)
+
+    def read_vi(self, reg):
+        if reg:
+            self.vi_read |= 1 << reg
+
+    def write_vi(self, reg):
+        if reg:
+            self.vi_write |= 1 << reg
+
+    def vf_read_lanes(self, reg):
+        for existing, lanes in self.vf_read:
+            if existing == reg:
+                return lanes
+        return 0
+
+
+PRODUCT_SUM_OPS = {0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x21, 0x23, 0x25, 0x27, 0x29, 0x2D, 0x2E}
+PRODUCT_SUM_SPECIAL = {0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x21, 0x23, 0x25, 0x27, 0x29, 0x2D}
+
+
+def upper_special(upper):
+    return (upper & 3) | ((upper >> 4) & 0x7C)
+
+
+def decode_upper(upper):
+    usage = Usage()
+    usage.pipeline = 'fmac'
+    usage.latency = FMAC_LATENCY
+    op = upper & 0x3F
+    dest, fs, ft, fd = DEST(upper), FS(upper), FT(upper), FD(upper)
+    if op <= 0x2F:
+        usage.add_vf_read(fs, dest)
+        usage.add_vf_write(fd, dest)
+        if op <= 0x1B:
+            usage.add_vf_read(ft, lane(op & 3))
+        elif op >= 0x28:
+            usage.add_vf_read(ft, 0xE if op == 0x2E else dest)
+        if op in PRODUCT_SUM_OPS:
+            usage.acc_read = dest
+        return usage
+    if op >= 0x3C:
+        special = upper_special(upper)
+        writes_acc = (special <= 0x0F or 0x18 <= special <= 0x1C or special == 0x1E or
+                      0x20 <= special <= 0x2A or 0x2C <= special <= 0x2E)
+        if writes_acc:
+            usage.add_vf_read(fs, dest)
+            if special <= 0x1B:
+                usage.add_vf_read(ft, lane(special & 3))
+            elif 0x28 <= special <= 0x2E:
+                usage.add_vf_read(ft, 0xE if special == 0x2E else dest)
+            usage.acc_write = dest
+            if special in PRODUCT_SUM_SPECIAL:
+                usage.acc_read = dest
+        elif 0x10 <= special <= 0x17 or special == 0x1D:
+            usage.add_vf_read(fs, dest)
+            usage.add_vf_write(ft, dest)
+        elif special == 0x1F:
+            usage.add_vf_read(fs, 0xE)
+            usage.add_vf_read(ft, 0x1)
+            usage.writes_clip = True
+        elif special not in (0x2F, 0x30):
+            usage.reserved = True
+        return usage
+    usage.reserved = True
+    return usage
+
+
+def lower_special(lower):
+    return (lower & 3) | ((lower >> 4) & 0x7C)
+
+
+def decode_lower(lower):
+    usage = Usage()
+    if lower in (0, 0x8000033C):
+        return usage
+    op_hi = (lower >> 25) & 0x7F
+    vf_t, vf_s = FT(lower), FS(lower)
+    vi_t, vi_s, vi_d = VIT(lower), VIS(lower), VID(lower)
+    dest = DEST(lower)
+    if op_hi == 0x00:
+        usage.pipeline, usage.latency = 'lsu', 4
+        usage.read_vi(vi_s)
+        usage.add_vf_write(vf_t, dest)
+    elif op_hi == 0x01:
+        usage.pipeline, usage.latency = 'lsu', 1
+        usage.read_vi(vi_t)
+        usage.add_vf_read(vf_s, dest)
+    elif op_hi == 0x04:
+        usage.pipeline, usage.latency = 'lsu', 4
+        usage.read_vi(vi_s)
+        usage.write_vi(vi_t)
+    elif op_hi == 0x05:
+        usage.pipeline, usage.latency = 'lsu', 1
+        usage.read_vi(vi_s)
+        usage.read_vi(vi_t)
+    elif op_hi in (0x08, 0x09):
+        usage.pipeline, usage.latency = 'ialu', 1
+        usage.delays_branch = True
+        usage.read_vi(vi_s)
+        usage.write_vi(vi_t)
+    elif op_hi in (0x10, 0x12, 0x13):
+        usage.pipeline, usage.latency = 'ialu', 1
+        usage.reads_clip = True
+        usage.write_vi(1)
+    elif op_hi == 0x11:
+        usage.pipeline, usage.latency = 'fmac', FMAC_LATENCY
+        usage.writes_clip = True
+    elif op_hi in (0x14, 0x16, 0x17):
+        usage.pipeline, usage.latency = 'ialu', 1
+        usage.write_vi(vi_t)
+    elif op_hi == 0x15:
+        usage.pipeline, usage.latency = 'fmac', FMAC_LATENCY
+    elif op_hi in (0x18, 0x1A, 0x1B):
+        usage.pipeline, usage.latency = 'ialu', 1
+        usage.read_vi(vi_s)
+        usage.write_vi(vi_t)
+    elif op_hi == 0x1C:
+        usage.pipeline, usage.latency = 'ialu', 1
+        usage.reads_clip = True
+        usage.write_vi(vi_t)
+    elif op_hi == 0x20:
+        usage.pipeline = 'branch'
+    elif op_hi == 0x21:
+        usage.pipeline, usage.latency = 'branch', 1
+        usage.write_vi(vi_t)
+    elif op_hi == 0x24:
+        usage.pipeline = 'branch'
+        usage.read_vi(vi_s)
+    elif op_hi == 0x25:
+        usage.pipeline, usage.latency = 'branch', 1
+        usage.read_vi(vi_s)
+        usage.write_vi(vi_t)
+    elif op_hi in (0x28, 0x29):
+        usage.pipeline = 'branch'
+        usage.read_vi(vi_s)
+        usage.read_vi(vi_t)
+    elif op_hi in (0x2C, 0x2D, 0x2E, 0x2F):
+        usage.pipeline = 'branch'
+        usage.read_vi(vi_s)
+    elif op_hi == 0x40:
+        direct = lower & 0x3F
+        if direct in (0x30, 0x31, 0x34, 0x35):
+            usage.pipeline, usage.latency = 'ialu', 1
+            usage.delays_branch = True
+            usage.read_vi(vi_s)
+            usage.read_vi(vi_t)
+            usage.write_vi(vi_d)
+        elif direct == 0x32:
+            usage.pipeline, usage.latency = 'ialu', 1
+            usage.delays_branch = True
+            usage.read_vi(vi_s)
+            usage.write_vi(vi_t)
+        elif direct < 0x3C:
+            usage.reserved = True
+        else:
+            special = lower_special(lower)
+            if special in (0x30, 0x31):
+                usage.pipeline, usage.latency = 'fmac', 4
+                usage.add_vf_read(vf_s, 0xF if special == 0x31 else dest)
+                usage.add_vf_write(vf_t, dest)
+            elif special in (0x34, 0x36):
+                usage.pipeline, usage.latency, usage.vi_latency = 'lsu', 4, 1
+                usage.delays_branch = True
+                usage.read_vi(vi_s)
+                usage.write_vi(vi_s)
+                usage.add_vf_write(vf_t, dest)
+            elif special in (0x35, 0x37):
+                usage.pipeline, usage.latency = 'lsu', 1
+                usage.delays_branch = True
+                usage.read_vi(vi_t)
+                usage.write_vi(vi_t)
+                usage.add_vf_read(vf_s, dest)
+            elif special == 0x38:
+                usage.pipeline, usage.latency = 'fdiv', 7
+                usage.add_vf_read(vf_s, lane((lower >> 21) & 3))
+                usage.add_vf_read(vf_t, lane((lower >> 23) & 3))
+            elif special == 0x39:
+                usage.pipeline, usage.latency = 'fdiv', 7
+                usage.add_vf_read(vf_t, lane((lower >> 23) & 3))
+            elif special == 0x3A:
+                usage.pipeline, usage.latency = 'fdiv', 13
+                usage.add_vf_read(vf_s, lane((lower >> 21) & 3))
+                usage.add_vf_read(vf_t, lane((lower >> 23) & 3))
+            elif special == 0x3B:
+                usage.pipeline = 'fdiv'
+                usage.wait_q = True
+            elif special == 0x3C:
+                usage.pipeline, usage.latency = 'ialu', 1
+                usage.delays_branch = True
+                usage.add_vf_read(vf_s, lane((lower >> 21) & 3))
+                usage.write_vi(vi_t)
+            elif special == 0x3D:
+                usage.pipeline, usage.latency = 'fmac', 4
+                usage.read_vi(vi_s)
+                usage.add_vf_write(vf_t, dest)
+            elif special == 0x3E:
+                usage.pipeline, usage.latency = 'lsu', 4
+                usage.read_vi(vi_s)
+                usage.write_vi(vi_t)
+            elif special == 0x3F:
+                usage.pipeline, usage.latency = 'lsu', 1
+                usage.read_vi(vi_s)
+                usage.read_vi(vi_t)
+            elif special in (0x68, 0x69):
+                usage.pipeline, usage.latency = 'ialu', 1
+                usage.write_vi(vi_t)
+            elif special == 0x6C:
+                usage.pipeline, usage.latency = 'xgkick', 2
+                usage.read_vi(vi_s)
+            else:
+                # R register, MFP, EFU and WAITP are not translated.
+                usage.reserved = True
+    else:
+        usage.reserved = True
+    return usage
+
+
+BRANCH_OPS = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
+
+
+class Pair:
+    def __init__(self, image, pc):
+        self.pc = pc
+        self.lower = int.from_bytes(image[pc:pc + 4], 'little')
+        self.upper = int.from_bytes(image[pc + 4:pc + 8], 'little')
+        self.i_bit = bool(self.upper & 0x80000000)
+        self.e_bit = bool(self.upper & 0x40000000)
+        self.d_bit = bool(self.upper & 0x10000000)
+        self.t_bit = bool(self.upper & 0x08000000)
+        self.up = decode_upper(self.upper)
+        self.lo = decode_lower(self.lower) if not self.i_bit else Usage()
+        up_reg = self.up.vf_write[0]
+        self.shadow = 0
+        self.suppressed = 0
+        if up_reg and (self.lo.vf_read_lanes(up_reg) or self.lo.vf_write[0] == up_reg):
+            self.shadow = up_reg
+            if self.lo.vf_write[0] == up_reg:
+                self.suppressed = up_reg
+        self.op_hi = (self.lower >> 25) & 0x7F
+        self.is_branch = not self.i_bit and self.op_hi in BRANCH_OPS
+
+    def branch_target(self):
+        return (self.pc + 8 + IMM11(self.lower) * 8) & 0x3FFF
+
+
+def analyse(image):
+    """Reachable pairs from PC 0, MSCNT resume points and BAL/JALR return points."""
+    size = len(image)
+    pairs = {}
+
+    def pair(pc):
+        if pc not in pairs:
+            pairs[pc] = Pair(image, pc)
+        return pairs[pc]
+
+    def check_slot(slot):
+        if slot.is_branch or slot.e_bit:
+            raise Reject(f'branch or E bit in a delay slot at {slot.pc:04x}')
+        if slot.d_bit or slot.t_bit:
+            raise Reject(f'D/T bit at {slot.pc:04x}')
+        if slot.up.reserved or slot.lo.reserved:
+            raise Reject(f'unsupported instruction at {slot.pc:04x}: {slot.upper:08x} {slot.lower:08x}')
+
+    roots = [0]
+    returns = set()
+    seen = set()
+    while roots:
+        start = roots.pop()
+        work = [start]
+        while work:
+            pc = work.pop()
+            if pc in seen or pc + 8 > size:
+                continue
+            seen.add(pc)
+            p = pair(pc)
+            if p.d_bit or p.t_bit:
+                raise Reject(f'D/T bit at {pc:04x}')
+            if p.up.reserved or p.lo.reserved:
+                raise Reject(f'unsupported instruction at {pc:04x}: {p.upper:08x} {p.lower:08x}')
+            if p.e_bit:
+                if p.is_branch:
+                    raise Reject(f'branch with E bit at {pc:04x}')
+                slot = pair(pc + 8)
+                check_slot(slot)
+                roots.append((pc + 16) & 0x3FFF)
+                continue
+            if p.is_branch:
+                slot = pair(pc + 8)
+                check_slot(slot)
+                if p.op_hi in (0x21, 0x25):
+                    ret = (pc + 16) & 0x3FFF
+                    if ret not in returns:
+                        returns.add(ret)
+                        roots.append(ret)
+                if p.op_hi in (0x24, 0x25):
+                    continue  # targets are the BAL/JALR return points
+                work.append(p.branch_target())
+                if p.op_hi not in (0x20, 0x21):
+                    work.append((pc + 16) & 0x3FFF)
+                continue
+            work.append((pc + 8) & 0x3FFF)
+    labels = {pc: pairs[pc] for pc in sorted(seen)}
+    return labels, pairs
+
+
+# ----------------------------------------------------------------------------- code emission
+
+def f(x):
+    return f'x.vf[{x}]'
+
+
+def comps(mask):
+    return [c for c in range(4) if mask & lane(c)]
+
+
+class Emitter:
+    def __init__(self, name, pairs, all_pairs):
+        self.name = name
+        self.pairs = pairs
+        self.all_pairs = all_pairs
+        self.out = []
+
+    def line(self, text=''):
+        self.out.append(text)
+
+    # ---------------------------------------------------------------- upper
+
+    def upper_op(self, p, lines):
+        """Returns (code computing temporaries, code writing results) for the upper word."""
+        u = p.upper
+        op = u & 0x3F
+        dest, fs, ft, fd = DEST(u), FS(u), FT(u), FD(u)
+        compute, write = [], []
+        lanes = comps(dest)
+        if op >= 0x3C:
+            special = upper_special(u)
+            if special in (0x2F, 0x30):
+                return compute, write
+            if special == 0x1F:  # CLIP
+                compute.append(f'const uint32_t clipNew = x.noClip ? 0u : clipFlags(x.vf[{fs}], x.vf[{ft}][3]);')
+                compute.append('x.clipFlag(t, clipNew);')
+                return compute, write
+            if 0x10 <= special <= 0x13:  # ITOF
+                scale = ['', ' / 16.0f', ' / 4096.0f', ' / 32768.0f'][special & 3]
+                for c in lanes:
+                    compute.append(f'int32_t iv{c}; std::memcpy(&iv{c}, &x.vf[{fs}][{c}], 4); '
+                                   f'const float ur{c} = static_cast<float>(iv{c}){scale};')
+                if ft:
+                    for c in lanes:
+                        write.append(f'x.vf[{ft}][{c}] = ur{c};')
+                return compute, write
+            if 0x14 <= special <= 0x17:  # FTOI
+                scale = ['1.0f', '16.0f', '4096.0f', '32768.0f'][special & 3]
+                for c in lanes:
+                    compute.append(f'const float ur{c} = bitsFloat(static_cast<uint32_t>(floatToInt(norm(x.vf[{fs}][{c}]), {scale})));')
+                if ft:
+                    for c in lanes:
+                        write.append(f'x.vf[{ft}][{c}] = ur{c};')
+                return compute, write
+            if special == 0x1D:  # ABS
+                for c in lanes:
+                    compute.append(f'const float ur{c} = std::fabs(norm(x.vf[{fs}][{c}]));')
+                if ft:
+                    for c in lanes:
+                        write.append(f'x.vf[{ft}][{c}] = ur{c};')
+                return compute, write
+            kind, product_sum = self.fmac_kind(special, True)
+            return self.fmac(u, kind, product_sum, fs, ft, dest, 'acc', special)
+        if 0x10 <= op <= 0x17 or op in (0x1D, 0x1F, 0x2B, 0x2F):  # MAX / MINI
+            is_max = op in (0x10, 0x11, 0x12, 0x13, 0x1D, 0x2B)
+            cmp = '>' if is_max else '<'
+            for c in lanes:
+                if op <= 0x17:
+                    other = f'norm(x.vf[{ft}][{op & 3}])'
+                elif op in (0x1D, 0x1F):
+                    other = 'norm(x.i)'
+                else:
+                    other = f'norm(x.vf[{ft}][{c}])'
+                compute.append(f'const float us{c} = norm(x.vf[{fs}][{c}]); const float uo{c} = {other}; '
+                               f'const float ur{c} = (us{c} {cmp} uo{c}) ? us{c} : uo{c};')
+            if fd:
+                for c in lanes:
+                    write.append(f'x.vf[{fd}][{c}] = ur{c};')
+            return compute, write
+        kind, product_sum = self.fmac_kind(op, False)
+        return self.fmac(u, kind, product_sum, fs, ft, dest, 'vf', op)
+
+    def fmac_kind(self, op, special):
+        table = {}
+        for base, kind in ((0x00, 'add'), (0x04, 'sub'), (0x08, 'madd'), (0x0C, 'msub'), (0x18, 'mul')):
+            for bc in range(4):
+                table[base + bc] = (kind, 'bc')
+        table.update({0x1C: ('mul', 'q'), 0x1E: ('mul', 'i'), 0x20: ('add', 'q'), 0x21: ('madd', 'q'),
+                      0x22: ('add', 'i'), 0x23: ('madd', 'i'), 0x24: ('sub', 'q'), 0x25: ('msub', 'q'),
+                      0x26: ('sub', 'i'), 0x27: ('msub', 'i'), 0x28: ('add', 'v'), 0x29: ('madd', 'v'),
+                      0x2A: ('mul', 'v'), 0x2C: ('sub', 'v'), 0x2D: ('msub', 'v'), 0x2E: ('op', 'v')})
+        if op not in table:
+            raise Reject(f'unhandled FMAC op {op:02x}')
+        kind = table[op]
+        product_sum = (op in PRODUCT_SUM_SPECIAL) if special else (op in PRODUCT_SUM_OPS)
+        if special and op == 0x2E:
+            kind = ('opmula', 'v')
+        return kind, product_sum
+
+    def fmac(self, u, kind, product_sum, fs, ft, dest, target, op):
+        (operation, source) = kind
+        compute, write = [], []
+        lanes = comps(dest)
+        cross_left = [1, 2, 0, 3]
+        cross_right = [2, 0, 1, 3]
+        if source == 'bc':
+            compute.append(f'const float ubc = norm(x.vf[{ft}][{op & 3}]);')
+        elif source == 'q':
+            compute.append('const float ubc = norm(x.q);')
+        elif source == 'i':
+            compute.append('const float ubc = norm(x.i);')
+        compute.append('uint8_t ulf[4] = {0, 0, 0, 0};')
+        compute.append('uint32_t usticky = 0u;')
+        for c in lanes:
+            if operation in ('op', 'opmula'):
+                left = f'norm(x.vf[{fs}][{cross_left[c]}])'
+                right = f'norm(x.vf[{ft}][{cross_right[c]}])'
+            else:
+                left = f'norm(x.vf[{fs}][{c}])'
+                right = 'ubc' if source in ('bc', 'q', 'i') else f'norm(x.vf[{ft}][{c}])'
+            compute.append(f'const float ul{c} = {left}; const float urt{c} = {right};')
+            accn = f'norm(x.acc[{c}])'
+            if operation == 'add':
+                expr, exact = f'ul{c} + urt{c}', f'(long double)ul{c} + (long double)urt{c}'
+            elif operation == 'sub':
+                expr, exact = f'ul{c} - urt{c}', f'(long double)ul{c} - (long double)urt{c}'
+            elif operation == 'mul':
+                expr, exact = f'ul{c} * urt{c}', f'(long double)ul{c} * (long double)urt{c}'
+            elif operation == 'madd':
+                expr, exact = (f'{accn} + ul{c} * urt{c}',
+                               f'(long double){accn} + (long double)ul{c} * (long double)urt{c}')
+            elif operation == 'msub':
+                expr, exact = (f'{accn} - ul{c} * urt{c}',
+                               f'(long double){accn} - (long double)ul{c} * (long double)urt{c}')
+            elif operation == 'op':
+                if c == 3:
+                    expr, exact = '0.0f', '0.0L'
+                else:
+                    expr, exact = (f'{accn} - ul{c} * urt{c}',
+                                   f'(long double){accn} - (long double)ul{c} * (long double)urt{c}')
+            else:  # opmula
+                if c == 3:
+                    expr, exact = '0.0f', '0.0L'
+                else:
+                    expr, exact = f'ul{c} * urt{c}', f'(long double)ul{c} * (long double)urt{c}'
+            compute.append(f'float ur{c} = {expr};')
+            compute.append(f'ulf[{c}] = fmacLane(ur{c}, {"true" if product_sum else "false"}, x.acc[{c}], '
+                           f'[&]() {{ return {exact}; }});')
+        if product_sum:
+            for c in lanes:
+                if operation == 'op':
+                    sl = f'norm(x.vf[{fs}][{cross_left[c]}])'
+                    sr = f'norm(x.vf[{ft}][{cross_right[c]}])'
+                else:
+                    sl = f'norm(x.vf[{fs}][{c}])'
+                    sr = 'ubc' if source in ('bc', 'q', 'i') else f'norm(x.vf[{ft}][{c}])'
+                compute.append(f'usticky |= productSticky({sl}, {sr});')
+        compute.append(f'x.fmacFlags(t, ulf, {dest}u, usticky);')
+        if target == 'acc':
+            for c in lanes:
+                write.append(f'x.acc[{c}] = ur{c};')
+        else:
+            fd = FD(u)
+            if fd:
+                for c in lanes:
+                    write.append(f'x.vf[{fd}][{c}] = ur{c};')
+        return compute, write
+
+    # ---------------------------------------------------------------- lower
+
+    def lower_op(self, p):
+        """Returns (compute, write, branch) code; branch describes control flow."""
+        l = p.lower
+        compute, write = [], []
+        branch = None
+        if p.i_bit or l in (0, 0x8000033C):
+            return compute, write, branch
+        op_hi = p.op_hi
+        vf_t, vf_s = FT(l), FS(l)
+        vi_t, vi_s, vi_d = VIT(l), VIS(l), VID(l)
+        dest = DEST(l)
+        lanes = comps(dest)
+        imm = IMM11(l)
+
+        def vi_result(reg, expr):
+            if reg:
+                compute.append(f'const int32_t lvi = {expr};')
+                write.append(f'x.vi[{reg}] = static_cast<int16_t>(lvi);')
+
+        def vf_result(reg, values):
+            for c in lanes:
+                compute.append(f'const float lr{c} = {values[c]};')
+            if reg and p.suppressed != reg:
+                for c in lanes:
+                    write.append(f'x.vf[{reg}][{c}] = lr{c};')
+
+        def branch_vi(reg):
+            if reg == 0:
+                return '0'
+            return f'(x.viBackupValid && x.viBackupReg == {reg} ? x.viBackupValue : x.vi[{reg}])'
+
+        if op_hi == 0x00:  # LQ
+            compute.append(f'float lm[4]; x.load(x.address(x.vi[{vi_s}], {imm}), lm);')
+            vf_result(vf_t, [f'lm[{c}]' for c in range(4)])
+        elif op_hi == 0x01:  # SQ
+            compute.append(f'x.storeVf(t, x.address(x.vi[{vi_t}], {imm}), {vf_s}, {dest}u);')
+        elif op_hi == 0x04:  # ILW
+            vi_result(vi_t, f'x.loadVi(x.address(x.vi[{vi_s}], {imm}), {dest}u)')
+        elif op_hi == 0x05:  # ISW
+            compute.append(f'x.storeVi(t, x.address(x.vi[{vi_s}], {imm}), x.vi[{vi_t}], {dest}u);')
+        elif op_hi in (0x08, 0x09):  # IADDIU / ISUBIU
+            imm15 = (l & 0x7FF) | ((l >> 10) & 0x7800)
+            sign = '+' if op_hi == 0x08 else '-'
+            vi_result(vi_t, f'static_cast<int16_t>(x.vi[{vi_s}] {sign} {imm15})')
+        elif op_hi in (0x10, 0x12, 0x13):  # FCEQ / FCAND / FCOR
+            imm24 = l & 0xFFFFFF
+            expr = {0x10: f'((x.clip & 0xFFFFFFu) == 0x{imm24:06x}u) ? 1 : 0',
+                    0x12: f'((x.clip & 0x{imm24:06x}u) != 0u) ? 1 : 0',
+                    0x13: f'((x.clip | 0x{imm24:06x}u) == 0xFFFFFFu) ? 1 : 0'}[op_hi]
+            vi_result(1, expr)
+        elif op_hi == 0x11:  # FCSET
+            compute.append(f'x.fcset(t, 0x{l & 0xFFFFFF:06x}u);')
+        elif op_hi in (0x14, 0x15, 0x16, 0x17):  # FSEQ / FSSET / FSAND / FSOR
+            imm12 = (((l >> 21) & 1) << 11) | (l & 0x7FF)
+            if op_hi == 0x15:
+                compute.append(f'x.fsset(t, 0x{imm12:03x}u);')
+            else:
+                expr = {0x14: f'((x.status & 0xFFFu) == 0x{imm12:03x}u) ? 1 : 0',
+                        0x16: f'static_cast<int32_t>((x.status & 0xFFFu) & 0x{imm12:03x}u)',
+                        0x17: f'static_cast<int32_t>((x.status & 0xFFFu) | 0x{imm12:03x}u)'}[op_hi]
+                vi_result(vi_t, expr)
+        elif op_hi in (0x18, 0x1A, 0x1B):  # FMEQ / FMAND / FMOR
+            src = f'static_cast<uint32_t>(static_cast<uint16_t>(x.vi[{vi_s}]))'
+            expr = {0x18: f'((x.mac & 0xFFFFu) == {src}) ? 1 : 0',
+                    0x1A: f'static_cast<int32_t>(x.mac & {src})',
+                    0x1B: f'static_cast<int32_t>(x.mac | {src})'}[op_hi]
+            vi_result(vi_t, expr)
+        elif op_hi == 0x1C:  # FCGET
+            vi_result(vi_t, 'static_cast<int32_t>(x.clip & 0x0FFFu)')
+        elif op_hi in (0x20, 0x21):  # B / BAL
+            if op_hi == 0x21:
+                vi_result(vi_t, str((p.pc + 16) // 8))
+            branch = ('always', p.branch_target())
+        elif op_hi in (0x24, 0x25):  # JR / JALR
+            compute.append(f'const uint32_t ljump = (static_cast<uint32_t>(static_cast<uint16_t>({branch_vi(vi_s)})) * 8u) & 0x3FFFu;')
+            if op_hi == 0x25:
+                vi_result(vi_t, str((p.pc + 16) // 8))
+            branch = ('jump', 'ljump')
+        elif op_hi in (0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F):
+            a = f'static_cast<int16_t>({branch_vi(vi_s)})'
+            b = f'static_cast<int16_t>({branch_vi(vi_t)})'
+            cond = {0x28: f'{a} == {b}', 0x29: f'{a} != {b}', 0x2C: f'{a} < 0', 0x2D: f'{a} > 0',
+                    0x2E: f'{a} <= 0', 0x2F: f'{a} >= 0'}[op_hi]
+            compute.append(f'const bool ltaken = {cond};')
+            branch = ('cond', p.branch_target())
+        elif op_hi == 0x40:
+            direct = l & 0x3F
+            if direct == 0x30:
+                vi_result(vi_d, f'static_cast<int16_t>(x.vi[{vi_s}] + x.vi[{vi_t}])')
+            elif direct == 0x31:
+                vi_result(vi_d, f'static_cast<int16_t>(x.vi[{vi_s}] - x.vi[{vi_t}])')
+            elif direct == 0x32:
+                imm5 = (l >> 6) & 0x1F
+                imm5 = imm5 - 32 if imm5 & 0x10 else imm5
+                vi_result(vi_t, f'static_cast<int16_t>(x.vi[{vi_s}] + ({imm5}))')
+            elif direct == 0x34:
+                vi_result(vi_d, f'x.vi[{vi_s}] & x.vi[{vi_t}]')
+            elif direct == 0x35:
+                vi_result(vi_d, f'x.vi[{vi_s}] | x.vi[{vi_t}]')
+            else:
+                special = lower_special(l)
+                if special == 0x30:  # MOVE
+                    vf_result(vf_t, [f'x.vf[{vf_s}][{c}]' for c in range(4)])
+                elif special == 0x31:  # MR32
+                    vf_result(vf_t, [f'x.vf[{vf_s}][{(c + 1) % 4}]' for c in range(4)])
+                elif special in (0x34, 0x36):  # LQI / LQD
+                    if special == 0x34:
+                        compute.append(f'float lm[4]; x.load(x.addressU16(x.vi[{vi_s}]), lm);')
+                        new_vi = f'static_cast<int16_t>(x.vi[{vi_s}] + 1)'
+                    else:
+                        compute.append(f'const int32_t ldec = static_cast<int16_t>(x.vi[{vi_s}] - 1);')
+                        compute.append(f'float lm[4]; x.load(x.addressU16({"ldec" if vi_s else "x.vi[0]"}), lm);')
+                        new_vi = 'ldec'
+                    vf_result(vf_t, [f'lm[{c}]' for c in range(4)])
+                    if vi_s:
+                        vi_result(vi_s, new_vi)
+                elif special in (0x35, 0x37):  # SQI / SQD
+                    if special == 0x35:
+                        compute.append(f'x.storeVf(t, x.addressU16(x.vi[{vi_t}]), {vf_s}, {dest}u);')
+                        new_vi = f'static_cast<int16_t>(x.vi[{vi_t}] + 1)'
+                    else:
+                        compute.append(f'const int32_t ldec = static_cast<int16_t>(x.vi[{vi_t}] - 1);')
+                        compute.append(f'x.storeVf(t, x.addressU16({"ldec" if vi_t else "x.vi[0]"}), {vf_s}, {dest}u);')
+                        new_vi = 'ldec'
+                    if vi_t:
+                        vi_result(vi_t, new_vi)
+                elif special == 0x38:  # DIV
+                    fsf, ftf = (l >> 21) & 3, (l >> 23) & 3
+                    compute.append(f'const float lnum = norm(x.vf[{vf_s}][{fsf}]); const float lden = norm(x.vf[{vf_t}][{ftf}]);')
+                    compute.append('uint32_t ldi = 0u; float lq = 0.0f;')
+                    compute.append('if (lden == 0.0f) { ldi = lnum == 0.0f ? 0x10u : 0x20u; '
+                                   'lq = std::signbit(lnum) != std::signbit(lden) ? -std::numeric_limits<float>::max() '
+                                   ': std::numeric_limits<float>::max(); } else { lq = lnum / lden; }')
+                    compute.append('uint32_t lign = 0u; lq = normResult(lq, lign);')
+                    compute.append('x.queueQ(t, lq, 7u, ldi);')
+                elif special == 0x39:  # SQRT
+                    ftf = (l >> 23) & 3
+                    compute.append(f'const float lval = norm(x.vf[{vf_t}][{ftf}]);')
+                    compute.append('x.queueQ(t, std::sqrt(std::fabs(lval)), 7u, lval < 0.0f ? 0x10u : 0u);')
+                elif special == 0x3A:  # RSQRT
+                    fsf, ftf = (l >> 21) & 3, (l >> 23) & 3
+                    compute.append(f'const float lnum = norm(x.vf[{vf_s}][{fsf}]); const float lrad = norm(x.vf[{vf_t}][{ftf}]);')
+                    compute.append('const float lden = std::sqrt(std::fabs(lrad)); uint32_t ldi = lrad < 0.0f ? 0x10u : 0u; float lq = 0.0f;')
+                    compute.append('if (lden != 0.0f) lq = lnum / lden; else { ldi = lnum == 0.0f ? 0x10u : 0x20u; '
+                                   'lq = std::signbit(lnum) ? -std::numeric_limits<float>::max() : std::numeric_limits<float>::max(); }')
+                    compute.append('uint32_t lign = 0u; lq = normResult(lq, lign);')
+                    compute.append('x.queueQ(t, lq, 13u, ldi);')
+                elif special == 0x3B:  # WAITQ
+                    pass
+                elif special == 0x3C:  # MTIR
+                    comp = (l >> 21) & 3
+                    vi_result(vi_t, f'static_cast<int16_t>(floatBits(x.vf[{vf_s}][{comp}]) & 0xFFFFu)')
+                elif special == 0x3D:  # MFIR
+                    compute.append(f'const float lfi = bitsFloat(static_cast<uint32_t>(static_cast<int32_t>(static_cast<int16_t>(x.vi[{vi_s}] & 0xFFFF))));')
+                    vf_result(vf_t, ['lfi'] * 4)
+                elif special == 0x3E:  # ILWR
+                    vi_result(vi_t, f'x.loadVi(x.addressU16(x.vi[{vi_s}]), {dest}u)')
+                elif special == 0x3F:  # ISWR
+                    compute.append(f'x.storeVi(t, x.addressU16(x.vi[{vi_s}]), x.vi[{vi_t}], {dest}u);')
+                elif special == 0x68:  # XTOP
+                    vi_result(vi_t, 'static_cast<int32_t>(x.top & 0x3FFu)')
+                elif special == 0x69:  # XITOP
+                    vi_result(vi_t, 'static_cast<int32_t>(x.itop & 0x3FFu)')
+                elif special == 0x6C:  # XGKICK
+                    compute.append(f'x.xgkick(t, x.vi[{vi_s}]);')
+                else:
+                    raise Reject(f'lower special {special:02x} at {p.pc:04x}')
+        else:
+            raise Reject(f'lower op {op_hi:02x} at {p.pc:04x}')
+        return compute, write, branch
+
+    # ---------------------------------------------------------------- one pair
+
+    def pair_code(self, p, in_delay_slot):
+        """C++ for one instruction pair, ending with x.cycle = t + 1."""
+        out = []
+        up_compute, up_write = self.upper_op(p, out)
+        lo_compute, lo_write, branch = self.lower_op(p)
+
+        out.append('t = x.cycle;')
+        for reg, lanes in p.up.vf_read + p.lo.vf_read:
+            if reg:
+                out.append(f't = x.vfStall(t, {reg}, {lanes}u);')
+        vi_reads = (p.up.vi_read | p.lo.vi_read) & 0xFFFE
+        for reg in range(1, 16):
+            if vi_reads & (1 << reg):
+                out.append(f't = std::max(t, x.viReady[{reg}]);')
+        acc_read = p.up.acc_read | p.lo.acc_read
+        if acc_read:
+            out.append(f't = x.accStall(t, {acc_read}u);')
+        if p.lo.pipeline == 'fdiv' or p.lo.wait_q:
+            out.append('if (x.fdivPending) t = std::max(t, x.fdivReady);')
+        if p.lo.pipeline == 'xgkick':
+            out.append('if (x.xgActive) t = std::max(t, x.xgFinish());')
+        if not in_delay_slot:
+            out.append(f'if (t >= x.budgetEnd) {{ x.handoff(0x{p.pc:04x}u); return; }}')
+
+        reads_q = False
+        if not p.i_bit or True:
+            u = p.upper
+            op = u & 0x3F
+            q_ops = {0x1C, 0x20, 0x21, 0x24, 0x25}
+            q_special = {0x1C, 0x20, 0x21, 0x24, 0x25}
+            if op >= 0x3C:
+                reads_q = upper_special(u) in q_special
+            else:
+                reads_q = op in q_ops
+        lower_reads_flags = (not p.i_bit) and p.op_hi in (0x10, 0x12, 0x13, 0x14, 0x16, 0x17, 0x18, 0x1A, 0x1B, 0x1C)
+        if reads_q or lower_reads_flags or p.lo.pipeline == 'fdiv':
+            out.append('x.commitTo(t);')
+
+        out.extend(up_compute)
+        out.extend(lo_compute)
+        if p.i_bit:
+            out.append(f'x.i = norm(bitsFloat(0x{p.lower:08x}u));')
+        out.extend(up_write)
+        out.extend(lo_write)
+
+        # Ready cycles, as markPairWrites.
+        lo_reg, lo_lanes = p.lo.vf_write
+        if lo_reg and p.suppressed != lo_reg:
+            lat = p.lo.vf_latency or p.lo.latency
+            out.append(f'x.vfWritten({lo_reg}, {lo_lanes}u, t + {lat}u);')
+        up_reg, up_lanes = p.up.vf_write
+        if up_reg:
+            lat = p.up.vf_latency or p.up.latency
+            out.append(f'x.vfWritten({up_reg}, {up_lanes}u, t + {lat}u);')
+        vi_writes = p.lo.vi_write & 0xFFFE
+        written_vi = 0
+        for reg in range(1, 16):
+            if vi_writes & (1 << reg):
+                lat = p.lo.vi_latency or p.lo.latency
+                out.append(f'x.viReady[{reg}] = t + {lat}u; x.noteReady(t + {lat}u);')
+                if not written_vi:
+                    written_vi = reg
+        if p.up.acc_write:
+            out.append(f'x.accWritten({p.up.acc_write}u, t + {ACC_FORWARD_LATENCY}u);')
+
+        # Branch-read quirk: the next pair's branch sees the old value of this pair's VI write.
+        if written_vi and p.lo.delays_branch:
+            # The old value is the one before this pair's write; recompute from the write list.
+            out.insert(self.find_first_write(out), f'const int32_t loldvi = x.vi[{written_vi}];')
+            out.append(f'x.viBackupValid = true; x.viBackupReg = {written_vi}; x.viBackupValue = loldvi;')
+        else:
+            out.append('x.viBackupValid = false;')
+        out.append('x.cycle = t + 1u;')
+        return out, branch
+
+    @staticmethod
+    def find_first_write(lines):
+        # Insert the old-VI capture before the first register write of the pair.
+        for index, text in enumerate(lines):
+            if text.startswith('x.vi[') and '=' in text and 'Ready' not in text:
+                return index
+        return len(lines)
+
+    # ---------------------------------------------------------------- whole program
+
+    def emit(self, image_name, image_bytes, code_bytes):
+        name = self.name
+        L = self.line
+        L('// Generated by ps2xRuntime/tools/vu1rec.py; do not edit.')
+        L(f'// Source image: {image_name}')
+        L('#include "runtime/ps2_vu1_compiled.h"')
+        L('')
+        L(f'namespace vu1prog_{name}')
+        L('{')
+        L('using namespace ps2x::vu1c;')
+        L('')
+        L(f'const uint8_t kImage[{code_bytes}] = {{')
+        for offset in range(0, code_bytes, 16):
+            chunk = ', '.join(f'0x{b:02x}' for b in image_bytes[offset:min(offset + 16, code_bytes)])
+            L(f'    {chunk},')
+        L('};')
+        L('')
+        L('void run(Exec &x, uint32_t entryPc)')
+        L('{')
+        L('    uint64_t t = 0;')
+        L('    switch (entryPc)')
+        L('    {')
+        for pc in self.pairs:
+            L(f'    case 0x{pc:04x}: goto P{pc:04x};')
+        L('    default: return;')
+        L('    }')
+        for pc, p in self.pairs.items():
+            L(f'P{pc:04x}: // up={p.upper:08x} lo={p.lower:08x}')
+            L('    {')
+            code, branch = self.pair_code(p, False)
+            for text in code:
+                L('        ' + text)
+            if p.e_bit:
+                slot = self.all_pairs[pc + 8]
+                slot_code, _ = self.pair_code(slot, True)
+                L(f'        // E-bit delay slot 0x{pc + 8:04x}')
+                for text in slot_code:
+                    L('        ' + text)
+                L(f'        x.end(x.cycle - 1u, 0x{(pc + 16) & 0x3FFF:04x}u);')
+                L('        return;')
+            elif branch:
+                kind, target = branch
+                if kind == 'cond':
+                    L('        const bool taken = ltaken;')
+                elif kind == 'jump':
+                    L('        const uint32_t jumpTarget = ljump;')
+                slot = self.all_pairs[pc + 8]
+                slot_code, _ = self.pair_code(slot, True)
+                L(f'        // delay slot 0x{pc + 8:04x}')
+                L('        {')
+                for text in slot_code:
+                    L('            ' + text)
+                L('        }')
+                if kind == 'always':
+                    L(f'        goto P{target:04x};')
+                elif kind == 'cond':
+                    L(f'        if (taken) goto P{target:04x};')
+                    L(f'        goto P{(pc + 16) & 0x3FFF:04x};')
+                else:
+                    L('        switch (jumpTarget)')
+                    L('        {')
+                    for other in self.pairs:
+                        L(f'        case 0x{other:04x}: goto P{other:04x};')
+                    L('        default: x.handoff(jumpTarget); return;')
+                    L('        }')
+            else:
+                nxt = (pc + 8) & 0x3FFF
+                if nxt in self.pairs:
+                    L(f'        goto P{nxt:04x};')
+                else:
+                    L(f'        x.handoff(0x{nxt:04x}u);')
+                    L('        return;')
+            L('    }')
+        L('}')
+        L('')
+        L(f'const Program kProgram{{"vu1prog_{name}", kImage, {code_bytes}u, run}};')
+        L('struct Registrar')
+        L('{')
+        L('    Registrar() { registerProgram(&kProgram); }')
+        L('} registrar;')
+        L('}')
+        return '\n'.join(self.out) + '\n'
+
+
+image_bytes_full = b''
+
+
+def translate(path, out_dir):
+    global image_bytes_full
+    image = open(path, 'rb').read()
+    image_bytes_full = image
+    pairs, all_pairs = analyse(image)
+    base = os.path.basename(path)
+    name = base.split('_')[-1].split('.')[0] if base.startswith('vu1code_') else os.path.splitext(base)[0]
+    code_bytes = max(pairs) + 8
+    for p in pairs.values():
+        if p.is_branch or p.e_bit:
+            code_bytes = max(code_bytes, p.pc + 16)
+    emitter = Emitter(name, pairs, all_pairs)
+    text = emitter.emit(base, image, code_bytes)
+    target = os.path.join(out_dir, f'vu1prog_{name}.cpp')
+    old = open(target, encoding='utf-8').read() if os.path.exists(target) else None
+    if old != text:
+        with open(target, 'w', encoding='utf-8', newline='\n') as out:
+            out.write(text)
+    return name, len(pairs), code_bytes
+
+
+def main():
+    if len(sys.argv) < 3:
+        raise SystemExit(__doc__)
+    out_dir = sys.argv[1]
+    os.makedirs(out_dir, exist_ok=True)
+    for path in sys.argv[2:]:
+        try:
+            name, count, size = translate(path, out_dir)
+            print(f'{os.path.basename(path)}: {count} pairs, {size} bytes -> vu1prog_{name}.cpp')
+        except Reject as error:
+            print(f'{os.path.basename(path)}: not translated ({error})')
+
+
+if __name__ == '__main__':
+    main()

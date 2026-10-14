@@ -4,9 +4,17 @@
 #include <array>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <vector>
 
 class GS;
 class PS2Memory;
+
+namespace ps2x::vu1c
+{
+    struct Exec;
+    struct Program;
+}
 
 struct VU1State
 {
@@ -46,6 +54,9 @@ public:
     };
 
     explicit VU1Interpreter(Unit unit = Unit::VU1);
+    ~VU1Interpreter();
+    VU1Interpreter(const VU1Interpreter &) = delete;
+    VU1Interpreter &operator=(const VU1Interpreter &) = delete;
 
     void reset();
 
@@ -250,9 +261,25 @@ private:
     bool m_pendingHaltD = false;
     bool m_pendingHaltT = false;
 
+    // Micro programs translated ahead of time (ps2_vu1_compiled.h).
+    struct CompiledVerification;
+    const ps2x::vu1c::Program *m_compiledProgram = nullptr;
+    uint64_t m_compiledGeneration = ~0ull;
+    std::unique_ptr<ps2x::vu1c::Exec> m_compiledExec;
+    std::unique_ptr<CompiledVerification> m_compiledVerification;
+    std::vector<uint8_t> *m_gifCapture = nullptr;
+
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
              GS &gs, PS2Memory *memory, uint32_t maxCycles);
+    const ps2x::vu1c::Program *compiledProgramFor(const uint8_t *vuCode, uint32_t codeSize, PS2Memory *memory);
+    bool runCompiled(const ps2x::vu1c::Program &program, uint8_t *vuData, uint32_t dataSize,
+                     uint64_t budgetEnd, std::vector<uint8_t> *gifCapture);
+    void exportCompiledState(ps2x::vu1c::Exec &x, uint8_t *vuData, uint32_t dataSize, uint64_t budgetEnd);
+    void importCompiledState(const ps2x::vu1c::Exec &x);
+    void beginCompiledVerification(const ps2x::vu1c::Program &program, uint8_t *vuData, uint32_t dataSize,
+                                   uint64_t budgetEnd);
+    void finishCompiledVerification(uint8_t *vuData, uint32_t dataSize, bool programEnded);
 
     InstructionUsage decodeUpperUsage(uint32_t upper) const;
     InstructionUsage decodeLowerUsage(uint32_t lower) const;

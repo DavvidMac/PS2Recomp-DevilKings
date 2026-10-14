@@ -1,4 +1,5 @@
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_compiled.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
@@ -13,6 +14,11 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <map>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 #include <ps2_log.h>
 
 #if defined(_MSC_VER) && !defined(__clang__)
@@ -74,6 +80,107 @@ namespace
         s_busy = {};
     }
 
+    // Diagnostics: PS2X_VU1_CAPTURE=<dir> identifies the VU1 micro memory image behind every
+    // MSCAL by content hash, saves each new image once as <dir>/vu1code_<hash>.bin and
+    // prints, every few seconds, how often each (image, start PC) pair ran.
+    const std::string &vu1CaptureDir()
+    {
+        static const std::string s_dir = []()
+        {
+            const char *value = std::getenv("PS2X_VU1_CAPTURE");
+            return std::string(value ? value : "");
+        }();
+        return s_dir;
+    }
+
+    uint64_t fnv1a64(const uint8_t *data, size_t size)
+    {
+        uint64_t hash = 1469598103934665603ull;
+        for (size_t i = 0; i < size; ++i)
+        {
+            hash ^= data[i];
+            hash *= 1099511628211ull;
+        }
+        return hash;
+    }
+
+    void captureVu1Program(const uint8_t *code, uint32_t codeSize, uint64_t generation, uint32_t startPC)
+    {
+        using Clock = std::chrono::steady_clock;
+        static uint64_t s_generation = ~0ull;
+        static uint64_t s_hash = 0;
+        static uint64_t s_generationsSeen = 0;
+        static std::unordered_map<uint64_t, bool> s_saved;
+        static std::map<std::pair<uint64_t, uint32_t>, uint64_t> s_calls;
+        static Clock::time_point s_lastReport = Clock::now();
+        static uint32_t s_reports = 0;
+
+        if (generation != s_generation)
+        {
+            s_generation = generation;
+            s_hash = fnv1a64(code, codeSize);
+            ++s_generationsSeen;
+            if (!s_saved[s_hash])
+            {
+                s_saved[s_hash] = true;
+                char name[64];
+                std::snprintf(name, sizeof(name), "vu1code_%016llx.bin", static_cast<unsigned long long>(s_hash));
+                const std::string path = vu1CaptureDir() + "/" + name;
+                if (FILE *file = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fwrite(code, 1, codeSize, file);
+                    std::fclose(file);
+                }
+                std::fprintf(stderr, "[vu1-capture] new image %016llx (generation %llu)\n",
+                             static_cast<unsigned long long>(s_hash), static_cast<unsigned long long>(generation));
+            }
+        }
+        ++s_calls[{s_hash, startPC}];
+
+        const Clock::time_point now = Clock::now();
+        if (now - s_lastReport < std::chrono::seconds(5) || s_reports >= 200u)
+            return;
+        s_lastReport = now;
+        ++s_reports;
+        std::fprintf(stderr, "[vu1-capture] images=%zu generations=%llu entries=%zu\n", s_saved.size(),
+                     static_cast<unsigned long long>(s_generationsSeen), s_calls.size());
+        std::vector<std::pair<uint64_t, std::pair<uint64_t, uint32_t>>> ranked;
+        for (const auto &[key, count] : s_calls)
+            ranked.push_back({count, key});
+        std::sort(ranked.rbegin(), ranked.rend());
+        for (size_t i = 0; i < ranked.size() && i < 12u; ++i)
+        {
+            std::fprintf(stderr, "[vu1-capture]   %016llx pc=%04x calls=%llu\n",
+                         static_cast<unsigned long long>(ranked[i].second.first), ranked[i].second.second,
+                         static_cast<unsigned long long>(ranked[i].first));
+        }
+    }
+
+    // PS2X_VU1_COMPILED=0 forces the interpreter even when a translated program exists.
+    bool compiledProgramsEnabled()
+    {
+        static const bool s_enabled = []()
+        {
+            const char *value = std::getenv("PS2X_VU1_COMPILED");
+            return !(value && value[0] == '0');
+        }();
+        return s_enabled;
+    }
+
+    // Diagnostics: PS2X_VU1_VERIFY runs every translated program and then the interpreter
+    // on the same input, keeps the interpreter's result and reports any difference.
+    bool compiledVerificationEnabled()
+    {
+        static const bool s_enabled = std::getenv("PS2X_VU1_VERIFY") != nullptr;
+        return s_enabled;
+    }
+
+    void captureGifPacket(void *user, const uint8_t *data, uint32_t size)
+    {
+        auto *packets = static_cast<std::vector<uint8_t> *>(user);
+        packets->insert(packets->end(), data, data + size);
+    }
+
     uint32_t floatBits(float value)
     {
         uint32_t bits = 0;
@@ -131,11 +238,40 @@ uint8_t VU1Interpreter::vfReadLanes(const InstructionUsage &usage, uint8_t reg)
     return 0u;
 }
 
+struct VU1Interpreter::CompiledVerification
+{
+    bool active = false;
+    const ps2x::vu1c::Program *program = nullptr;
+    uint32_t entryPc = 0;
+    ps2x::vu1c::Exit compiledExit = ps2x::vu1c::Exit::Refused;
+    VU1State state{};
+    uint64_t cycle = 0;
+    uint32_t workingClip = 0;
+    std::array<std::array<uint64_t, 4>, 32> vfReady{};
+    std::array<uint64_t, 16> viReady{};
+    std::array<uint64_t, 4> accReady{};
+    bool backupValid = false;
+    uint8_t backupReg = 0;
+    int32_t backupValue = 0;
+    std::vector<uint8_t> memoryBefore;
+    VU1State compiledState{};
+    uint64_t compiledCycle = 0;
+    uint32_t compiledWorkingClip = 0;
+    std::vector<uint8_t> compiledMemory;
+    std::vector<uint8_t> compiledPackets;
+    std::vector<uint8_t> interpreterPackets;
+    uint64_t verified = 0;
+    uint64_t mismatches = 0;
+    uint64_t handoffs = 0;
+};
+
 VU1Interpreter::VU1Interpreter(Unit unit)
     : m_unit(unit)
 {
     reset();
 }
+
+VU1Interpreter::~VU1Interpreter() = default;
 
 void VU1Interpreter::resetScheduler()
 {
@@ -1053,6 +1189,8 @@ void VU1Interpreter::finishXgkick()
     if (!m_xgkick.active)
         return;
 
+    if (m_gifCapture)
+        m_gifCapture->insert(m_gifCapture->end(), m_xgkick.packet.data(), m_xgkick.packet.data() + m_xgkick.totalBytes);
     if (m_activeMemory)
         m_activeMemory->submitGifPacket(GifPathId::Path1, m_xgkick.packet.data(), m_xgkick.totalBytes);
     else if (m_activeGs)
@@ -1729,6 +1867,8 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t startPC, uint32_t top, uint32_t itop,
                              uint32_t maxCycles)
 {
+    if (m_unit == Unit::VU1 && memory && !vu1CaptureDir().empty())
+        captureVu1Program(vuCode, codeSize, memory->getVU1CodeGeneration(), startPC & microAddressMask());
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
     m_state.ebit = false;
@@ -1776,7 +1916,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const auto statsStart = collectStats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const uint64_t statsStartCycle = m_cycle;
     uint64_t executedPairs = 0;
-    while (m_cycle < budgetEnd && !m_stopRequested)
+    if (m_unit == Unit::VU1 && memory && compiledProgramsEnabled() && !pipelinesPending() &&
+        !m_state.branchPending && !m_state.ebit && !m_state.haltAfterDelaySlot)
+    {
+        if (const ps2x::vu1c::Program *program = compiledProgramFor(vuCode, codeSize, memory))
+        {
+            if (compiledVerificationEnabled())
+                beginCompiledVerification(*program, vuData, dataSize, budgetEnd);
+            else if (runCompiled(*program, vuData, dataSize, budgetEnd, nullptr))
+                programEnded = true;
+        }
+    }
+    while (!programEnded && m_cycle < budgetEnd && !m_stopRequested)
     {
         if (m_cycle >= m_nextCommitCycle)
             commitReadyPipelines();
@@ -2044,8 +2195,344 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_pendingHaltT = false;
     }
     m_state.cycles = m_cycle;
+    if (m_compiledVerification && m_compiledVerification->active)
+        finishCompiledVerification(vuData, dataSize, programEnded);
     if (useVuRounding && previousRoundingMode != -1)
         std::fesetround(previousRoundingMode);
     if (collectStats)
         recordVu1Stats(executedPairs, m_cycle - statsStartCycle, std::chrono::steady_clock::now() - statsStart);
+}
+
+const ps2x::vu1c::Program *VU1Interpreter::compiledProgramFor(const uint8_t *vuCode, uint32_t codeSize,
+                                                              PS2Memory *memory)
+{
+    // Micro memory only changes through VIF MPG uploads, which bump the generation.
+    const uint64_t generation = memory->getVU1CodeGeneration();
+    if (generation != m_compiledGeneration)
+    {
+        m_compiledGeneration = generation;
+        m_compiledProgram = ps2x::vu1c::findProgram(vuCode, codeSize);
+    }
+    return m_compiledProgram;
+}
+
+void VU1Interpreter::exportCompiledState(ps2x::vu1c::Exec &x, uint8_t *vuData, uint32_t dataSize, uint64_t budgetEnd)
+{
+    std::memcpy(x.vf, m_state.vf, sizeof(x.vf));
+    std::memcpy(x.vi, m_state.vi, sizeof(x.vi));
+    std::memcpy(x.acc, m_state.acc, sizeof(x.acc));
+    x.q = m_state.q;
+    x.i = m_state.i;
+    x.mac = m_state.mac;
+    x.status = m_state.status;
+    x.clip = m_state.clip;
+    x.top = m_state.top;
+    x.itop = m_state.itop;
+
+    x.cycle = m_cycle;
+    x.budgetEnd = budgetEnd;
+    x.lastReady = m_cycle;
+    for (uint32_t reg = 0; reg < 32u; ++reg)
+        for (uint32_t component = 0; component < 4u; ++component)
+            x.vfReady[reg][component] = m_vfReady[reg][component];
+    for (uint32_t reg = 0; reg < 16u; ++reg)
+        x.viReady[reg] = m_viReady[reg];
+    for (uint32_t component = 0; component < 4u; ++component)
+        x.accReady[component] = m_accReady[component];
+
+    x.flagHead = 0u;
+    x.flagCount = 0u;
+    x.workingClip = m_workingClip;
+    x.fdivPending = false;
+    x.fdivReady = 0u;
+    x.fdivValue = 0.0f;
+    x.fdivStatusDi = 0u;
+    x.viBackupValid = m_viBranchBackupValid;
+    x.viBackupReg = m_viBranchBackupReg;
+    x.viBackupValue = m_viBranchBackupValue;
+
+    x.xgActive = false;
+    x.xgSource = 0u;
+    x.xgCopied = 0u;
+    x.xgTagEnd = 0u;
+    x.xgTotal = 0u;
+    x.xgTagEop = false;
+    x.xgIssue = 0u;
+    x.xgPacket = m_xgkick.packet.data();
+
+    x.mem = vuData;
+    x.memSize = dataSize;
+    static const bool s_noClip = std::getenv("PS2X_VU1_NOCLIP") != nullptr;
+    x.noClip = s_noClip;
+    x.submitGif = [](void *user, const uint8_t *data, uint32_t size)
+    {
+        auto *self = static_cast<VU1Interpreter *>(user);
+        if (self->m_activeMemory)
+            self->m_activeMemory->submitGifPacket(GifPathId::Path1, data, size);
+        else if (self->m_activeGs)
+            self->m_activeGs->processGIFPacket(data, size);
+    };
+    x.gifUser = this;
+    x.reportError = [](void *user, uint32_t code)
+    { static_cast<VU1Interpreter *>(user)->reportReservedInstruction(false, code); };
+    x.errorUser = this;
+    x.exit = ps2x::vu1c::Exit::Refused;
+    x.exitPc = m_state.pc;
+}
+
+void VU1Interpreter::importCompiledState(const ps2x::vu1c::Exec &x)
+{
+    std::memcpy(m_state.vf, x.vf, sizeof(x.vf));
+    std::memcpy(m_state.vi, x.vi, sizeof(x.vi));
+    std::memcpy(m_state.acc, x.acc, sizeof(x.acc));
+    m_state.q = x.q;
+    m_state.i = x.i;
+    m_state.mac = x.mac;
+    m_state.status = x.status;
+    m_state.clip = x.clip;
+    m_cycle = x.cycle;
+    m_state.cycles = m_cycle;
+    m_workingClip = x.workingClip;
+    for (uint32_t reg = 0; reg < 32u; ++reg)
+        for (uint32_t component = 0; component < 4u; ++component)
+            m_vfReady[reg][component] = x.vfReady[reg][component];
+    for (uint32_t reg = 0; reg < 16u; ++reg)
+        m_viReady[reg] = x.viReady[reg];
+    for (uint32_t component = 0; component < 4u; ++component)
+        m_accReady[component] = x.accReady[component];
+    m_viBranchBackupValid = x.viBackupValid;
+    m_viBranchBackupReg = x.viBackupReg;
+    m_viBranchBackupValue = x.viBackupValue;
+    m_state.pc = x.exitPc & microAddressMask();
+    m_state.branchPending = false;
+    m_state.ebit = false;
+    m_state.haltAfterDelaySlot = false;
+
+    if (x.exit != ps2x::vu1c::Exit::Handoff)
+        return;
+
+    // Hand the in-flight work to the interpreter's pipelines so its stalls, commits
+    // and final flush come out exactly as if it had run the whole program.
+    for (uint32_t index = 0; index < x.flagCount; ++index)
+    {
+        const ps2x::vu1c::FlagEntry &pending = x.flags[(x.flagHead + index) & 15u];
+        FlagPipelineEntry &entry = m_flagPipeline[index];
+        entry = {};
+        entry.valid = true;
+        entry.issueCycle = pending.issue;
+        entry.readyCycle = pending.ready;
+        entry.mac = pending.mac;
+        entry.status = pending.status;
+        entry.extraSticky = pending.extraSticky;
+        entry.clip = pending.clip;
+        entry.writesMac = pending.writesMac;
+        entry.writesStatus = pending.writesStatus;
+        entry.writesSticky = pending.writesSticky;
+        entry.writesClip = pending.writesClip;
+        m_flagSlots |= 1u << index;
+        noteCommitCycle(entry.readyCycle);
+    }
+    if (x.fdivPending)
+    {
+        m_fdiv.valid = true;
+        m_fdiv.readyCycle = x.fdivReady;
+        m_fdiv.value = x.fdivValue;
+        m_fdiv.statusDi = x.fdivStatusDi;
+        noteCommitCycle(m_fdiv.readyCycle);
+    }
+    for (uint32_t reg = 1; reg < 32u; ++reg)
+    {
+        for (uint32_t component = 0; component < 4u; ++component)
+        {
+            const uint64_t ready = x.vfReady[reg][component];
+            if (ready <= m_cycle)
+                continue;
+            uint8_t lanes = 0u;
+            for (uint32_t other = component; other < 4u; ++other)
+            {
+                if (x.vfReady[reg][other] == ready)
+                    lanes |= laneForComponent(other);
+            }
+            bool alreadyQueued = false;
+            for (uint32_t earlier = 0; earlier < component; ++earlier)
+                alreadyQueued = alreadyQueued || x.vfReady[reg][earlier] == ready;
+            if (!alreadyQueued)
+                queueVfWrite(static_cast<uint8_t>(reg), lanes, m_state.vf[reg], static_cast<uint32_t>(ready - m_cycle));
+        }
+    }
+    for (uint32_t reg = 1; reg < 16u; ++reg)
+    {
+        if (x.viReady[reg] > m_cycle)
+            queueViWrite(static_cast<uint8_t>(reg), m_state.vi[reg], static_cast<uint32_t>(x.viReady[reg] - m_cycle));
+    }
+    for (uint32_t component = 0; component < 4u; ++component)
+    {
+        const uint64_t ready = x.accReady[component];
+        if (ready <= m_cycle)
+            continue;
+        uint8_t lanes = 0u;
+        for (uint32_t other = component; other < 4u; ++other)
+        {
+            if (x.accReady[other] == ready)
+                lanes |= laneForComponent(other);
+        }
+        bool alreadyQueued = false;
+        for (uint32_t earlier = 0; earlier < component; ++earlier)
+            alreadyQueued = alreadyQueued || x.accReady[earlier] == ready;
+        if (!alreadyQueued)
+            queueAccWrite(lanes, m_state.acc, static_cast<uint32_t>(ready - m_cycle));
+    }
+    if (x.xgActive)
+    {
+        m_xgkick.active = true;
+        m_xgkick.sourceAddress = x.xgSource;
+        m_xgkick.copiedBytes = x.xgCopied;
+        m_xgkick.currentTagEnd = x.xgTagEnd;
+        m_xgkick.totalBytes = x.xgTotal;
+        m_xgkick.currentTagEop = x.xgTagEop;
+        m_xgkick.issueCycle = x.xgIssue;
+        // Credit after the copy of cycle m_cycle: odd distance = a qword was just taken.
+        m_xgkick.cycleCredit = ((m_cycle - x.xgIssue) % 2u) == 0u ? 1u : 0u;
+    }
+}
+
+bool VU1Interpreter::runCompiled(const ps2x::vu1c::Program &program, uint8_t *vuData, uint32_t dataSize,
+                                 uint64_t budgetEnd, std::vector<uint8_t> *gifCapture)
+{
+    if (!m_compiledExec)
+        m_compiledExec = std::make_unique<ps2x::vu1c::Exec>();
+    ps2x::vu1c::Exec &x = *m_compiledExec;
+    exportCompiledState(x, vuData, dataSize, budgetEnd);
+    if (gifCapture)
+    {
+        x.submitGif = captureGifPacket;
+        x.gifUser = gifCapture;
+    }
+    program.run(x, m_state.pc);
+    if (x.exit == ps2x::vu1c::Exit::Refused)
+        return false;
+    importCompiledState(x);
+    return x.exit == ps2x::vu1c::Exit::Ended;
+}
+
+void VU1Interpreter::beginCompiledVerification(const ps2x::vu1c::Program &program, uint8_t *vuData,
+                                               uint32_t dataSize, uint64_t budgetEnd)
+{
+    if (!m_compiledVerification)
+        m_compiledVerification = std::make_unique<CompiledVerification>();
+    CompiledVerification &v = *m_compiledVerification;
+    v.program = &program;
+    v.entryPc = m_state.pc;
+    v.state = m_state;
+    v.cycle = m_cycle;
+    v.workingClip = m_workingClip;
+    v.vfReady = m_vfReady;
+    v.viReady = m_viReady;
+    v.accReady = m_accReady;
+    v.backupValid = m_viBranchBackupValid;
+    v.backupReg = m_viBranchBackupReg;
+    v.backupValue = m_viBranchBackupValue;
+    v.memoryBefore.assign(vuData, vuData + dataSize);
+    v.compiledPackets.clear();
+
+    runCompiled(program, vuData, dataSize, budgetEnd, &v.compiledPackets);
+    v.compiledExit = m_compiledExec->exit;
+    if (v.compiledExit == ps2x::vu1c::Exit::Refused)
+    {
+        v.active = false;
+        return;
+    }
+    v.compiledState = m_state;
+    v.compiledCycle = m_cycle;
+    v.compiledWorkingClip = m_workingClip;
+    v.compiledMemory.assign(vuData, vuData + dataSize);
+
+    // Rewind and let the interpreter produce the reference result (and the real GIF output).
+    m_state = v.state;
+    m_cycle = v.cycle;
+    m_workingClip = v.workingClip;
+    resetScheduler();
+    m_workingClip = v.workingClip;
+    m_vfReady = v.vfReady;
+    m_viReady = v.viReady;
+    m_accReady = v.accReady;
+    m_viBranchBackupValid = v.backupValid;
+    m_viBranchBackupReg = v.backupReg;
+    m_viBranchBackupValue = v.backupValue;
+    std::memcpy(vuData, v.memoryBefore.data(), dataSize);
+    v.interpreterPackets.clear();
+    m_gifCapture = &v.interpreterPackets;
+    v.active = true;
+}
+
+void VU1Interpreter::finishCompiledVerification(uint8_t *vuData, uint32_t dataSize, bool programEnded)
+{
+    CompiledVerification &v = *m_compiledVerification;
+    m_gifCapture = nullptr;
+    v.active = false;
+    if (v.compiledExit != ps2x::vu1c::Exit::Ended || !programEnded)
+    {
+        ++v.handoffs;
+        return;
+    }
+    ++v.verified;
+
+    char what[160] = {};
+    const VU1State &c = v.compiledState;
+    const VU1State &r = m_state;
+    if (std::memcmp(c.vf, r.vf, sizeof(r.vf)) != 0)
+    {
+        for (uint32_t reg = 0; reg < 32u && !what[0]; ++reg)
+            for (uint32_t component = 0; component < 4u && !what[0]; ++component)
+                if (floatBits(c.vf[reg][component]) != floatBits(r.vf[reg][component]))
+                    std::snprintf(what, sizeof(what), "vf%u[%u] compiled=%08x interpreter=%08x", reg, component,
+                                  floatBits(c.vf[reg][component]), floatBits(r.vf[reg][component]));
+    }
+    else if (std::memcmp(c.vi, r.vi, sizeof(r.vi)) != 0)
+    {
+        for (uint32_t reg = 0; reg < 16u && !what[0]; ++reg)
+            if (c.vi[reg] != r.vi[reg])
+                std::snprintf(what, sizeof(what), "vi%u compiled=%d interpreter=%d", reg, c.vi[reg], r.vi[reg]);
+    }
+    else if (std::memcmp(c.acc, r.acc, sizeof(r.acc)) != 0)
+        std::snprintf(what, sizeof(what), "acc");
+    else if (floatBits(c.q) != floatBits(r.q))
+        std::snprintf(what, sizeof(what), "q compiled=%08x interpreter=%08x", floatBits(c.q), floatBits(r.q));
+    else if (floatBits(c.i) != floatBits(r.i))
+        std::snprintf(what, sizeof(what), "i");
+    else if (c.mac != r.mac)
+        std::snprintf(what, sizeof(what), "mac compiled=%04x interpreter=%04x", c.mac, r.mac);
+    else if (c.status != r.status)
+        std::snprintf(what, sizeof(what), "status compiled=%03x interpreter=%03x", c.status, r.status);
+    else if (c.clip != r.clip)
+        std::snprintf(what, sizeof(what), "clip compiled=%06x interpreter=%06x", c.clip, r.clip);
+    else if (v.compiledWorkingClip != m_workingClip)
+        std::snprintf(what, sizeof(what), "working clip");
+    else if (c.pc != r.pc)
+        std::snprintf(what, sizeof(what), "pc compiled=%04x interpreter=%04x", c.pc, r.pc);
+    else if (v.compiledCycle != m_cycle)
+        std::snprintf(what, sizeof(what), "cycles compiled=%llu interpreter=%llu",
+                      static_cast<unsigned long long>(v.compiledCycle - v.cycle),
+                      static_cast<unsigned long long>(m_cycle - v.cycle));
+    else if (v.compiledMemory.size() != dataSize || std::memcmp(v.compiledMemory.data(), vuData, dataSize) != 0)
+    {
+        uint32_t offset = 0;
+        while (offset < dataSize && v.compiledMemory[offset] == vuData[offset])
+            ++offset;
+        std::snprintf(what, sizeof(what), "vu memory at 0x%04x", offset);
+    }
+    else if (v.compiledPackets != v.interpreterPackets)
+        std::snprintf(what, sizeof(what), "gif packets compiled=%zu bytes interpreter=%zu bytes",
+                      v.compiledPackets.size(), v.interpreterPackets.size());
+
+    if (what[0])
+    {
+        ++v.mismatches;
+        if (v.mismatches <= 200u)
+            std::fprintf(stderr, "[vu1-verify] MISMATCH %s entry=%04x: %s\n", v.program->name, v.entryPc, what);
+    }
+    if ((v.verified & 0xFFFu) == 0u)
+        std::fprintf(stderr, "[vu1-verify] verified=%llu mismatches=%llu handoffs=%llu\n",
+                     static_cast<unsigned long long>(v.verified), static_cast<unsigned long long>(v.mismatches),
+                     static_cast<unsigned long long>(v.handoffs));
 }
