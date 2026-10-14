@@ -13,6 +13,16 @@ project(PS2RetroX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# With MSVC-style compilers CMake's RelWithDebInfo uses /Ob1, which inlines only
+# functions declared inline. The GS pixel paths, the VU helpers and the IOP core
+# lean on small helpers, so inline as Release does (Devil Kings battles run about
+# 12% faster).
+if(MSVC)
+    foreach(lang C CXX)
+        string(REPLACE "/Ob1" "/Ob2" CMAKE_${lang}_FLAGS_RELWITHDEBINFO "${CMAKE_${lang}_FLAGS_RELWITHDEBINFO}")
+    endforeach()
+endif()
+
 option(PS2X_BUILD_RECOMP "Build ps2xRecomp" ON)
 option(PS2X_BUILD_RUNTIME "Build ps2xRuntime" ON)
 option(PS2X_BUILD_ANALYZER "Build ps2xAnalyzer" ON)
