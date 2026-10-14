@@ -574,30 +574,62 @@ namespace ps2x::vu1c
 
             const uint32_t lanes = destLaneBits(dest);
             const __m128i resultExponent = exponents4(result);
-            __m128i fast = midRange4(resultExponent);
+            __m128i mid = midRange4(resultExponent);
             if constexpr (kProductSum)
+                mid = _mm_and_si128(mid, _mm_cmplt_epi32(exponents4(accRaw),
+                                                         _mm_add_epi32(resultExponent, _mm_set1_epi32(17))));
+            __m128i fast = mid;
+            uint32_t zeroOperandLanes = 0u;
+            uint32_t zeroLanes = 0u;
+            if constexpr (kKind == kFmacMul || kProductSum)
             {
-                fast = _mm_and_si128(fast, _mm_cmplt_epi32(exponents4(accRaw),
-                                                           _mm_add_epi32(resultExponent, _mm_set1_epi32(17))));
-                fast = _mm_and_si128(fast, midRange4(exponents4(product)));
+                // Operands are normalised, so a zero operand is +-0 and makes the product
+                // exactly +-0 (skinning weights and unused components do that all the time).
+                // exactFlags then reports Z, and S for -0, for the product and for a result
+                // that is zero; a nonzero result is the accumulator itself.
+                const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
+                const __m128i zero = _mm_setzero_si128();
+                const __m128i zeroOperand =
+                    _mm_or_si128(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(left), absMask), zero),
+                                 _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(right), absMask), zero));
+                const __m128i zeroResult = _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(result), absMask), zero);
+                zeroOperandLanes = static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(zeroOperand))) & lanes;
+                zeroLanes = static_cast<uint32_t>(
+                                _mm_movemask_ps(_mm_castsi128_ps(_mm_and_si128(zeroOperand, zeroResult)))) &
+                            lanes;
+                if constexpr (kProductSum)
+                    fast = _mm_or_si128(_mm_and_si128(mid, midRange4(exponents4(product))),
+                                        _mm_and_si128(zeroOperand, _mm_or_si128(zeroResult, mid)));
+                else
+                    fast = _mm_or_si128(mid, zeroOperand);
             }
             if ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(fast))) & lanes) == lanes)
             {
                 const uint32_t negative = static_cast<uint32_t>(_mm_movemask_ps(result)) & lanes;
                 uint32_t extraSticky = 0u;
                 if constexpr (kProductSum)
-                    extraSticky = (static_cast<uint32_t>(_mm_movemask_ps(product)) & lanes) != 0u ? 0x2u : 0u;
+                    extraSticky = ((static_cast<uint32_t>(_mm_movemask_ps(product)) & lanes) != 0u ? 0x2u : 0u) |
+                                  (zeroOperandLanes != 0u ? 0x1u : 0u);
                 if (FlagEntry *entry = pushFlag(t))
                 {
-                    entry->mac = destLaneBits(negative) << 4; // S flags, x highest
-                    entry->status = negative != 0u ? 0x2u : 0u;
+                    // Z flags in bits 0-3 and S flags in bits 4-7, x highest.
+                    entry->mac = destLaneBits(zeroLanes) | (destLaneBits(negative) << 4);
+                    entry->status = (zeroLanes != 0u ? 0x1u : 0u) | (negative != 0u ? 0x2u : 0u);
                     entry->extraSticky = extraSticky;
                     entry->writesMac = true;
                     entry->writesStatus = true;
                 }
                 return;
             }
+            fmacVecExact<kKind, kProductSum>(t, dest, left, right, accNorm, out);
+        }
 
+        // The rare lanes outside the normal range: kept out of line so that every FMAC
+        // instruction of a translated program does not carry a copy.
+        template <int kKind, bool kProductSum>
+        PS2X_VU1C_NOINLINE void fmacVecExact(uint64_t t, uint8_t dest, __m128 left, __m128 right, __m128 accNorm,
+                                             float out[4])
+        {
             float l[4], r[4], a[4];
             _mm_storeu_ps(l, left);
             _mm_storeu_ps(r, right);
