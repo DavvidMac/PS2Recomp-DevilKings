@@ -119,6 +119,18 @@ namespace
         return file + ":" + std::to_string(line.LineNumber);
     }
 
+    // Source lines listed per busy function: PS2X_PROFILE_LINES=<n> (default 12).
+    size_t linesShown()
+    {
+        static const size_t s_lines = []() -> size_t
+        {
+            const char *value = std::getenv("PS2X_PROFILE_LINES");
+            const long parsed = value ? std::strtol(value, nullptr, 10) : 0L;
+            return parsed > 0 ? static_cast<size_t>(parsed) : 12u;
+        }();
+        return s_lines;
+    }
+
     bool isWaitFunction(const std::string &name)
     {
         return name.rfind("Zw", 0) == 0 || name.rfind("Nt", 0) == 0 || name.rfind("Rtl", 0) == 0 || name == "?";
@@ -198,7 +210,7 @@ namespace
                 std::vector<std::pair<std::string, uint64_t>> lines(byLine.begin(), byLine.end());
                 std::sort(lines.begin(), lines.end(), [](const auto &a, const auto &b) { return a.second > b.second; });
                 std::fprintf(out, "  lines of %s:\n", functions[i].first.c_str());
-                for (size_t j = 0; j < lines.size() && j < 12u; ++j)
+                for (size_t j = 0; j < lines.size() && j < linesShown(); ++j)
                 {
                     std::fprintf(out, "      %6.2f%%  %s\n",
                                  100.0 * static_cast<double>(lines[j].second) / static_cast<double>(functions[i].second),

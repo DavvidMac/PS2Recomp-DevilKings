@@ -9,6 +9,7 @@ These debugging switches are read once at startup from the environment (some are
 | `PS2X_WATCH` | `<addr>[:<bytes>[:<vsync>]]` | Reports writes overlapping the watched EE RAM range from the selected VSync. Address uses C-style base detection; omitted byte length defaults to 4 and omitted VSync to 0. Prints `[watch]` with registers and a stack scan; capped at 4,000 reports. |
 | `PS2X_RDRAM_DUMP` | `<vsync>:<path>` | Writes 32 MiB of EE RAM to the file at that VSync; prints `[rdram-dump]`. |
 | `PS2X_PROFILE` | `<delaySeconds>:<seconds>:<path>` | Windows only. A sampling profiler starts `<delaySeconds>` after start-up, records the instruction pointer of every thread about once per millisecond for `<seconds>`, then writes the 40 busiest functions of each thread, and the busiest source lines of its top four functions, to `<path>`; prints `[profile]`. |
+| `PS2X_PROFILE_LINES` | `<count>` | Number of source lines `PS2X_PROFILE` lists for each of the busiest functions; default 12. |
 | `PS2X_PEEK` | `<hex-addr>[:<words>][,...]` | At each thread dump, prints memory words for each address. Word count defaults to 1 and is capped at 64 per address. |
 | `PS2X_THREAD_DUMP` | `<vsync-interval>` | Prints guest thread state every N VSyncs as `[thread-dump]`; 0 or omitted disables it. |
 | `PS2X_WAKE_TRACE` | `<tid>` | Logs wakeups directed at the thread ID as `[wake]`; omitted disables tracing. |
@@ -18,6 +19,7 @@ These debugging switches are read once at startup from the environment (some are
 | Variable | Syntax | What it does |
 |---|---|---|
 | `PS2X_DMA_WATCH` | `<lo>:<hi>[:<vsync>]` | Watches DMA tag payloads overlapping the half-open guest address range `[lo,hi)` for 60 VSyncs from the optional start (default 0). Prints `[dma]`; capped at 20,000 reports. |
+| `PS2X_DMA_TIMING` | Any value | About every five seconds prints `[dma-timing]`: GIF, VIF0 and VIF1 DMA kicks per second, their data per second and the host time per second the EE thread spent starting and processing them (for VIF1 that includes the VU1 programs the transfer starts and the GIF packets they send). |
 | `PS2X_VIF1_WATCH` | `<qword>` | Index (0-1023) of a VU1 data-memory qword. Logs every UNPACK that writes it (with the first four payload words, plus eight qwords of a V4-32 payload), every UNPACK dropped for lack of data, and every MSCAL/MSCNT/FLUSH, all as `[vif1]`. Capped at 20,000 lines. |
 | `PS2X_VU1_TRACE` | `<pc>:<pairs>[:<skip>[:<lower>]]` | Once VU1 reaches micro address `<pc>` (hex) for the `<skip>`+1-th time (decimal, default 0), logs the next `<pairs>` (decimal) executed instruction pairs as `[vu1]` with CLIP, Q, VI and VF writes; `<lower>` (hex) only matches where the lower instruction word equals it. Fires once. |
 | `PS2X_VU1_NOCLIP` | Any value | Forces VU1 clip flags to inside; enabled by presence, including an empty value. No output. |

@@ -11,6 +11,7 @@
 #include <vector>
 #include <cstdio>
 #include <cstdlib>
+#include <chrono>
 
 namespace
 {
@@ -1172,6 +1173,48 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
 }
 
+namespace
+{
+    // Diagnostics: PS2X_DMA_TIMING=1 prints, every 5 s, the DMA kicks of the GIF, VIF0
+    // and VIF1 channels and the host time the EE thread spent starting and processing them.
+    struct DmaTiming
+    {
+        bool enabled = std::getenv("PS2X_DMA_TIMING") != nullptr;
+        std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+        uint64_t kicks[3] = {};
+        uint64_t bytes[3] = {};
+        double seconds[3] = {};
+    };
+
+    DmaTiming &dmaTiming()
+    {
+        static DmaTiming timing;
+        return timing;
+    }
+
+    void noteDmaKick(uint32_t channelBase, uint64_t bytes, std::chrono::steady_clock::time_point start,
+                     uint64_t vsync)
+    {
+        DmaTiming &timing = dmaTiming();
+        const uint32_t index = channelBase == 0x1000A000u ? 0u : (channelBase == 0x10008000u ? 1u : 2u);
+        const auto now = std::chrono::steady_clock::now();
+        ++timing.kicks[index];
+        timing.bytes[index] += bytes;
+        timing.seconds[index] += std::chrono::duration<double>(now - start).count();
+        const double window = std::chrono::duration<double>(now - timing.windowStart).count();
+        if (window < 5.0)
+            return;
+        std::fprintf(stderr,
+                     "[dma-timing] vsync=%llu per s: gif %.0f kicks %.0f KB %.1f ms | vif0 %.0f kicks %.1f ms | "
+                     "vif1 %.0f kicks %.0f KB %.1f ms\n",
+                     static_cast<unsigned long long>(vsync), timing.kicks[0] / window,
+                     timing.bytes[0] / 1024.0 / window, timing.seconds[0] * 1000.0 / window, timing.kicks[1] / window,
+                     timing.seconds[1] * 1000.0 / window, timing.kicks[2] / window, timing.bytes[2] / 1024.0 / window,
+                     timing.seconds[2] * 1000.0 / window);
+        timing = DmaTiming{};
+    }
+}
+
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
     size_t timerIndex = 0u;
@@ -1355,6 +1398,9 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t madr = m_ioRegisters[channelBase + 0x10];
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
+            const bool timeKick = dmaTiming().enabled;
+            const auto kickStart = timeKick ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            uint64_t kickBytes = static_cast<uint64_t>(qwc) * 16u;
 
             if (tryProcessScratchpadDma(channelBase, value))
             {
@@ -1602,6 +1648,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     chcr = (chcr & 0x0000FFFFu) | (lastTagUpper << 16);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
+                    kickBytes = chainBuf.size();
                     if (!chainBuf.empty())
                     {
                         PendingTransfer pt;
@@ -1638,6 +1685,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                 {
                     processPendingTransfers();
                 }
+                if (timeKick)
+                    noteDmaKick(channelBase, kickBytes, kickStart, gs_regs.vsyncTick.load(std::memory_order_relaxed));
             }
         }
         return true;
