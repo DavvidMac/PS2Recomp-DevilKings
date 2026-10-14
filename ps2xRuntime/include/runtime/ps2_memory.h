@@ -370,6 +370,10 @@ public:
     // way into the VIF1, VU1, GIF or GS calls syncVif1() first: it waits until the queued
     // transfers are done and completes them (D1_CHCR.STR, D_STAT, DMAC handler causes).
     bool vif1Async() const { return m_vif1Async; }
+    // Turns the VIF1 thread on unless PS2X_VIF1_THREAD=0 (the game runtime does this; a bare
+    // PS2Memory, as in the tests, stays synchronous unless PS2X_VIF1_THREAD=1). Call it before
+    // the first VIF1 transfer.
+    void enableVif1ThreadByDefault();
     void syncVif1();
     // Completes the queued VIF1 transfers if they have all finished, without waiting.
     void pollVif1();

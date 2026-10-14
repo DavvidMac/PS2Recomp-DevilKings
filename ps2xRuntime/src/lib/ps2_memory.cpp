@@ -2318,6 +2318,12 @@ void PS2Memory::processPendingTransfers()
     }
 }
 
+void PS2Memory::enableVif1ThreadByDefault()
+{
+    const char *vif1Thread = std::getenv("PS2X_VIF1_THREAD");
+    m_vif1Async = !(vif1Thread && vif1Thread[0] == '0');
+}
+
 void PS2Memory::queueVif1Transfers()
 {
     if (m_pendingVif1Transfers.empty())

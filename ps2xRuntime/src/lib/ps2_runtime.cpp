@@ -999,6 +999,9 @@ bool PS2Runtime::initialize(const char *title)
             std::cerr << "Failed to initialize PS2 memory" << std::endl;
             return false;
         }
+        // VIF1 transfers (and the VU1 programs they start) run alongside the EE, as on the
+        // console; PS2X_VIF1_THREAD=0 processes them on the EE thread instead.
+        m_memory.enableVif1ThreadByDefault();
 
         if (!syncCoreSubsystems())
         {
