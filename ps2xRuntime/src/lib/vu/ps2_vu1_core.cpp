@@ -2425,7 +2425,12 @@ bool VU1Interpreter::runCompiled(const ps2x::vu1c::Program &program, uint8_t *vu
         x.submitGif = captureGifPacket;
         x.gifUser = gifCapture;
     }
+    // Translated FMACs read their operands raw: with DAZ the SSE units take denormal
+    // operands as signed zeros, which is what VU normalisation makes of them.
+    const unsigned int savedCsr = _mm_getcsr();
+    _mm_setcsr(savedCsr | 0x0040u);
     program.run(x, m_state.pc);
+    _mm_setcsr(savedCsr);
     if (x.exit == ps2x::vu1c::Exit::Refused)
     {
         // The image matched, but the translator did not see this entry point.

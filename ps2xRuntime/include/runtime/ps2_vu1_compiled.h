@@ -575,12 +575,15 @@ namespace ps2x::vu1c
         }
 
         // One FMAC instruction on all four lanes (only DEST lanes count): returns the result
-        // and queues the flags as fmacFlags does. left and right are the normalised operands,
-        // already broadcast or permuted; accv is ACC, which is always normalised (only FMAC
-        // results are written to it), so it needs no norm4. A lane whose result (and, for
-        // product sums, product) lies in the normal range reports only its sign in fmacLane
-        // and productSticky, so when every DEST lane does, the flags come from the sign bits;
-        // otherwise the lanes go through fmacLane and productSticky as the scalar code did.
+        // and queues the flags as fmacFlags does. left and right are the operands as stored,
+        // already broadcast or permuted, NOT normalised: translated code runs with DAZ (see
+        // VU1Interpreter::runCompiled), so denormals read as signed zeros, as normalisation
+        // makes them; an infinity or NaN makes the result (and product) one too, which never
+        // passes the fast test below, and the exact path normalises and starts over. accv is
+        // ACC, always normalised (only FMAC results are written to it). A lane whose result
+        // (and, for product sums, product) lies in the normal range reports only its sign in
+        // fmacLane and productSticky, so when every DEST lane does, the flags come from the
+        // sign bits; otherwise the lanes go through fmacLane and productSticky.
         template <int kKind, bool kProductSum>
         PS2X_VU1C_INLINE __m128 fmacVec(uint64_t t, uint8_t dest, __m128 left, __m128 right, __m128 accv)
         {
@@ -615,10 +618,11 @@ namespace ps2x::vu1c
             uint32_t zeroLanes = 0u;
             if constexpr (kKind == kFmacMul || kProductSum)
             {
-                // Operands are normalised, so a zero operand is +-0 and makes the product
-                // exactly +-0 (skinning weights and unused components do that all the time).
-                // exactFlags then reports Z, and S for -0, for the product and for a result
-                // that is zero; a nonzero result is the accumulator itself.
+                // A zero operand (+-0) makes the product exactly +-0 (skinning weights and
+                // unused components do that all the time): exactFlags then reports Z, and S
+                // for -0, for the product and for a result that is zero; a nonzero result is
+                // the accumulator itself. An infinite operand times zero is NaN instead, which
+                // the zero-result requirement keeps out of the fast path.
                 const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
                 const __m128i zero = _mm_setzero_si128();
                 const __m128i zeroOperand =
@@ -629,11 +633,16 @@ namespace ps2x::vu1c
                 zeroLanes = static_cast<uint32_t>(
                                 _mm_movemask_ps(_mm_castsi128_ps(_mm_and_si128(zeroOperand, zeroResult)))) &
                             lanes;
+                // The product too must be zero: an infinite operand times zero is NaN, and the
+                // cross product's w result is zero whatever its product is.
                 if constexpr (kProductSum)
-                    fast = _mm_or_si128(_mm_and_si128(mid, midRange4(exponents4(product))),
-                                        _mm_and_si128(zeroOperand, _mm_or_si128(zeroResult, mid)));
+                    fast = _mm_or_si128(
+                        _mm_and_si128(mid, midRange4(exponents4(product))),
+                        _mm_and_si128(_mm_and_si128(zeroOperand, _mm_cmpeq_epi32(
+                                                                     _mm_and_si128(_mm_castps_si128(product), absMask), zero)),
+                                      _mm_or_si128(zeroResult, mid)));
                 else
-                    fast = _mm_or_si128(mid, zeroOperand);
+                    fast = _mm_or_si128(mid, _mm_and_si128(zeroOperand, zeroResult));
             }
             if ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(fast))) & lanes) == lanes)
             {
@@ -704,15 +713,16 @@ namespace ps2x::vu1c
                 const __m128i zeroOperand =
                     _mm_or_si128(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(left), absMask), zero),
                                  _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(right), absMask), zero));
+                const __m128i zeroResult =
+                    _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(result), absMask), zero);
                 if constexpr (kProductSum)
-                {
-                    const __m128i zeroResult =
-                        _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(result), absMask), zero);
-                    fast = _mm_or_si128(_mm_and_si128(mid, midRange4(exponents4(product))),
-                                        _mm_and_si128(zeroOperand, _mm_or_si128(zeroResult, mid)));
-                }
+                    fast = _mm_or_si128(
+                        _mm_and_si128(mid, midRange4(exponents4(product))),
+                        _mm_and_si128(_mm_and_si128(zeroOperand, _mm_cmpeq_epi32(
+                                                                     _mm_and_si128(_mm_castps_si128(product), absMask), zero)),
+                                      _mm_or_si128(zeroResult, mid)));
                 else
-                    fast = _mm_or_si128(mid, zeroOperand);
+                    fast = _mm_or_si128(mid, _mm_and_si128(zeroOperand, zeroResult));
             }
             if ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(fast))) & lanes) == lanes)
             {
@@ -759,6 +769,30 @@ namespace ps2x::vu1c
         PS2X_VU1C_NOINLINE void fmacVecExact(uint64_t t, uint8_t dest, __m128 left, __m128 right, __m128 accNorm,
                                              float out[4])
         {
+            // The fast path ran on raw operands under DAZ; this one does what the interpreter
+            // does: normalised operands, and no DAZ, which would turn a denormal product into
+            // zero before the accumulate.
+            const unsigned int savedCsr = _mm_getcsr();
+            _mm_setcsr(savedCsr & ~0x0040u);
+            left = norm4(left);
+            right = norm4(right);
+            {
+                const __m128 product = _mm_mul_ps(left, right);
+                __m128 result;
+                if constexpr (kKind == kFmacAdd)
+                    result = _mm_add_ps(left, right);
+                else if constexpr (kKind == kFmacSub)
+                    result = _mm_sub_ps(left, right);
+                else if constexpr (kKind == kFmacMul || kKind == kFmacOpmula)
+                    result = product;
+                else if constexpr (kKind == kFmacMadd)
+                    result = _mm_add_ps(accNorm, product);
+                else
+                    result = _mm_sub_ps(accNorm, product);
+                if constexpr (kKind == kFmacOpmsub || kKind == kFmacOpmula)
+                    result = _mm_blend_ps(result, _mm_setzero_ps(), 0x8);
+                _mm_storeu_ps(out, result);
+            }
             float l[4], r[4], a[4];
             _mm_storeu_ps(l, left);
             _mm_storeu_ps(r, right);
@@ -809,6 +843,7 @@ namespace ps2x::vu1c
             }
             else
                 fmacFlags(t, laneFlags, dest, sticky);
+            _mm_setcsr(savedCsr);
         }
 
         void clipFlag(uint64_t t, uint32_t newClip)

@@ -4,7 +4,9 @@
 #include "runtime/gs/ps2_gs_psmct32.h"
 #include "runtime/ps2_memory.h"
 #include "runtime/ps2_vu1.h"
+#include "runtime/ps2_vu1_compiled.h"
 
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +16,63 @@
 namespace
 {
     constexpr uint32_t kVuUpperNop = 0x000002FFu;
+
+    // A float drawn from the values VU normalisation changes (denormals, infinities, NaN),
+    // zeros, range ends, tiny normals whose products underflow, and ordinary values.
+    uint32_t vuTestFloatBits(uint32_t random)
+    {
+        const uint32_t sign = (random >> 31) << 31;
+        switch (random % 11u)
+        {
+        case 0:
+            return sign;
+        case 1:
+            return sign | 1u | (random & 0x7FFFFFu);
+        case 2:
+            return sign | 0x7F800000u;
+        case 3:
+            return 0x7FC00000u | (random & 0x3FFFFFu);
+        case 4:
+            return sign | 0x7F7FFFFFu;
+        case 5:
+            return sign | 0x00800000u | (random & 0x7FFFFFu);
+        case 6:
+            return sign | 0x0D000000u | (random & 0x7FFFFFu);
+        default:
+            return sign | (0x3C000000u + (random % 0x07000000u));
+        }
+    }
+
+    // One translated FMAC (Exec::fmacVec or fmacLite) of every kind, chosen at run time.
+    __m128 runCompiledFmac(ps2x::vu1c::Exec &x, int kind, bool lite, uint8_t dest, __m128 left, __m128 right,
+                           __m128 acc, __m128i &signAcc, __m128i &minAbsAcc)
+    {
+        using namespace ps2x::vu1c;
+        switch (kind)
+        {
+        case 0:
+            return lite ? x.fmacLite<kFmacAdd, false>(dest, left, right, acc, signAcc, minAbsAcc)
+                        : x.fmacVec<kFmacAdd, false>(1u, dest, left, right, acc);
+        case 1:
+            return lite ? x.fmacLite<kFmacSub, false>(dest, left, right, acc, signAcc, minAbsAcc)
+                        : x.fmacVec<kFmacSub, false>(1u, dest, left, right, acc);
+        case 2:
+            return lite ? x.fmacLite<kFmacMul, false>(dest, left, right, acc, signAcc, minAbsAcc)
+                        : x.fmacVec<kFmacMul, false>(1u, dest, left, right, acc);
+        case 3:
+            return lite ? x.fmacLite<kFmacMadd, true>(dest, left, right, acc, signAcc, minAbsAcc)
+                        : x.fmacVec<kFmacMadd, true>(1u, dest, left, right, acc);
+        case 4:
+            return lite ? x.fmacLite<kFmacMsub, true>(dest, left, right, acc, signAcc, minAbsAcc)
+                        : x.fmacVec<kFmacMsub, true>(1u, dest, left, right, acc);
+        case 5:
+            return lite ? x.fmacLite<kFmacOpmsub, true>(dest, left, right, acc, signAcc, minAbsAcc)
+                        : x.fmacVec<kFmacOpmsub, true>(1u, dest, left, right, acc);
+        default:
+            return lite ? x.fmacLite<kFmacOpmula, false>(dest, left, right, acc, signAcc, minAbsAcc)
+                        : x.fmacVec<kFmacOpmula, false>(1u, dest, left, right, acc);
+        }
+    }
 
     struct Vu1Fixture
     {
@@ -217,6 +276,85 @@ void register_ps2_vu1_tests()
 {
     MiniTest::Case("PS2VU1", [](TestCase &tc)
     {
+        tc.Run("translated FMACs on raw operands under DAZ match normalised operands", [](TestCase &t)
+        {
+            using namespace ps2x::vu1c;
+            const int previousRounding = std::fegetround();
+            std::fesetround(FE_TOWARDZERO); // as VU1Interpreter::run
+            const unsigned int csr = _mm_getcsr();
+            uint32_t seed = 0x2468ACE1u;
+            auto next = [&seed]()
+            {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                return seed;
+            };
+            uint32_t mismatches = 0u;
+            for (uint32_t round = 0; round < 20000u; ++round)
+            {
+                float leftLanes[4], rightLanes[4], accLanes[4];
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    leftLanes[c] = bitsFloat(vuTestFloatBits(next()));
+                    rightLanes[c] = bitsFloat(vuTestFloatBits(next()));
+                    accLanes[c] = norm(bitsFloat(vuTestFloatBits(next()))); // ACC is always normalised
+                }
+                const __m128 left = _mm_loadu_ps(leftLanes);
+                const __m128 right = _mm_loadu_ps(rightLanes);
+                const __m128 acc = _mm_loadu_ps(accLanes);
+                const uint8_t dest = static_cast<uint8_t>(1u + next() % 15u);
+                const int kind = static_cast<int>(next() % 7u);
+                const bool lite = (next() & 1u) != 0u;
+
+                Exec reference{};
+                Exec raw{};
+                reference.nextCommit = raw.nextCommit = kNever;
+                std::memcpy(reference.acc, accLanes, sizeof(accLanes));
+                std::memcpy(raw.acc, accLanes, sizeof(accLanes));
+                __m128i referenceSign = _mm_setzero_si128(), rawSign = _mm_setzero_si128();
+                __m128i referenceMin = _mm_set1_epi32(-1), rawMin = _mm_set1_epi32(-1);
+
+                _mm_setcsr(csr & ~0x0040u);
+                const __m128 expected = runCompiledFmac(reference, kind, lite, dest, norm4(left), norm4(right), acc,
+                                                        referenceSign, referenceMin);
+                _mm_setcsr(csr | 0x0040u);
+                const __m128 actual = runCompiledFmac(raw, kind, lite, dest, left, right, acc, rawSign, rawMin);
+                _mm_setcsr(csr);
+
+                float expectedLanes[4], actualLanes[4];
+                _mm_storeu_ps(expectedLanes, expected);
+                _mm_storeu_ps(actualLanes, actual);
+                bool same = true;
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    if ((dest & lane(c)) != 0u && floatBits(expectedLanes[c]) != floatBits(actualLanes[c]))
+                        same = false;
+                }
+                if (lite)
+                {
+                    reference.foldLite(referenceSign, referenceMin);
+                    raw.foldLite(rawSign, rawMin);
+                    same = same && reference.status == raw.status;
+                }
+                else
+                {
+                    same = same && reference.flagCount == raw.flagCount;
+                    if (same && reference.flagCount == 1u)
+                    {
+                        const FlagEntry &e = reference.flags[reference.flagHead];
+                        const FlagEntry &a = raw.flags[raw.flagHead];
+                        same = e.mac == a.mac && e.status == a.status && e.extraSticky == a.extraSticky &&
+                               e.writesMac == a.writesMac && e.writesStatus == a.writesStatus;
+                    }
+                }
+                if (!same)
+                    ++mismatches;
+            }
+            std::fesetround(previousRounding);
+            t.Equals(mismatches, 0u, "raw operands under DAZ should give the normalised results and flags");
+        });
+
         tc.Run("upper ADD applies the destination mask", [](TestCase &t)
         {
             Vu1Fixture fx;

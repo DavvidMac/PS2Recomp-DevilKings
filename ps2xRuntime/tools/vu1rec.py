@@ -890,9 +890,9 @@ class Emitter:
         if source == 'bc':
             right = self.bc_operand(ft, op & 3, cache, compute)
         elif source == 'q':
-            right = '_mm_set1_ps(norm(x.q))'
+            right = '_mm_set1_ps(x.q)'
         elif source == 'i':
-            right = '_mm_set1_ps(norm(x.i))'
+            right = '_mm_set1_ps(x.i)'
         else:
             right = self.vf_operand(ft, lanes_needed, cache, compute)
         if cross:
@@ -919,23 +919,18 @@ class Emitter:
         return compute, write
 
     def vf_operand(self, reg, lanes, cache, lines):
-        """VF[reg] as an FMAC operand whose DEST `lanes` must be normalised."""
+        """VF[reg] as an FMAC operand. Operands go in as stored: Exec::fmacVec runs them under
+        DAZ and sends anything a normalisation would change to its exact path."""
         if cache is None:
-            return f'norm4(_mm_loadu_ps(x.vf[{reg}]))'
-        name = cache.get(reg, lines)
-        if reg == 0 or (cache.norm.get(reg, 0) & lanes) == lanes:
-            return name
-        return f'norm4({name})'
+            return f'_mm_loadu_ps(x.vf[{reg}])'
+        return cache.get(reg, lines)
 
     def bc_operand(self, reg, comp, cache, lines):
-        """Component comp of VF[reg] broadcast to four lanes, normalised."""
+        """Component comp of VF[reg] broadcast to four lanes (raw, see vf_operand)."""
         if cache is None:
-            return f'_mm_set1_ps(norm(x.vf[{reg}][{comp}]))'
+            return f'_mm_set1_ps(x.vf[{reg}][{comp}])'
         name = cache.get(reg, lines)
-        splat = f'_mm_shuffle_ps({name}, {name}, _MM_SHUFFLE({comp}, {comp}, {comp}, {comp}))'
-        if reg == 0 or (cache.norm.get(reg, 0) & lane(comp)):
-            return splat
-        return f'norm4({splat})'
+        return f'_mm_shuffle_ps({name}, {name}, _MM_SHUFFLE({comp}, {comp}, {comp}, {comp}))'
 
     def vec_write(self, reg, dest, cache):
         """Writes the DEST lanes of urv to VF[reg] (ACC when reg is None)."""
