@@ -320,6 +320,33 @@ def decode_lower(lower):
 
 
 BRANCH_OPS = {0x20, 0x21, 0x24, 0x25, 0x28, 0x29, 0x2C, 0x2D, 0x2E, 0x2F}
+MAC_READS = {0x18, 0x1A, 0x1B}            # FMEQ / FMAND / FMOR
+STATUS_USES = {0x14, 0x15, 0x16, 0x17}    # FSEQ / FSSET / FSAND / FSOR
+
+# FMAC operations (upper opcode, or upper special for the ACC forms): (operation, operand).
+FMAC_TABLE = {}
+for _base, _kind in ((0x00, 'add'), (0x04, 'sub'), (0x08, 'madd'), (0x0C, 'msub'), (0x18, 'mul')):
+    for _bc in range(4):
+        FMAC_TABLE[_base + _bc] = (_kind, 'bc')
+FMAC_TABLE.update({0x1C: ('mul', 'q'), 0x1E: ('mul', 'i'), 0x20: ('add', 'q'), 0x21: ('madd', 'q'),
+                   0x22: ('add', 'i'), 0x23: ('madd', 'i'), 0x24: ('sub', 'q'), 0x25: ('msub', 'q'),
+                   0x26: ('sub', 'i'), 0x27: ('msub', 'i'), 0x28: ('add', 'v'), 0x29: ('madd', 'v'),
+                   0x2A: ('mul', 'v'), 0x2C: ('sub', 'v'), 0x2D: ('msub', 'v'), 0x2E: ('op', 'v')})
+
+
+def flag_fmac(upper):
+    """True when the upper word is an FMAC operation that writes MAC and status (Exec::fmacVec)."""
+    if DEST(upper) == 0:
+        return False
+    op = upper & 0x3F
+    if op >= 0x3C:
+        special = upper_special(upper)
+        if special in (0x1D, 0x1F, 0x2F, 0x30) or 0x10 <= special <= 0x17:
+            return False
+        return special in FMAC_TABLE
+    if 0x10 <= op <= 0x17 or op in (0x1D, 0x1F, 0x2B, 0x2F):
+        return False
+    return op in FMAC_TABLE
 
 
 class Pair:
@@ -425,6 +452,96 @@ class Emitter:
         self.out = []
         # Without FSSET an FDIV result may land ahead of queued flag writes (Exec::commitQ).
         self.has_fsset = any(not q.i_bit and q.op_hi == 0x15 for q in all_pairs.values())
+        self.fmacs = {pc for pc, q in all_pairs.items() if flag_fmac(q.upper)}
+        self.lite = self.lite_fmacs()
+        # Hot state is written back (and lite sticky bits folded into status) before every exit.
+        self.writeback = 'x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue;'
+        if self.lite:
+            self.writeback += ' x.foldLite(liteSign, liteMinAbs);'
+
+    def lite_fmacs(self):
+        """FMAC pairs whose MAC and status writes no flag read can observe (Exec::fmacLite).
+
+        A MAC read at pair r sees the last FMAC that has landed by its issue cycle. An FMAC
+        one to three pairs before r on some path may or may not have landed (stalls), so it
+        stays exact; the first FMAC four or more pairs back has landed (every pair takes at
+        least a cycle) and hides everything before it on that path. The program end flushes
+        the pipelines, so it sees the last FMAC on every path. Leaving the translated code
+        (a JR to a pair it does not have, running off its end) counts as a MAC read by the
+        next pair. A budget handoff needs nothing: the interpreter goes on with this code.
+        Programs that read status or use FSSET get no lite FMACs, so the sticky bits that
+        foldLite adds at exits are never observed late or out of order.
+        """
+        nodes = self.all_pairs
+        if any(not q.i_bit and q.op_hi in STATUS_USES for q in nodes.values()):
+            return set()
+        labels = self.pairs
+        succ = {}
+
+        def edge(a, b):
+            succ.setdefault(a, set()).add(b)
+
+        def go(pc):
+            return pc if pc in labels else 'exit'
+
+        for pc, p in labels.items():
+            slot = (pc + 8) & 0x3FFF
+            if p.e_bit:
+                edge(pc, slot)
+                edge(slot, 'end')
+            elif p.is_branch:
+                edge(pc, slot)
+                if p.op_hi in (0x24, 0x25):
+                    for other in labels:
+                        edge(slot, other)
+                    edge(slot, 'exit')
+                else:
+                    edge(slot, go(p.branch_target()))
+                    if p.op_hi not in (0x20, 0x21):
+                        edge(slot, go((pc + 16) & 0x3FFF))
+            else:
+                edge(pc, go((pc + 8) & 0x3FFF))
+        preds = {}
+        for a, targets in succ.items():
+            for b in targets:
+                preds.setdefault(b, set()).add(a)
+
+        exact = set()
+
+        def walk_read(start):
+            work = [(q, 1) for q in preds.get(start, ())]
+            seen = set()
+            while work:
+                q, distance = work.pop()
+                key = (q, min(distance, 4))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if q in self.fmacs:
+                    exact.add(q)
+                    if distance >= 4:
+                        continue
+                work.extend((before, distance + 1) for before in preds.get(q, ()))
+
+        def walk_end(start):
+            work = list(preds.get(start, ()))
+            seen = set()
+            while work:
+                q = work.pop()
+                if q in seen:
+                    continue
+                seen.add(q)
+                if q in self.fmacs:
+                    exact.add(q)
+                    continue
+                work.extend(preds.get(q, ()))
+
+        for pc, q in nodes.items():
+            if not q.i_bit and q.op_hi in MAC_READS:
+                walk_read(pc)
+        walk_read('exit')
+        walk_end('end')
+        return self.fmacs - exact
 
     def line(self, text=''):
         self.out.append(text)
@@ -471,7 +588,7 @@ class Emitter:
                         write.append(f'x.vf[{ft}][{c}] = ur{c};')
                 return compute, write
             kind, product_sum = self.fmac_kind(special, True)
-            return self.fmac(u, kind, product_sum, fs, ft, dest, 'acc', special)
+            return self.fmac(p.pc, u, kind, product_sum, fs, ft, dest, 'acc', special)
         if 0x10 <= op <= 0x17 or op in (0x1D, 0x1F, 0x2B, 0x2F):  # MAX / MINI
             is_max = op in (0x10, 0x11, 0x12, 0x13, 0x1D, 0x2B)
             cmp = '>' if is_max else '<'
@@ -489,26 +606,18 @@ class Emitter:
                     write.append(f'x.vf[{fd}][{c}] = ur{c};')
             return compute, write
         kind, product_sum = self.fmac_kind(op, False)
-        return self.fmac(u, kind, product_sum, fs, ft, dest, 'vf', op)
+        return self.fmac(p.pc, u, kind, product_sum, fs, ft, dest, 'vf', op)
 
     def fmac_kind(self, op, special):
-        table = {}
-        for base, kind in ((0x00, 'add'), (0x04, 'sub'), (0x08, 'madd'), (0x0C, 'msub'), (0x18, 'mul')):
-            for bc in range(4):
-                table[base + bc] = (kind, 'bc')
-        table.update({0x1C: ('mul', 'q'), 0x1E: ('mul', 'i'), 0x20: ('add', 'q'), 0x21: ('madd', 'q'),
-                      0x22: ('add', 'i'), 0x23: ('madd', 'i'), 0x24: ('sub', 'q'), 0x25: ('msub', 'q'),
-                      0x26: ('sub', 'i'), 0x27: ('msub', 'i'), 0x28: ('add', 'v'), 0x29: ('madd', 'v'),
-                      0x2A: ('mul', 'v'), 0x2C: ('sub', 'v'), 0x2D: ('msub', 'v'), 0x2E: ('op', 'v')})
-        if op not in table:
+        if op not in FMAC_TABLE:
             raise Reject(f'unhandled FMAC op {op:02x}')
-        kind = table[op]
+        kind = FMAC_TABLE[op]
         product_sum = (op in PRODUCT_SUM_SPECIAL) if special else (op in PRODUCT_SUM_OPS)
         if special and op == 0x2E:
             kind = ('opmula', 'v')
         return kind, product_sum
 
-    def fmac(self, u, kind, product_sum, fs, ft, dest, target, op):
+    def fmac(self, pc, u, kind, product_sum, fs, ft, dest, target, op):
         (operation, source) = kind
         compute, write = [], []
         lanes = comps(dest)
@@ -529,8 +638,12 @@ class Emitter:
             compute.append(f'const __m128 uls = {left}; const __m128 urs = {right};')
             left = '_mm_shuffle_ps(uls, uls, _MM_SHUFFLE(3, 0, 2, 1))'
             right = '_mm_shuffle_ps(urs, urs, _MM_SHUFFLE(3, 1, 0, 2))'
-        compute.append(f'float urv[4]; x.fmacVec<{kinds[operation]}, {"true" if product_sum else "false"}>'
-                       f'(t, {dest}u, {left}, {right}, urv);')
+        if pc in self.lite:
+            compute.append(f'float urv[4]; x.fmacLite<{kinds[operation]}, {"true" if product_sum else "false"}>'
+                           f'({dest}u, {left}, {right}, urv, liteSign, liteMinAbs);')
+        else:
+            compute.append(f'float urv[4]; x.fmacVec<{kinds[operation]}, {"true" if product_sum else "false"}>'
+                           f'(t, {dest}u, {left}, {right}, urv);')
         for c in lanes:
             compute.append(f'const float ur{c} = urv[{c}];')
         if target == 'acc':
@@ -740,7 +853,7 @@ class Emitter:
         if p.lo.pipeline == 'xgkick':
             out.append('if (x.xgActive) t = std::max(t, x.xgFinish());')
         if not in_delay_slot:
-            out.append(f'if (t >= budget) {{ x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue; x.handoff(0x{p.pc:04x}u); return; }}')
+            out.append(f'if (t >= budget) {{ {self.writeback} x.handoff(0x{p.pc:04x}u); return; }}')
 
         reads_q = False
         if not p.i_bit or True:
@@ -832,6 +945,10 @@ class Emitter:
         L('    bool vbValid = x.viBackupValid;')
         L('    uint8_t vbReg = x.viBackupReg;')
         L('    int32_t vbValue = x.viBackupValue;')
+        if self.lite:
+            L('    // Sticky status bits of the lite FMACs (Exec::fmacLite), folded in at exits.')
+            L('    __m128i liteSign = _mm_setzero_si128();')
+            L('    __m128i liteMinAbs = _mm_set1_epi32(-1);')
         L('    switch (entryPc)')
         L('    {')
         for pc in self.pairs:
@@ -850,7 +967,7 @@ class Emitter:
                 L(f'        // E-bit delay slot 0x{pc + 8:04x}')
                 for text in slot_code:
                     L('        ' + text)
-                L('        x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue;')
+                L(f'        {self.writeback}')
                 L(f'        x.end(cyc - 1u, 0x{(pc + 16) & 0x3FFF:04x}u);')
                 L('        return;')
             elif branch:
@@ -876,14 +993,14 @@ class Emitter:
                     L('        {')
                     for other in self.pairs:
                         L(f'        case 0x{other:04x}: goto P{other:04x};')
-                    L('        default: x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue; x.handoff(jumpTarget); return;')
+                    L(f'        default: {self.writeback} x.handoff(jumpTarget); return;')
                     L('        }')
             else:
                 nxt = (pc + 8) & 0x3FFF
                 if nxt in self.pairs:
                     L(f'        goto P{nxt:04x};')
                 else:
-                    L('        x.cycle = cyc; x.viBackupValid = vbValid; x.viBackupReg = vbReg; x.viBackupValue = vbValue;')
+                    L(f'        {self.writeback}')
                     L(f'        x.handoff(0x{nxt:04x}u);')
                     L('        return;')
             L('    }')
@@ -925,12 +1042,16 @@ def translate(path, out_dir, done):
     done.add(name)
     emitter = Emitter(name, pairs, all_pairs)
     text = emitter.emit(base, image, code_bytes)
+    translate.lite_counts[name] = (len(emitter.lite), len(emitter.fmacs))
     target = os.path.join(out_dir, f'vu1prog_{name}.cpp')
     old = open(target, encoding='utf-8').read() if os.path.exists(target) else None
     if old != text:
         with open(target, 'w', encoding='utf-8', newline='\n') as out:
             out.write(text)
     return name, len(pairs), code_bytes, True
+
+
+translate.lite_counts = {}
 
 
 def main():
@@ -947,6 +1068,9 @@ def main():
         try:
             name, count, size, written = translate(path, out_dir, done)
             note = '' if written else ' (same code as an earlier image)'
+            if written:
+                lite, fmacs = translate.lite_counts[name]
+                note = f', {lite} of {fmacs} FMACs without flag writes'
             print(f'{os.path.basename(path)}: {count} pairs, {size} bytes -> vu1prog_{name}.cpp{note}')
         except Reject as error:
             print(f'{os.path.basename(path)}: not translated ({error})')

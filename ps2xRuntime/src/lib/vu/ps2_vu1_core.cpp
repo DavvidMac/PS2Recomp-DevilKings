@@ -2255,6 +2255,7 @@ void VU1Interpreter::exportCompiledState(ps2x::vu1c::Exec &x, uint8_t *vuData, u
     x.flagHead = 0u;
     x.flagCount = 0u;
     x.workingClip = m_workingClip;
+    x.liteSticky = 0u;
     x.fdivPending = false;
     x.fdivReady = 0u;
     x.fdivValue = 0.0f;

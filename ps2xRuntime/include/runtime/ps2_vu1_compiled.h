@@ -160,6 +160,13 @@ namespace ps2x::vu1c
         return ((dest >> 3) & 1u) | ((dest >> 1) & 2u) | ((dest << 1) & 4u) | ((dest << 3) & 8u);
     }
 
+    // All-ones in the vector lanes set in `lanes` (x = 1 ... w = 8).
+    inline __m128i laneMask4(uint32_t lanes)
+    {
+        return _mm_setr_epi32((lanes & 1u) != 0u ? -1 : 0, (lanes & 2u) != 0u ? -1 : 0, (lanes & 4u) != 0u ? -1 : 0,
+                              (lanes & 8u) != 0u ? -1 : 0);
+    }
+
     // norm() on four lanes.
     inline __m128 norm4(__m128 value)
     {
@@ -286,6 +293,9 @@ namespace ps2x::vu1c
         uint32_t flagHead;
         uint32_t flagCount;
         uint32_t workingClip;
+        // Status flags (bits 0-3 form) of fmacLite instructions that took the exact path;
+        // foldLite adds them to the sticky bits.
+        uint32_t liteSticky;
 
         // FDIV unit (Q).
         bool fdivPending;
@@ -624,9 +634,101 @@ namespace ps2x::vu1c
             fmacVecExact<kKind, kProductSum>(t, dest, left, right, accNorm, out);
         }
 
-        // The rare lanes outside the normal range: kept out of line so that every FMAC
-        // instruction of a translated program does not carry a copy.
+        // fmacVec for an instruction whose MAC and status writes no flag read can observe
+        // (vu1rec.py proves it: a later FMAC always lands first). The result is the same;
+        // instead of queueing its flags the instruction only gathers the status bits it
+        // would make sticky: sign bits of the DEST lanes in signAcc, and their magnitudes in
+        // minAbsAcc, which a zero lane makes zero. foldLite adds those to status at exits.
         template <int kKind, bool kProductSum>
+        PS2X_VU1C_INLINE void fmacLite(uint8_t dest, __m128 left, __m128 right, float out[4], __m128i &signAcc,
+                                       __m128i &minAbsAcc)
+        {
+            constexpr bool kUsesAcc = kKind == kFmacMadd || kKind == kFmacMsub || kKind == kFmacOpmsub;
+            const __m128 accRaw = _mm_loadu_ps(acc);
+            const __m128 accNorm = kUsesAcc ? norm4(accRaw) : _mm_setzero_ps();
+            const __m128 product = _mm_mul_ps(left, right);
+            __m128 result;
+            if constexpr (kKind == kFmacAdd)
+                result = _mm_add_ps(left, right);
+            else if constexpr (kKind == kFmacSub)
+                result = _mm_sub_ps(left, right);
+            else if constexpr (kKind == kFmacMul || kKind == kFmacOpmula)
+                result = product;
+            else if constexpr (kKind == kFmacMadd)
+                result = _mm_add_ps(accNorm, product);
+            else
+                result = _mm_sub_ps(accNorm, product);
+            if constexpr (kKind == kFmacOpmsub || kKind == kFmacOpmula)
+                result = _mm_blend_ps(result, _mm_setzero_ps(), 0x8);
+            _mm_storeu_ps(out, result);
+            if (dest == 0u)
+                return;
+
+            // The same test as fmacVec: lanes passing it keep the SSE result and only
+            // report Z and S (plus the product's S and a zero operand's Z for product sums).
+            const uint32_t lanes = destLaneBits(dest);
+            const __m128i resultExponent = exponents4(result);
+            __m128i mid = midRange4(resultExponent);
+            if constexpr (kProductSum)
+                mid = _mm_and_si128(mid, _mm_cmplt_epi32(exponents4(accRaw),
+                                                         _mm_add_epi32(resultExponent, _mm_set1_epi32(17))));
+            __m128i fast = mid;
+            const __m128i absMask = _mm_set1_epi32(0x7FFFFFFF);
+            if constexpr (kKind == kFmacMul || kProductSum)
+            {
+                const __m128i zero = _mm_setzero_si128();
+                const __m128i zeroOperand =
+                    _mm_or_si128(_mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(left), absMask), zero),
+                                 _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(right), absMask), zero));
+                if constexpr (kProductSum)
+                {
+                    const __m128i zeroResult =
+                        _mm_cmpeq_epi32(_mm_and_si128(_mm_castps_si128(result), absMask), zero);
+                    fast = _mm_or_si128(_mm_and_si128(mid, midRange4(exponents4(product))),
+                                        _mm_and_si128(zeroOperand, _mm_or_si128(zeroResult, mid)));
+                }
+                else
+                    fast = _mm_or_si128(mid, zeroOperand);
+            }
+            if ((static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(fast))) & lanes) == lanes)
+            {
+                // There a zero result or product only comes from a zero operand, so a zero
+                // magnitude is exactly fmacVec's Z, and the sign bits are its S.
+                const __m128i destMask = laneMask4(lanes);
+                const __m128i resultBits = _mm_castps_si128(result);
+                __m128i sign = _mm_and_si128(resultBits, destMask);
+                __m128i magnitude = _mm_or_si128(_mm_and_si128(resultBits, absMask), _mm_xor_si128(destMask, _mm_set1_epi32(-1)));
+                if constexpr (kProductSum)
+                {
+                    const __m128i productBits = _mm_castps_si128(product);
+                    sign = _mm_or_si128(sign, _mm_and_si128(productBits, destMask));
+                    magnitude = _mm_min_epu32(magnitude, _mm_or_si128(_mm_and_si128(productBits, absMask),
+                                                                      _mm_xor_si128(destMask, _mm_set1_epi32(-1))));
+                }
+                signAcc = _mm_or_si128(signAcc, sign);
+                minAbsAcc = _mm_min_epu32(minAbsAcc, magnitude);
+                return;
+            }
+            fmacVecExact<kKind, kProductSum, true>(0u, dest, left, right, accNorm, out);
+        }
+
+        // Adds the status bits gathered by fmacLite to the sticky bits (no FSSET or status
+        // read can come between, vu1rec.py gives programs with those no lite FMACs).
+        void foldLite(__m128i signAcc, __m128i minAbsAcc)
+        {
+            uint32_t sticky = liteSticky;
+            if (_mm_movemask_ps(_mm_castsi128_ps(signAcc)) != 0)
+                sticky |= 0x2u;
+            if (_mm_movemask_ps(_mm_castsi128_ps(_mm_cmpeq_epi32(minAbsAcc, _mm_setzero_si128()))) != 0)
+                sticky |= 0x1u;
+            status |= (sticky & 0xFu) << 6;
+            liteSticky = 0u;
+        }
+
+        // The rare lanes outside the normal range: kept out of line so that every FMAC
+        // instruction of a translated program does not carry a copy. kLite: an fmacLite
+        // instruction, whose flags only go to the sticky bits.
+        template <int kKind, bool kProductSum, bool kLite = false>
         PS2X_VU1C_NOINLINE void fmacVecExact(uint64_t t, uint8_t dest, __m128 left, __m128 right, __m128 accNorm,
                                              float out[4])
         {
@@ -668,7 +770,17 @@ namespace ps2x::vu1c
                         sticky |= productSticky(l[c], r[c]);
                 }
             }
-            fmacFlags(t, laneFlags, dest, sticky);
+            if constexpr (kLite)
+            {
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    if ((dest & lane(c)) != 0u)
+                        sticky |= laneFlags[c];
+                }
+                liteSticky |= sticky;
+            }
+            else
+                fmacFlags(t, laneFlags, dest, sticky);
         }
 
         void clipFlag(uint64_t t, uint32_t newClip)
