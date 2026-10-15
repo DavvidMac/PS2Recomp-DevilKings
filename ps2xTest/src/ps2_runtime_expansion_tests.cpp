@@ -764,6 +764,48 @@ void register_ps2_runtime_expansion_tests()
             runtime.requestStop();
         });
 
+        tc.Run("re-creating an MPEG decoder for every movie reuses its guest block and callbacks", [](TestCase &t)
+        {
+            // Devil Kings plays every movie with sceMpegCreate on the same decoder and never
+            // calls sceMpegDelete; one guest allocation per movie froze the 22nd movie.
+            PS2Runtime runtime;
+            std::vector<uint8_t> rdram(PS2_RAM_SIZE, 0u);
+            ps2_stubs::resetMpegStubState();
+            constexpr uint32_t kMpegAddr = 0x00138C80u;
+            constexpr uint32_t kMpegWorkAddr = 0x00140000u;
+
+            uint32_t firstBlock = 0u;
+            uint32_t firstHandle = 0u;
+            for (int movie = 0; movie < 30; ++movie)
+            {
+                R5900Context createCtx{};
+                setRegU32(createCtx, 4, kMpegAddr);
+                setRegU32(createCtx, 5, kMpegWorkAddr);
+                setRegU32(createCtx, 6, 0x2000u);
+                ps2_stubs::sceMpegCreate(rdram.data(), &createCtx, &runtime);
+                uint32_t block = 0u;
+                std::memcpy(&block, rdram.data() + kMpegWorkAddr + 0x44u, sizeof(block));
+
+                R5900Context callbackCtx{};
+                setRegU32(callbackCtx, 4, kMpegAddr);
+                setRegU32(callbackCtx, 5, 0u);
+                setRegU32(callbackCtx, 6, 0x00251290u);
+                setRegU32(callbackCtx, 7, 0x01389400u);
+                ps2_stubs::sceMpegAddCallback(rdram.data(), &callbackCtx, &runtime);
+                const uint32_t handle = ::getRegU32(&callbackCtx, 2);
+
+                if (movie == 0)
+                {
+                    firstBlock = block;
+                    firstHandle = handle;
+                    t.IsTrue(block != 0u, "sceMpegCreate should hang a guest block off the decoder");
+                    continue;
+                }
+                t.Equals(block, firstBlock, "a re-created decoder should keep its guest block");
+                t.Equals(handle, firstHandle, "an identical callback should keep its handle");
+            }
+        });
+
         tc.Run("sceMpegGetPicture blocks as a typed scheduler wait and resumes on EOF", [](TestCase &t)
         {
             PS2Runtime runtime;

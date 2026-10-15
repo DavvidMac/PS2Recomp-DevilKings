@@ -546,6 +546,9 @@ namespace ps2_stubs
             uint32_t isEndTraceCount = 0u;
             std::unordered_map<uint32_t, std::vector<MpegRegisteredCallback>> callbacksByMpeg;
             std::unordered_map<uint32_t, MpegPlaybackState> playbackByMpeg;
+            // 0x600-byte guest block sceMpegCreate hangs off each decoder. Games re-create
+            // the same decoder for every movie without sceMpegDelete, so it is reused.
+            std::unordered_map<uint32_t, uint32_t> scratchByMpeg;
             // Decoder that receives bitstream DMA'd to the IPU (toIPU channel).
             uint32_t activeIpuMpeg = 0u;
         };
@@ -553,6 +556,23 @@ namespace ps2_stubs
         std::mutex g_mpeg_stub_mutex;
         constexpr uint32_t kMpegPictureWaitType = 1u;
         MpegStubState g_mpeg_stub_state;
+
+        // Games register the same callbacks again after re-creating a decoder for the next
+        // movie; an identical registration keeps its handle instead of piling up duplicates.
+        uint32_t addMpegCallbackLocked(uint32_t mpegAddr, uint32_t type, uint32_t streamId,
+                                       uint32_t func, uint32_t data, bool stream)
+        {
+            std::vector<MpegRegisteredCallback> &callbacks = g_mpeg_stub_state.callbacksByMpeg[mpegAddr];
+            for (const MpegRegisteredCallback &callback : callbacks)
+            {
+                if (callback.type == type && callback.streamId == streamId && callback.func == func &&
+                    callback.data == data && callback.stream == stream)
+                    return callback.handle;
+            }
+            const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
+            callbacks.push_back(MpegRegisteredCallback{type, streamId, func, data, handle, stream});
+            return handle;
+        }
 
         // TODO this resolution should follow runtime resolution
         constexpr uint32_t kStubMovieWidth = 320u;
@@ -2053,11 +2073,7 @@ namespace ps2_stubs
             g_mpeg_stub_state.activeIpuMpeg = mpegAddr;
         }
 
-        const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
-        g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
-            MpegRegisteredCallback{callbackType, 0u, callbackFunc, callbackData, handle, false});
-
-        setReturnU32(ctx, handle);
+        setReturnU32(ctx, addMpegCallbackLocked(mpegAddr, callbackType, 0u, callbackFunc, callbackData, false));
     }
 
     void sceMpegAddStrCallback(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -2073,9 +2089,7 @@ namespace ps2_stubs
         std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
         g_mpeg_stub_state.initialized = true;
         (void)getPlaybackState(mpegAddr);
-        const uint32_t handle = g_mpeg_stub_state.nextCallbackHandle++;
-        g_mpeg_stub_state.callbacksByMpeg[mpegAddr].push_back(
-            MpegRegisteredCallback{streamType, streamId, callbackFunc, callbackData, handle, true});
+        (void)addMpegCallbackLocked(mpegAddr, streamType, streamId, callbackFunc, callbackData, true);
         setReturnU32(ctx, 0u);
     }
 
@@ -2132,9 +2146,14 @@ namespace ps2_stubs
             return;
         }
 
+        uint32_t allocResult = 0u;
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             getPlaybackState(param_1) = makeFreshPlaybackState();
+            uint32_t &scratch = g_mpeg_stub_state.scratchByMpeg[param_1];
+            if (scratch == 0u)
+                scratch = runtime ? runtime->guestMalloc(0x600, 8u) : (uVar3 + 0x200u);
+            allocResult = scratch;
         }
 
         const uint32_t puVar4 = uVar3 + 0x108u;
@@ -2148,7 +2167,6 @@ namespace ps2_stubs
         mpegGuestWrite32(rdram, puVar4 + 0x8, a1_init);
         mpegGuestWrite32(rdram, puVar4 + 0xC, a1_init);
 
-        const uint32_t allocResult = runtime ? runtime->guestMalloc(0x600, 8u) : (uVar3 + 0x200u);
         mpegGuestWrite32(rdram, uVar3 + 0x44, allocResult);
 
         // param_1[0..2] = 0; param_1[4..0xe] = 0xffffffff/0 as per decompilation
@@ -2202,11 +2220,20 @@ namespace ps2_stubs
         (void)rdram;
 
         const uint32_t mpegAddr = getRegU32(ctx, 4);
+        uint32_t scratch = 0u;
         {
             std::lock_guard<std::mutex> lock(g_mpeg_stub_mutex);
             g_mpeg_stub_state.callbacksByMpeg.erase(mpegAddr);
             g_mpeg_stub_state.playbackByMpeg.erase(mpegAddr);
+            const auto it = g_mpeg_stub_state.scratchByMpeg.find(mpegAddr);
+            if (it != g_mpeg_stub_state.scratchByMpeg.end())
+            {
+                scratch = it->second;
+                g_mpeg_stub_state.scratchByMpeg.erase(it);
+            }
         }
+        if (scratch != 0u && runtime)
+            runtime->guestFree(scratch);
         runtime->eeScheduler().completeExternalWait(kMpegPictureWaitType, mpegAddr, KE_WAIT_DELETE);
         setReturnU32(ctx, 0u);
     }
