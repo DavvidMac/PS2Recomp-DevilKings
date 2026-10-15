@@ -971,6 +971,7 @@ bool PS2Runtime::syncCoreSubsystems()
                                                    m_gs, &m_memory, startPC, top, itop, 65536);
                                      m_memory.noteVu1RunStop((m_vu1.state().stoppedByD ? 0x0200u : 0u) |
                                                              (m_vu1.state().stoppedByT ? 0x0400u : 0u)); });
+    m_memory.setVu1RunQueue(m_vu1.runQueue());
     m_memory.setVu1MscntCallback([this](uint32_t top, uint32_t itop)
                                  {
                                      const uint32_t fbrst = m_memory.vu1RunFbrst();

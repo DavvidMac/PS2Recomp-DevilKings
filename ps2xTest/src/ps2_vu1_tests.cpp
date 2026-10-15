@@ -9,6 +9,7 @@
 #include <cfenv>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <vector>
@@ -16,6 +17,57 @@
 namespace
 {
     constexpr uint32_t kVuUpperNop = 0x000002FFu;
+
+    // Stands in for a translated program in the worker-thread test. From PC 0: adds 1 to
+    // each lane of the qword at TOP into TOP + 1; when the input's x is odd, adds it to a
+    // running sum in qword 1000 (so neighbouring runs depend on each other); copies the
+    // input into vf1 and its x into vi2, shifts in one clip flag, and ends.
+    void parallelTestRun(ps2x::vu1c::Exec &x, uint32_t entryPc)
+    {
+        if (entryPc != 0u)
+            return;
+        const uint64_t t = x.cycle;
+        float in[4];
+        x.load((x.top & 1023u) * 16u, in);
+        uint32_t words[4];
+        std::memcpy(words, in, sizeof(words));
+        const uint32_t out[4] = {words[0] + 1u, words[1] + 1u, words[2] + 1u, words[3] + 1u};
+        x.store(t, ((x.top + 1u) & 1023u) * 16u, out, 0xFu);
+        if ((words[0] & 1u) != 0u)
+        {
+            float sum[4];
+            x.load(1000u * 16u, sum);
+            uint32_t total[4];
+            std::memcpy(total, sum, sizeof(total));
+            total[0] += words[0];
+            total[1] += 1u;
+            x.store(t + 1u, 1000u * 16u, total, 0xCu);
+        }
+        std::memcpy(x.vf[1], in, sizeof(in));
+        x.vfWritten(1u, 0xFu, t + 4u);
+        x.vi[2] = static_cast<int16_t>(words[0] & 0xFFFFu);
+        x.viReady[2] = t + 1u;
+        x.noteReady(t + 1u);
+        x.clipFlag(t + 2u, words[1] & 0x3Fu);
+        x.end(t + 5u, 0x0010u);
+    }
+
+    const uint8_t kParallelTestImage[16] = {'p', 'a', 'r', 'a', 'l', 'l', 'e', 'l', ' ', 't', 'e', 's', 't', ' ', 'v', 'u'};
+    const ps2x::vu1c::EntryInputs kParallelTestEntries[] = {{0x0000u, 0u, 0u, 0u, 0u, {}}};
+    const ps2x::vu1c::Program kParallelTestProgram{"parallel test", kParallelTestImage, 16u, parallelTestRun,
+                                                   kParallelTestEntries, 1u};
+
+    void setTestEnv(const char *name, const char *value)
+    {
+#ifdef _WIN32
+        _putenv_s(name, value);
+#else
+        if (value[0] != '\0')
+            setenv(name, value, 1);
+        else
+            unsetenv(name);
+#endif
+    }
 
     // A float drawn from the values VU normalisation changes (denormals, infinities, NaN),
     // zeros, range ends, tiny normals whose products underflow, and ordinary values.
@@ -1849,6 +1901,83 @@ void register_ps2_vu1_tests()
                      "reserved opcode should retain the diagnostic PC");
             t.Equals(vu1.state().vi[1], 0,
                      "instruction following a reserved opcode must not execute");
+        });
+
+        tc.Run("VU1 runs on worker threads take effect as if run in order", [](TestCase &t)
+        {
+            static const bool s_registered = []()
+            {
+                ps2x::vu1c::registerProgram(&kParallelTestProgram);
+                return true;
+            }();
+            (void)s_registered;
+
+            Vu1Fixture serialFx;
+            Vu1Fixture parallelFx;
+            t.IsTrue(serialFx.initialize() && parallelFx.initialize(), "VU1 fixtures should initialize");
+            std::memcpy(serialFx.code, kParallelTestImage, sizeof(kParallelTestImage));
+            std::memcpy(parallelFx.code, kParallelTestImage, sizeof(kParallelTestImage));
+
+            VU1Interpreter serial;
+            VU1Interpreter parallel;
+            setTestEnv("PS2X_VU1_THREADS", "2");
+            Vu1RunQueue *queue = parallel.runQueue();
+            setTestEnv("PS2X_VU1_THREADS", "");
+            t.IsTrue(queue != nullptr, "PS2X_VU1_THREADS should give the interpreter a run queue");
+            if (!queue)
+                return;
+
+            uint32_t seed = 0x13579BDFu;
+            auto next = [&seed]()
+            {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                return seed;
+            };
+            auto vifWrite = [&](uint32_t qword, const uint32_t words[4])
+            {
+                std::memcpy(serialFx.data + qword * 16u, words, 16u);
+                std::memcpy(parallelFx.data + qword * 16u, words, 16u);
+                queue->noteDataWrite(qword, 1u);
+            };
+            bool memoryMatched = true;
+            for (uint32_t run = 0; run < 600u; ++run)
+            {
+                // Double-buffered input, as the VIF unpacks it.
+                const uint32_t top = (run & 1u) != 0u ? 0x200u : 0x100u;
+                const uint32_t input[4] = {next(), next(), next(), next()};
+                vifWrite(top, input);
+                serial.execute(serialFx.code, PS2_VU1_CODE_SIZE, serialFx.data, PS2_VU1_DATA_SIZE, serialFx.gs,
+                               &serialFx.mem, 0u, top, 0u, 1000u);
+                parallel.execute(parallelFx.code, PS2_VU1_CODE_SIZE, parallelFx.data, PS2_VU1_DATA_SIZE, parallelFx.gs,
+                                 &parallelFx.mem, 0u, top, 0u, 1000u);
+                // The VIF sometimes writes over a run's output after the run started.
+                if (run % 3u == 0u)
+                {
+                    const uint32_t marker[4] = {run, ~run, run * 3u, 7u};
+                    vifWrite(top + 1u, marker);
+                }
+                if (run % 97u == 96u)
+                {
+                    queue->drain();
+                    memoryMatched = memoryMatched &&
+                                    std::memcmp(serialFx.data, parallelFx.data, PS2_VU1_DATA_SIZE) == 0;
+                }
+            }
+            queue->drain();
+            memoryMatched = memoryMatched && std::memcmp(serialFx.data, parallelFx.data, PS2_VU1_DATA_SIZE) == 0;
+            t.IsTrue(memoryMatched, "VU1 data memory should match the runs made in order");
+
+            const VU1State &a = serial.state();
+            const VU1State &b = parallel.state();
+            t.IsTrue(std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0, "VF registers should match");
+            t.IsTrue(std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0, "VI registers should match");
+            t.Equals(b.clip, a.clip, "clip flags should match");
+            t.Equals(b.status, a.status, "status flags should match");
+            t.Equals(b.mac, a.mac, "MAC flags should match");
+            t.Equals(b.pc, a.pc, "PC should match");
+            t.Equals(b.cycles, a.cycles, "cycle count should match");
         });
     });
 }

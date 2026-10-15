@@ -463,6 +463,25 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     if (sizeBytes == 0u)
         return;
+    // VU1 runs started on worker threads take effect before the transfer ends.
+    struct DrainAtEnd
+    {
+        Vu1RunQueue *queue;
+        ~DrainAtEnd()
+        {
+            if (queue && queue->pending())
+                queue->drain();
+        }
+    } drainAtEnd{m_vu1RunQueue};
+    const bool runsQueued = m_vu1RunQueue != nullptr;
+    // PATH2 packets go after the PATH1 output of the runs started before them.
+    auto submitPath2 = [&](const uint8_t *packet, uint32_t size, bool directHl)
+    {
+        if (runsQueued && m_vu1RunQueue->pending())
+            m_vu1RunQueue->queuePath2Packet(packet, size, directHl);
+        else
+            submitGifPacket(GifPathId::Path2, packet, size, true, directHl);
+    };
 
     uint32_t pos = 0;
 
@@ -484,7 +503,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 (static_cast<uint64_t>(kGifFmtImage) << 58);
             std::memcpy(imagePacket.data(), &imageTag, sizeof(imageTag));
             std::memcpy(imagePacket.data() + 16u, data + pos, static_cast<size_t>(chunkQw) * 16u);
-            submitGifPacket(GifPathId::Path2, imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), true, m_vif1PendingPath2DirectHl);
+            submitPath2(imagePacket.data(), static_cast<uint32_t>(imagePacket.size()), m_vif1PendingPath2DirectHl);
 
             pos += chunkQw * 16u;
             m_vif1PendingPath2ImageQwc -= chunkQw;
@@ -548,6 +567,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_MSKPATH3)
         {
             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
+            if (runsQueued && m_vu1RunQueue->pending())
+                m_vu1RunQueue->drain();
             const bool wasMasked = m_path3Masked;
             m_path3Masked = (imm & 0x8000u) != 0u;
             if (wasMasked && !m_path3Masked)
@@ -644,8 +665,11 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 uint32_t copyBytes = mpgBytes;
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
-                if (pos + copyBytes <= sizeBytes)
+                // Games upload the same program again before each object: that changes nothing.
+                if (pos + copyBytes <= sizeBytes && std::memcmp(m_vu1Code + destAddr, data + pos, copyBytes) != 0)
                 {
+                    if (runsQueued && m_vu1RunQueue->pending())
+                        m_vu1RunQueue->drain();
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
                     markVU1CodeModified();
                 }
@@ -668,7 +692,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if (qwCount > 0)
             {
                 const bool directHl = (opcode == VIF_DIRECTHL);
-                submitGifPacket(GifPathId::Path2, data + pos, qwCount * 16, true, directHl);
+                submitPath2(data + pos, qwCount * 16, directHl);
 
                 const uint32_t pendingImageQw = pendingGifImageQwc(data + pos, qwCount * 16u);
                 if (pendingImageQw != 0u)
@@ -780,6 +804,16 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 unpackDirect(m_vu1Data, data + pos, data + sizeBytes, vn, vl, zeroExtend, writeVectorCount, vuAddr, cl,
                              wl))
             {
+                if (runsQueued && m_vu1RunQueue->pending())
+                {
+                    // Every wl vectors fill wl qwords, then cl - wl are skipped.
+                    if (cl == wl)
+                        m_vu1RunQueue->noteDataWrite(vuAddr, writeVectorCount);
+                    else
+                        for (uint32_t first = 0; first < writeVectorCount; first += wl)
+                            m_vu1RunQueue->noteDataWrite(vuAddr + (first / wl) * cl,
+                                                         std::min(wl, writeVectorCount - first));
+                }
                 pos += totalBytes;
                 if (pos > sizeBytes)
                     break;
@@ -787,6 +821,9 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             }
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
+                // This path keeps masked lanes of what is there: no runs may be pending.
+                if (runsQueued && m_vu1RunQueue->pending())
+                    m_vu1RunQueue->drain();
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
                 for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)

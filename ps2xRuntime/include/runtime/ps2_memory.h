@@ -26,6 +26,23 @@
 
 class GS;
 
+// VU1 runs started on worker threads before the runs ahead of them ended (VU1Interpreter,
+// PS2X_VU1_THREADS). They take effect in program order; the VIF1 path keeps its own VU1
+// data writes and PATH2 packets in that order through this queue.
+class Vu1RunQueue
+{
+public:
+    virtual ~Vu1RunQueue() = default;
+    // Runs started and not yet in effect.
+    virtual bool pending() const = 0;
+    // Puts every run into effect, waiting for the threads still running them.
+    virtual void drain() = 0;
+    // The VIF wrote `count` qwords of VU1 data memory starting at qword `qword` (wrapping).
+    virtual void noteDataWrite(uint32_t qword, uint32_t count) = 0;
+    // A PATH2 packet that goes to the GIF after the output of the runs started before it.
+    virtual void queuePath2Packet(const uint8_t *data, uint32_t size, bool directHl) = 0;
+};
+
 constexpr uint32_t PS2_RAM_SIZE = 32u * 1024u * 1024u; // 32MB
 constexpr uint32_t PS2_RAM_MASK = PS2_RAM_SIZE - 1u;   // Mask for 32MB alignment
 constexpr uint32_t PS2_RAM_BASE = 0x00000000;          // Physical base of RDRAM
@@ -339,6 +356,7 @@ public:
     void setVu1MscalCallback(Vu1MscalCallback cb) { m_vu1MscalCallback = std::move(cb); }
     using Vu1MscntCallback = std::function<void(uint32_t top, uint32_t itop)>;
     void setVu1MscntCallback(Vu1MscntCallback cb) { m_vu1MscntCallback = std::move(cb); }
+    void setVu1RunQueue(Vu1RunQueue *queue) { m_vu1RunQueue = queue; }
 
     uint8_t *getVU1Code() { return m_vu1Code; }
     const uint8_t *getVU1Code() const { return m_vu1Code; }
@@ -455,6 +473,7 @@ public:
     GifArbiter *m_gifArbiter = nullptr;
     Vu1MscalCallback m_vu1MscalCallback;
     Vu1MscntCallback m_vu1MscntCallback;
+    Vu1RunQueue *m_vu1RunQueue = nullptr;
 
     uint8_t *m_vu0Code = nullptr;
     uint8_t *m_vu0Data = nullptr;

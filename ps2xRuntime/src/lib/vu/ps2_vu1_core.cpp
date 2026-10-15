@@ -4,6 +4,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_vu1_detail.h"
+#include "ps2_vu1_parallel.h"
 
 #include <algorithm>
 #include <cfenv>
@@ -323,6 +324,8 @@ void VU1Interpreter::resetScheduler()
 
 void VU1Interpreter::reset()
 {
+    if (m_parallel)
+        m_parallel->drain();
     std::memset(&m_state, 0, sizeof(m_state));
     m_state.vf[0][3] = 1.0f;
     m_state.q = 1.0f;
@@ -1884,6 +1887,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
 {
     if (m_unit == Unit::VU1 && memory && !vu1CaptureDir().empty())
         captureVu1Program(vuCode, codeSize, memory->getVU1CodeGeneration(), startPC & microAddressMask());
+    if (m_parallel &&
+        runInParallel(true, vuCode, codeSize, vuData, dataSize, gs, memory, startPC, top, itop, maxCycles))
+        return;
     resetScheduler();
     m_state.pc = startPC & microAddressMask();
     m_state.ebit = false;
@@ -1907,6 +1913,8 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
                             GS &gs, PS2Memory *memory,
                             uint32_t top, uint32_t itop, uint32_t maxCycles)
 {
+    if (m_parallel && runInParallel(false, vuCode, codeSize, vuData, dataSize, gs, memory, 0u, top, itop, maxCycles))
+        return;
     m_state.top = top;
     m_state.itop = itop;
     m_state.stoppedByD = false;

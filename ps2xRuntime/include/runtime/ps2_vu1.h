@@ -9,6 +9,7 @@
 
 class GS;
 class PS2Memory;
+class Vu1RunQueue;
 
 namespace ps2x::vu1c
 {
@@ -73,6 +74,9 @@ public:
 
     VU1State &state() { return m_state; }
     const VU1State &state() const { return m_state; }
+
+    // Runs started on worker threads (PS2X_VU1_THREADS); nullptr when they are off.
+    Vu1RunQueue *runQueue();
 
 private:
     enum Pipeline : uint8_t
@@ -268,6 +272,12 @@ private:
     std::unique_ptr<ps2x::vu1c::Exec> m_compiledExec;
     std::unique_ptr<CompiledVerification> m_compiledVerification;
     std::vector<uint8_t> *m_gifCapture = nullptr;
+
+    // Translated runs on worker threads (ps2_vu1_parallel.cpp).
+    struct Parallel;
+    std::unique_ptr<Parallel> m_parallel;
+    bool runInParallel(bool mscal, uint8_t *vuCode, uint32_t codeSize, uint8_t *vuData, uint32_t dataSize, GS &gs,
+                       PS2Memory *memory, uint32_t startPC, uint32_t top, uint32_t itop, uint32_t maxCycles);
 
     void run(uint8_t *vuCode, uint32_t codeSize,
              uint8_t *vuData, uint32_t dataSize,
