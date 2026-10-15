@@ -266,6 +266,18 @@ namespace ps2x::vu1c
         Refused  // Entry PC not handled by this program; nothing was executed.
     };
 
+    // What a run did to state other than VF/VI/ACC (whose writes show in their ready
+    // cycles), for merging a run that started before the run ahead of it had ended.
+    enum : uint32_t
+    {
+        kEffectMac = 1u << 0,     // MAC written
+        kEffectStatus = 1u << 1,  // status bits 0-3 written (FMAC flags)
+        kEffectDivide = 1u << 2,  // Q and status bits 4-5 written (an FDIV result)
+        kEffectSticky = 1u << 3,  // sticky status bits replaced (FSSET)
+        kEffectClipSet = 1u << 4, // clip flags replaced (FCSET)
+        kEffectI = 1u << 5,       // I written (an I-bit pair)
+    };
+
     struct Exec
     {
         // Architectural state.
@@ -333,6 +345,44 @@ namespace ps2x::vu1c
 
         Exit exit;
         uint32_t exitPc;
+
+        // kEffect* bits, CLIP instructions run, and the VU memory qwords the run read before
+        // writing all four lanes and wrote (bit q % 64 of word q / 64 for qword q), with the
+        // lanes it wrote of each.
+        uint32_t effects;
+        uint32_t clipWrites;
+        uint64_t memRead[16];
+        uint64_t memWritten[16];
+        uint8_t memLanes[1024];
+
+        // ------------------------------------------------------------ read and write sets
+
+        PS2X_VU1C_INLINE void noteMemRead(uint32_t address)
+        {
+            const uint32_t qword = (address >> 4) & 1023u;
+            if (memLanes[qword] != 0xFu)
+                memRead[qword >> 6] |= 1ull << (qword & 63u);
+        }
+
+        PS2X_VU1C_INLINE void noteMemWrite(uint32_t address, uint8_t dest)
+        {
+            const uint32_t qword = (address >> 4) & 1023u;
+            memLanes[qword] |= dest;
+            memWritten[qword >> 6] |= 1ull << (qword & 63u);
+        }
+
+        void clearMemSets()
+        {
+            std::memset(memRead, 0, sizeof(memRead));
+            std::memset(memWritten, 0, sizeof(memWritten));
+            std::memset(memLanes, 0, sizeof(memLanes));
+        }
+
+        static uint32_t flagEffects(const FlagEntry &entry)
+        {
+            return (entry.writesMac ? kEffectMac : 0u) | (entry.writesStatus ? kEffectStatus : 0u) |
+                   (entry.writesSticky ? kEffectSticky : 0u);
+        }
 
         // ------------------------------------------------------------ timing
 
@@ -406,6 +456,7 @@ namespace ps2x::vu1c
                     status = (status & 0x03Fu) | (entry.status & 0xFC0u);
                 if (entry.writesClip)
                     clip = entry.clip;
+                effects |= flagEffects(entry);
                 flagHead = (flagHead + 1u) & 15u;
                 flagCount = 0u;
                 nextCommit = fdivPending ? fdivReady : kNever;
@@ -427,6 +478,7 @@ namespace ps2x::vu1c
                 const uint32_t currentDi = fdivStatusDi & 0x30u;
                 status = (status & 0xFCFu) | currentDi | (currentDi << 6);
                 fdivPending = false;
+                effects |= kEffectDivide;
             }
         }
 
@@ -464,6 +516,7 @@ namespace ps2x::vu1c
                     }
                     if (entry.writesClip)
                         newClip = entry.clip;
+                    effects |= flagEffects(entry);
                 }
                 mac = newMac;
                 clip = newClip;
@@ -500,6 +553,7 @@ namespace ps2x::vu1c
                         status = (status & 0x03Fu) | (entry.status & 0xFC0u);
                     if (entry.writesClip)
                         clip = entry.clip;
+                    effects |= flagEffects(entry);
                     flagHead = (flagHead + 1u) & 15u;
                     --flagCount;
                 }
@@ -509,6 +563,7 @@ namespace ps2x::vu1c
                     const uint32_t currentDi = fdivStatusDi & 0x30u;
                     status = (status & 0xFCFu) | currentDi | (currentDi << 6);
                     fdivPending = false;
+                    effects |= kEffectDivide;
                 }
             }
         }
@@ -848,6 +903,7 @@ namespace ps2x::vu1c
 
         void clipFlag(uint64_t t, uint32_t newClip)
         {
+            ++clipWrites;
             workingClip = ((workingClip << 6) | (newClip & 0x3Fu)) & 0xFFFFFFu;
             if (FlagEntry *entry = pushFlag(t))
             {
@@ -858,6 +914,7 @@ namespace ps2x::vu1c
 
         void fsset(uint64_t t, uint32_t immediate)
         {
+            effects |= kEffectSticky;
             for (uint32_t index = 0; index < flagCount; ++index)
             {
                 FlagEntry &entry = flags[(flagHead + index) & 15u];
@@ -873,6 +930,7 @@ namespace ps2x::vu1c
 
         void fcset(uint64_t t, uint32_t newClip)
         {
+            effects |= kEffectClipSet;
             workingClip = newClip & 0xFFFFFFu;
             for (uint32_t index = 0; index < flagCount; ++index)
             {
@@ -918,6 +976,7 @@ namespace ps2x::vu1c
             }
             const uint32_t qwordOffset = xgCopied;
             const uint32_t sourceOffset = (xgSource + xgCopied) % memSize;
+            noteMemRead(sourceOffset);
             if (sourceOffset + 16u <= memSize)
             {
                 std::memcpy(xgPacket + xgCopied, mem + sourceOffset, 16u);
@@ -998,6 +1057,8 @@ namespace ps2x::vu1c
         {
             const uint32_t bytes = count * 16u;
             const uint32_t source = (xgSource + xgCopied) % memSize;
+            for (uint32_t index = 0; index < count; ++index)
+                noteMemRead((source + index * 16u) % memSize);
             const uint32_t first = std::min(bytes, memSize - source);
             std::memcpy(xgPacket + xgCopied, mem + source, first);
             if (first < bytes)
@@ -1057,6 +1118,7 @@ namespace ps2x::vu1c
         {
             if (xgActive)
                 xgProgressSlow(t);
+            noteMemWrite(address, dest);
             uint32_t current[4];
             std::memcpy(current, mem + address, sizeof(current));
             for (uint32_t component = 0; component < 4u; ++component)
@@ -1082,13 +1144,15 @@ namespace ps2x::vu1c
             store(t, address, words, dest);
         }
 
-        void load(uint32_t address, float out[4]) const
+        void load(uint32_t address, float out[4])
         {
+            noteMemRead(address);
             std::memcpy(out, mem + address, 16u);
         }
 
-        int32_t loadVi(uint32_t address, uint8_t dest) const
+        int32_t loadVi(uint32_t address, uint8_t dest)
         {
+            noteMemRead(address);
             uint32_t component = 3u;
             if ((dest & 0x8u) != 0u)
                 component = 0u;
@@ -1136,12 +1200,47 @@ namespace ps2x::vu1c
 
     using ProgramFn = void (*)(Exec &x, uint32_t entryPc);
 
+    enum : uint8_t
+    {
+        kInputQ = 1u,
+        kInputI = 2u,
+        kInputMac = 4u,
+        kInputStatus = 8u,
+    };
+
+    // The state left by earlier runs that a run from an MSCAL/MSCNT entry point may read
+    // (vu1rec.py entry_inputs). With these values unchanged the run writes the same values
+    // whatever the rest of the state was.
+    struct EntryInputs
+    {
+        uint16_t pc;
+        uint16_t vi;      // VI registers (bit r)
+        uint8_t acc;      // ACC lanes (lane() bits)
+        uint8_t other;    // kInput* bits
+        uint32_t clip;    // clip flag bits
+        uint8_t vf[32];   // VF lanes per register
+    };
+
     struct Program
     {
         const char *name;
         const uint8_t *code; // micro memory image the program was translated from
         uint32_t codeBytes;  // bytes of `code` that must match (up to the last reachable pair)
         ProgramFn run;
+        // Entry points a run may start from before the run ahead of it has ended, with what
+        // they read of earlier runs' state; none for a program with FSSET.
+        const EntryInputs *entries;
+        uint32_t entryCount;
+
+        const EntryInputs *inputsAt(uint32_t pc) const
+        {
+            for (uint32_t index = 0; index < entryCount; ++index)
+            {
+                if (entries[index].pc == pc)
+                    return &entries[index];
+            }
+            return nullptr;
+        }
     };
 
     // Registers a translated program; called from static initialisers in generated code.

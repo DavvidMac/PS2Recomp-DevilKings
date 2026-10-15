@@ -9,6 +9,9 @@ code when micro memory matches the image up to the end of the translated code,
 and the interpreter otherwise. <name> is a hash of those bytes, so images that
 only differ after the code (leftovers of earlier uploads) share one file.
 --prune deletes the other vu1prog_*.cpp files in <out_dir>, so pass every image.
+Each program also lists, per MSCAL/MSCNT entry point, the state left by earlier runs that
+its runs read (entry_inputs), which lets the runtime start them on worker threads
+(PS2X_VU1_THREADS).
 
 The generated code reproduces VU1Interpreter exactly: instruction usage
 (stall sources and latencies) is decoded here the same way as
@@ -434,6 +437,197 @@ def analyse(image):
     return labels, pairs
 
 
+# ----------------------------------------------------------------------------- independent entries
+
+Q_UPPER = {0x1C, 0x20, 0x21, 0x24, 0x25}          # MULq, ADDq, MADDq, SUBq, MSUBq (and ACC forms)
+I_UPPER = {0x1D, 0x1E, 0x1F, 0x22, 0x23, 0x26, 0x27}  # MAXi, MULi, MINIi, ADDi, MADDi, SUBi, MSUBi
+I_SPECIAL = {0x1E, 0x22, 0x23, 0x26, 0x27}        # MULAi, ADDAi, MADDAi, SUBAi, MSUBAi
+CLIP_LATENCY = 4
+MAC_LATENCY = 4
+
+
+def upper_reads_q(upper):
+    op = upper & 0x3F
+    return (upper_special(upper) in Q_UPPER) if op >= 0x3C else op in Q_UPPER
+
+
+def upper_reads_i(upper):
+    op = upper & 0x3F
+    return (upper_special(upper) in I_SPECIAL) if op >= 0x3C else op in I_UPPER
+
+
+def clip_bits_read(p):
+    """Bits of the clip flag register the pair's lower instruction reads (0: none)."""
+    if p.i_bit:
+        return 0
+    imm = p.lower & 0xFFFFFF
+    if p.op_hi == 0x10:          # FCEQ: all 24 bits
+        return 0xFFFFFF
+    if p.op_hi == 0x12:          # FCAND: the bits of the mask
+        return imm
+    if p.op_hi == 0x13:          # FCOR: the bits the mask leaves out
+        return ~imm & 0xFFFFFF
+    if p.op_hi == 0x1C:          # FCGET: bits 0-11
+        return 0xFFF
+    return 0
+
+
+def entry_inputs(labels, all_pairs, entry, limit=300000):
+    """The state left by earlier runs that a run from `entry` reads, as a set of keys
+    ('vf', reg, lane), ('vi', reg), ('acc', lane), ('q',), ('i',), ('mac',), ('status',)
+    and ('clip', bits); None when the search gives up. A value counts as the run's own once
+    it wrote it: flag and Q writes only once their latency has passed (reads do not wait
+    for them); a branch reads the VI value from before the pair ahead of it (the integer-op
+    quirk); status reads always count (the sticky bits carry over). Given the same inputs a
+    run writes the same values whatever the rest of the state was, so the runtime may start
+    it on a copy of VU memory before the run ahead of it ends and check the inputs later."""
+    returns = tuple(sorted({(q.pc + 16) & 0x3FFF for q in labels.values()
+                            if q.is_branch and q.op_hi in (0x21, 0x25)}))
+    # State: pc, written keys, pending delay-slot targets, (VI reg, written before) of the
+    # pair before for the branch quirk, Q, MAC ('in', 'own' or pairs left), clip (CLIPs
+    # landed, 4 once the earlier flags are all shifted out or replaced; ((pairs left,
+    # shifts), ...) in flight, FCSET counting 4).
+    inputs = set()
+    clip_inputs = 0
+    seen = set()
+    work = [(entry, frozenset(), None, None, 'in', 'in', (0, ()))]
+    while work:
+        state = work.pop()
+        if state in seen:
+            continue
+        if len(seen) >= limit:
+            return None
+        seen.add(state)
+        pc, written, slot_targets, vb, q, mac, clip = state
+        p = all_pairs.get(pc)
+        if p is None:
+            return None
+
+        # Writes whose latency has passed by this pair.
+        if isinstance(q, int):
+            q = 'own' if q <= 1 else q - 1
+        if isinstance(mac, int):
+            mac = 'own' if mac <= 1 else mac - 1
+        shifts, pending = clip
+        still = []
+        for left, count in pending:
+            if left <= 1:
+                shifts = min(shifts + count, 4)
+            else:
+                still.append((left - 1, count))
+        pending = tuple(still)
+
+        # Reads.
+        for reg, lanes in p.up.vf_read + p.lo.vf_read:
+            if reg:
+                inputs.update(('vf', reg, c) for c in comps(lanes) if ('vf', reg, c) not in written)
+        vi_reads = (p.up.vi_read | p.lo.vi_read) & 0xFFFE
+        for reg in range(1, 16):
+            if vi_reads & (1 << reg):
+                if p.is_branch and vb is not None and vb[0] == reg:
+                    if not vb[1]:
+                        inputs.add(('vi', reg))
+                elif ('vi', reg) not in written:
+                    inputs.add(('vi', reg))
+        inputs.update(('acc', c) for c in comps(p.up.acc_read | p.lo.acc_read) if ('acc', c) not in written)
+        if upper_reads_q(p.upper) and q != 'own':
+            inputs.add(('q',))
+        if upper_reads_i(p.upper) and ('i',) not in written:
+            inputs.add(('i',))
+        if not p.i_bit and p.op_hi in MAC_READS and mac != 'own':
+            inputs.add(('mac',))
+        if not p.i_bit and p.op_hi in (0x14, 0x16, 0x17):
+            inputs.add(('status',))
+        # Each CLIP shifted the flags left by six: what is left of the earlier flags sits
+        # above the run's own bits, and stands for their low bits.
+        if shifts < 4:
+            clip_inputs |= (clip_bits_read(p) >> (6 * shifts)) & 0xFFFFFF
+
+        # Writes.
+        keys = set()
+        reg, lanes = p.up.vf_write
+        if reg:
+            keys.update(('vf', reg, c) for c in comps(lanes))
+        reg, lanes = p.lo.vf_write
+        if reg and p.suppressed != reg:
+            keys.update(('vf', reg, c) for c in comps(lanes))
+        vi_writes = p.lo.vi_write & 0xFFFE
+        keys.update(('vi', reg) for reg in range(1, 16) if vi_writes & (1 << reg))
+        keys.update(('acc', c) for c in comps(p.up.acc_write))
+        if p.i_bit:
+            keys.add(('i',))
+        first_vi = next((reg for reg in range(1, 16) if vi_writes & (1 << reg)), 0)
+        next_vb = (first_vi, ('vi', first_vi) in written) if first_vi and p.lo.delays_branch else None
+        written = written | keys if keys - written else written
+        if p.lo.pipeline == 'fdiv' and not p.lo.wait_q:
+            q = p.lo.latency     # issued after the one in flight, which has landed by then
+        elif p.lo.wait_q and isinstance(q, int):
+            q = 'own'
+        if flag_fmac(p.upper) and mac == 'in':
+            mac = MAC_LATENCY
+        if p.up.writes_clip:
+            pending = pending + ((CLIP_LATENCY, 1),)
+        if not p.i_bit and p.op_hi == 0x11:   # FCSET
+            pending = pending + ((CLIP_LATENCY, 4),)
+        clip = (shifts, pending)
+
+        # Control flow.
+        if slot_targets is not None:
+            for target in slot_targets:
+                if target is not None:
+                    work.append((target, written, None, next_vb, q, mac, clip))
+            continue
+        nxt = (pc + 8) & 0x3FFF
+        if p.e_bit:
+            work.append((nxt, written, (None,), next_vb, q, mac, clip))
+        elif p.is_branch:
+            if p.op_hi in (0x24, 0x25):
+                targets = returns
+            else:
+                targets = (p.branch_target(),) if p.op_hi in (0x20, 0x21) else \
+                    (p.branch_target(), (pc + 16) & 0x3FFF)
+            work.append((nxt, written, targets, next_vb, q, mac, clip))
+        else:
+            work.append((nxt, written, None, next_vb, q, mac, clip))
+    if clip_inputs:
+        inputs.add(('clip', clip_inputs))
+    return inputs
+
+
+def run_entries(labels, all_pairs):
+    """{entry: inputs} for the MSCAL/MSCNT entry points (PC 0 and the pairs after E-bit
+    delay slots) that a run may start from ahead of time (entry_inputs). None for a program
+    with FSSET, whose sticky status bits a later merge could not rebuild."""
+    if any(not q.i_bit and q.op_hi == 0x15 for q in all_pairs.values()):
+        return None
+    roots = {0} | {(pc + 16) & 0x3FFF for pc, q in labels.items() if q.e_bit}
+    result = {}
+    for entry in sorted(pc for pc in roots if pc in labels):
+        inputs = entry_inputs(labels, all_pairs, entry)
+        if inputs is not None:
+            result[entry] = inputs
+    return result
+
+
+def describe_inputs(inputs):
+    if not inputs:
+        return 'none'
+    vf = {}
+    words = []
+    for key in sorted(inputs, key=str):
+        if key[0] == 'vf':
+            vf[key[1]] = vf.get(key[1], '') + 'xyzw'[key[2]]
+        elif key[0] == 'vi':
+            words.append(f'vi{key[1]}')
+        elif key[0] == 'acc':
+            words.append(f'acc.{"xyzw"[key[1]]}')
+        elif key[0] == 'clip':
+            words.append(f'clip&{key[1]:06x}')
+        else:
+            words.append(key[0])
+    return ' '.join([f'vf{reg}.{"".join(sorted(lanes, key="xyzw".index))}' for reg, lanes in sorted(vf.items())] + words)
+
+
 # ----------------------------------------------------------------------------- code emission
 
 def f(x):
@@ -597,7 +791,7 @@ class Emitter:
         body.extend(up_compute)
         body.extend(lo_compute)
         if p.i_bit:
-            body.append(f'x.i = norm(bitsFloat(0x{p.lower:08x}u));')
+            body.append(f'x.i = norm(bitsFloat(0x{p.lower:08x}u)); x.effects |= kEffectI;')
         body.extend(up_write)
         body.extend(lo_write)
 
@@ -1168,7 +1362,7 @@ class Emitter:
         out.extend(up_compute)
         out.extend(lo_compute)
         if p.i_bit:
-            out.append(f'x.i = norm(bitsFloat(0x{p.lower:08x}u));')
+            out.append(f'x.i = norm(bitsFloat(0x{p.lower:08x}u)); x.effects |= kEffectI;')
         out.extend(up_write)
         out.extend(lo_write)
 
@@ -1323,7 +1517,31 @@ class Emitter:
             L('    }')
         L('}')
         L('')
-        L(f'const Program kProgram{{"vu1prog_{name}", kImage, {code_bytes}u, run}};')
+        entries = run_entries(self.pairs, self.all_pairs) or {}
+        self.entries = entries
+        if entries:
+            L('// State each entry reads from earlier runs (vu1rec.py entry_inputs).')
+            L('const EntryInputs kEntries[] = {')
+            for pc, inputs in entries.items():
+                vf = [0] * 32
+                vi = acc = other = clip = 0
+                for key in inputs:
+                    if key[0] == 'vf':
+                        vf[key[1]] |= lane(key[2])
+                    elif key[0] == 'vi':
+                        vi |= 1 << key[1]
+                    elif key[0] == 'acc':
+                        acc |= lane(key[1])
+                    elif key[0] == 'clip':
+                        clip |= key[1]
+                    else:
+                        other |= {'q': 1, 'i': 2, 'mac': 4, 'status': 8}[key[0]]
+                lanes = ', '.join(str(v) for v in vf)
+                L(f'    {{0x{pc:04x}u, 0x{vi:04x}u, {acc}u, {other}u, 0x{clip:06x}u, {{{lanes}}}}}, // {describe_inputs(inputs)}')
+            L('};')
+            L(f'const Program kProgram{{"vu1prog_{name}", kImage, {code_bytes}u, run, kEntries, {len(entries)}u}};')
+        else:
+            L(f'const Program kProgram{{"vu1prog_{name}", kImage, {code_bytes}u, run, nullptr, 0u}};')
         L('struct Registrar')
         L('{')
         L('    Registrar() { registerProgram(&kProgram); }')
@@ -1360,6 +1578,7 @@ def translate(path, out_dir, done):
     emitter = Emitter(name, pairs, all_pairs)
     text = emitter.emit(base, image, code_bytes)
     translate.lite_counts[name] = (len(emitter.lite), len(emitter.fmacs))
+    translate.entries[name] = emitter.entries
     target = os.path.join(out_dir, f'vu1prog_{name}.cpp')
     old = open(target, encoding='utf-8').read() if os.path.exists(target) else None
     if old != text:
@@ -1369,6 +1588,7 @@ def translate(path, out_dir, done):
 
 
 translate.lite_counts = {}
+translate.entries = {}
 
 
 def main():
@@ -1388,6 +1608,8 @@ def main():
             if written:
                 lite, fmacs = translate.lite_counts[name]
                 note = f', {lite} of {fmacs} FMACs without flag writes'
+                for pc, inputs in translate.entries[name].items():
+                    note += f'\n    entry {pc:04x} reads {describe_inputs(inputs)}'
             print(f'{os.path.basename(path)}: {count} pairs, {size} bytes -> vu1prog_{name}.cpp{note}')
         except Reject as error:
             print(f'{os.path.basename(path)}: not translated ({error})')

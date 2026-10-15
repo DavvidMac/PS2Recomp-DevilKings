@@ -2295,6 +2295,9 @@ void VU1Interpreter::exportCompiledState(ps2x::vu1c::Exec &x, uint8_t *vuData, u
     x.errorUser = this;
     x.exit = ps2x::vu1c::Exit::Refused;
     x.exitPc = m_state.pc;
+    x.effects = 0u;
+    x.clipWrites = 0u;
+    x.clearMemSets();
 }
 
 void VU1Interpreter::importCompiledState(const ps2x::vu1c::Exec &x)
