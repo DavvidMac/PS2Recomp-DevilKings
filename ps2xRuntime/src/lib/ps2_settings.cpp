@@ -131,6 +131,15 @@ namespace ps2x::settings
         {
             if (value == "auto")
                 return std::string();
+            if (definition.kind == Kind::Choice && !definition.choiceEnvironment.empty())
+            {
+                for (size_t index = 0; index < definition.choices.size(); ++index)
+                {
+                    if (definition.choices[index] == value && index < definition.choiceEnvironment.size())
+                        return definition.choiceEnvironment[index];
+                }
+                return std::string();
+            }
             if (definition.kind == Kind::Bool)
                 return value == "true" ? "1" : "0";
             if (definition.kind == Kind::Number)
@@ -142,6 +151,15 @@ namespace ps2x::settings
         {
             if (definition.kind == Kind::Bool)
                 return (value[0] == '0' || value[0] == '\0') ? "false" : "true";
+            if (definition.kind == Kind::Choice && !definition.choiceEnvironment.empty())
+            {
+                for (size_t index = 0; index < definition.choiceEnvironment.size(); ++index)
+                {
+                    if (!definition.choiceEnvironment[index].empty() && definition.choiceEnvironment[index] == value)
+                        return definition.choices[index];
+                }
+                return definition.defaultValue;
+            }
             return value;
         }
 
@@ -272,8 +290,15 @@ namespace ps2x::settings
             add({"video", "window", "Janela", "Como o jogo ocupa o monitor.", Kind::Choice, "windowed", nullptr,
                  {"windowed", "fullscreen", "borderless"}, {"Janela", "Tela cheia", "Tela cheia sem borda"}, 0, 0, nullptr,
                  true});
-            add({"video", "aspect", "Proporção", "4:3 é a proporção da TV para a qual o jogo foi feito.", Kind::Choice,
-                 "4:3", nullptr, {"4:3", "stretch"}, {"4:3", "Esticar na janela"}, 0, 0, nullptr, true});
+            {
+                Definition aspect{"video", "aspect", "Proporção",
+                                  "4:3 é a TV para a qual o jogo foi feito. 16:9 e 21:9 abrem a cena dos lados nos jogos "
+                                  "que suportam (o HUD 2D ainda estica).",
+                                  Kind::Choice, "4:3", "PS2X_WIDESCREEN", {"4:3", "16:9", "21:9", "stretch"},
+                                  {"4:3", "16:9", "21:9", "Esticar na janela"}, 0, 0, nullptr, false};
+                aspect.choiceEnvironment = {"", "16:9", "21:9", ""};
+                add(aspect);
+            }
             add({"video", "filter", "Filtro da imagem",
                  "Nítido mostra os pixels; suave os mistura ao ampliar; scanlines e CRT imitam a TV.", Kind::Choice,
                  "smooth", nullptr, {"sharp", "smooth", "scanlines", "crt"}, {"Nítido", "Suave", "Scanlines", "CRT"}, 0,
@@ -307,6 +332,10 @@ namespace ps2x::settings
             add({"saves", "memcard_folder", "Pasta do memory card 1",
                  "Pasta dos saves do slot 1 (o slot 2 usa a pasta irmã mc1). Relativa à pasta do jogo.", Kind::Path,
                  "mc0", nullptr, {}, {}, 0, 0, nullptr, false});
+            // Jogo (ganchos que o override do jogo implementa)
+            add({"game", "skip_intro", "Pular logos da abertura",
+                 "Vai direto à abertura e ao título, nos jogos que suportam.", Kind::Bool, "false",
+                 "PS2X_SKIP_INTRO", {}, {}, 0, 0, nullptr, false});
             // Saves: cópias de segurança
             add({"saves", "backups", "Cópias de segurança",
                  "Ao abrir o jogo, copia os memory cards para saves_backup/ e guarda as mais recentes.",

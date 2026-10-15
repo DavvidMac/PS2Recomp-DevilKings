@@ -142,7 +142,7 @@ void PS2SettingsMenu::draw(PS2Runtime &runtime)
 void PS2SettingsMenu::drawSettings(const char *section)
 {
     if (std::strcmp(section, "video") == 0)
-        helpLine("Em breve: renderizador por GPU (com MSAA e resolução maior) e 16:9 e 21:9 sem esticar o HUD.");
+        helpLine("Em breve: renderizador por GPU (com MSAA e resolução maior) e o HUD 2D sem esticar no 16:9 e 21:9.");
     for (const settings::Definition &definition : settings::definitions())
     {
         if (std::strcmp(definition.section, section) != 0)
@@ -275,6 +275,8 @@ void PS2SettingsMenu::drawControls()
 
 void PS2SettingsMenu::drawHacks()
 {
+    drawSettings("game");
+    ImGui::Separator();
     helpLine("Cada código escreve na memória do jogo a cada quadro, como um CodeBreaker. Começam desligados. "
              "Desbloqueios podem ficar gravados no memory card.");
     const std::vector<settings::CheatGroup> groups = settings::cheatGroups();

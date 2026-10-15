@@ -38,6 +38,7 @@ namespace ps2x::settings
         int maximum = 0;
         const char *autoLabel = nullptr;     // Number: shown for 0
         bool live = false;
+        std::vector<std::string> choiceEnvironment; // Choice: PS2X_* value per choice ("" = leave unset)
     };
 
     // Every setting, in menu order.
