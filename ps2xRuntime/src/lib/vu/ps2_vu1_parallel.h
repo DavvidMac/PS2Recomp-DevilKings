@@ -79,6 +79,8 @@ struct VU1Interpreter::Parallel final : public Vu1RunQueue
         uint32_t exitPc = kUnknownPc; // where the last run from here ended
         uint32_t attempts = 0;
         uint32_t failures = 0;
+        uint32_t inputFailures = 0;  // since the last report
+        uint32_t memoryFailures = 0; // since the last report
         uint32_t backoff = 0;
         uint32_t penalty = 0;
     };

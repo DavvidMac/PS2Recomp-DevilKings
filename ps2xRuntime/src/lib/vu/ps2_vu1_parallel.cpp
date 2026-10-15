@@ -11,6 +11,10 @@
 #include <immintrin.h>
 #endif
 
+// PS2X_DMA_TRACE timeline (ps2_memory.cpp).
+bool dmaTraceActive();
+void dmaTrace(const char *format, ...);
+
 namespace
 {
     // PS2X_VU1_THREADS=<n>: worker threads for translated VU1 runs (0 or unset: none).
@@ -111,10 +115,16 @@ VU1Interpreter::Parallel::~Parallel()
 
 void VU1Interpreter::Parallel::runSlot(Slot &slot)
 {
+    const bool traced = dmaTraceActive();
+    if (traced)
+        dmaTrace("vu1 run #%llu%s begins", static_cast<unsigned long long>(slot.sequence), slot.exact ? " (again)" : "");
     const unsigned int savedCsr = _mm_getcsr();
     _mm_setcsr(slot.csr);
     slot.program->run(slot.exec, slot.entryPc);
     _mm_setcsr(savedCsr);
+    if (traced)
+        dmaTrace("vu1 run #%llu ends, %llu cycles", static_cast<unsigned long long>(slot.sequence),
+                 static_cast<unsigned long long>(slot.exec.cycle - slot.startCycle));
     slot.done.store(true, std::memory_order_release);
 }
 
@@ -243,8 +253,14 @@ void VU1Interpreter::Parallel::queuePath2Packet(const uint8_t *data, uint32_t si
 
 void VU1Interpreter::Parallel::drain()
 {
+    if (items.empty())
+        return;
+    if (dmaTraceActive())
+        dmaTrace("vu1 drain, %zu items", items.size());
     while (!items.empty())
         commitFront(true);
+    if (dmaTraceActive())
+        dmaTrace("vu1 drained");
 }
 
 void VU1Interpreter::Parallel::applyLog(size_t from, size_t to)
@@ -283,7 +299,12 @@ bool VU1Interpreter::Parallel::commitFront(bool wait)
                     }
                     pause();
                 }
-                stats.waited += std::chrono::steady_clock::now() - start;
+                const auto waited = std::chrono::steady_clock::now() - start;
+                stats.waited += waited;
+                if (dmaTraceActive())
+                    dmaTrace("vu1 vif1 thread waited %.1f us for #%llu",
+                             std::chrono::duration<double, std::micro>(waited).count(),
+                             static_cast<unsigned long long>(slot.sequence));
             }
             if (commitRun(slot))
                 break;
@@ -452,9 +473,15 @@ bool VU1Interpreter::Parallel::commitRun(Slot &slot)
         else if (!ended)
             ++stats.rerunExit;
         else if (!inputsMatch(slot))
+        {
             ++stats.rerunInputs;
+            ++entry.inputFailures;
+        }
         else if (readsAhead(slot))
+        {
             ++stats.rerunMemory;
+            ++entry.memoryFailures;
+        }
         else
             ok = true;
         if (!ok)
@@ -471,6 +498,8 @@ bool VU1Interpreter::Parallel::commitRun(Slot &slot)
         prepare(slot, slot.mscal, slot.mscal ? slot.entryPc : (v.m_state.pc & v.microAddressMask()), slot.top,
                 slot.itop, slot.maxCycles, committedMemory.data(), true);
         ++stats.redone;
+        if (dmaTraceActive())
+            dmaTrace("vu1 commit #%llu stale, again on a worker", static_cast<unsigned long long>(slot.sequence));
         pushRedo(slot);
         return false;
     }
@@ -484,9 +513,13 @@ bool VU1Interpreter::Parallel::commitRun(Slot &slot)
             written[word] = x.memWritten[word];
         merge(slot);
         ++stats.merged;
+        if (dmaTraceActive())
+            dmaTrace("vu1 commit #%llu", static_cast<unsigned long long>(slot.sequence));
     }
     else
     {
+        if (dmaTraceActive())
+            dmaTrace("vu1 commit #%llu stale, again in place", static_cast<unsigned long long>(slot.sequence));
         rerun(slot, written);
     }
     slot.exact = false;
@@ -805,9 +838,15 @@ void VU1Interpreter::Parallel::reportStats()
                  "no inputs %.0f, backing off %.0f\n",
                  stats.refusals[1] / window, stats.refusals[2] / window, stats.refusals[3] / window,
                  stats.refusals[4] / window, stats.refusals[5] / window, stats.refusals[6] / window);
-    for (const EntryStats &entry : entries)
-        std::fprintf(stderr, "[vu1-par]   %s entry %04x: exit %04x, %u of %u failed, backoff %u\n", entry.program->name,
-                     entry.entryPc, entry.exitPc, entry.failures, entry.attempts, entry.backoff);
+    for (EntryStats &entry : entries)
+    {
+        std::fprintf(stderr,
+                     "[vu1-par]   %s entry %04x: exit %04x, %u of %u failed, backoff %u; per s: inputs %.0f, memory %.0f\n",
+                     entry.program->name, entry.entryPc, entry.exitPc, entry.failures, entry.attempts, entry.backoff,
+                     entry.inputFailures / window, entry.memoryFailures / window);
+        entry.inputFailures = 0u;
+        entry.memoryFailures = 0u;
+    }
     if (checkEnabled)
         std::fprintf(stderr, "[vu1-par] checked %llu runs, %llu mismatches\n",
                      static_cast<unsigned long long>(stats.checked),
@@ -992,6 +1031,8 @@ bool VU1Interpreter::runInParallel(bool mscal, uint8_t *vuCode, uint32_t codeSiz
         p.drain();
         ++p.stats.inline_;
         ++p.stats.refusals[refusal];
+        if (dmaTraceActive())
+            dmaTrace("vu1 in place (reason %d) %s %04x", refusal, program ? program->name + 8 : "-", entryPc);
         return false;
     }
 
@@ -1016,6 +1057,8 @@ bool VU1Interpreter::runInParallel(bool mscal, uint8_t *vuCode, uint32_t codeSiz
     p.predictedPc = p.entryStats(program, entryPc).exitPc;
     ++p.dispatched;
     ++p.stats.started;
+    if (dmaTraceActive())
+        dmaTrace("vu1 start #%llu %s %04x", static_cast<unsigned long long>(sequence), program->name + 8, entryPc);
     p.publish();
     return true;
 }
