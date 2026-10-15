@@ -274,8 +274,12 @@ namespace ps2x::settings
                  true});
             add({"video", "aspect", "Proporção", "4:3 é a proporção da TV para a qual o jogo foi feito.", Kind::Choice,
                  "4:3", nullptr, {"4:3", "stretch"}, {"4:3", "Esticar na janela"}, 0, 0, nullptr, true});
-            add({"video", "filter", "Filtro da imagem", "Nítido mostra os pixels; suave os mistura ao ampliar.",
-                 Kind::Choice, "smooth", nullptr, {"sharp", "smooth"}, {"Nítido", "Suave"}, 0, 0, nullptr, true});
+            add({"video", "filter", "Filtro da imagem",
+                 "Nítido mostra os pixels; suave os mistura ao ampliar; scanlines e CRT imitam a TV.", Kind::Choice,
+                 "smooth", nullptr, {"sharp", "smooth", "scanlines", "crt"}, {"Nítido", "Suave", "Scanlines", "CRT"}, 0,
+                 0, nullptr, true});
+            add({"video", "antialias", "Antisserrilhado (FXAA)", "Suaviza as bordas serrilhadas dos objetos.",
+                 Kind::Bool, "false", nullptr, {}, {}, 0, 0, nullptr, true});
             add({"video", "vsync", "VSync", "Sincroniza com o monitor (evita imagem rasgada).", Kind::Bool, "true",
                  nullptr, {}, {}, 0, 0, nullptr, true});
             add({"video", "deinterlace", "Desentrelaçamento", "Junta os dois campos entrelaçados como uma TV faz.",

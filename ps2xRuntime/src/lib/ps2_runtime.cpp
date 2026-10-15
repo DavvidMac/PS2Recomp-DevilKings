@@ -2737,8 +2737,89 @@ namespace
 {
     // Live player settings for the window and the picture (ps2x::settings, the F1 menu),
     // applied on the thread that owns the window.
+    // Presentation filters, applied while drawing the frame to the window (GLSL 330, desktop).
+    const char *kFilterShader = R"(#version 330
+in vec2 fragTexCoord;
+in vec4 fragColor;
+uniform sampler2D texture0;
+uniform vec4 colDiffuse;
+uniform vec2 textureSize;  // texels of the frame texture
+uniform vec2 pictureUv;    // texture coordinates of the picture's far corner
+uniform int mode;          // 0 plain, 1 scanlines, 2 CRT
+uniform int fxaa;
+out vec4 finalColor;
+
+float luma(vec3 c) { return dot(c, vec3(0.299, 0.587, 0.114)); }
+
+// FXAA in the style of the console version: blend along the local edge direction.
+vec3 antialiased(vec2 uv)
+{
+    vec2 px = 1.0 / textureSize;
+    vec3 nw = texture(texture0, uv + vec2(-1.0, -1.0) * px).rgb;
+    vec3 ne = texture(texture0, uv + vec2(1.0, -1.0) * px).rgb;
+    vec3 sw = texture(texture0, uv + vec2(-1.0, 1.0) * px).rgb;
+    vec3 se = texture(texture0, uv + vec2(1.0, 1.0) * px).rgb;
+    vec3 m = texture(texture0, uv).rgb;
+    float lnw = luma(nw), lne = luma(ne), lsw = luma(sw), lse = luma(se), lm = luma(m);
+    float lmin = min(lm, min(min(lnw, lne), min(lsw, lse)));
+    float lmax = max(lm, max(max(lnw, lne), max(lsw, lse)));
+    vec2 dir = vec2(-((lnw + lne) - (lsw + lse)), (lnw + lsw) - (lne + lse));
+    float reduce = max((lnw + lne + lsw + lse) * 0.03125, 1.0 / 128.0);
+    float scale = 1.0 / (min(abs(dir.x), abs(dir.y)) + reduce);
+    dir = clamp(dir * scale, vec2(-8.0), vec2(8.0)) * px;
+    vec3 a = 0.5 * (texture(texture0, uv + dir * (1.0 / 3.0 - 0.5)).rgb +
+                    texture(texture0, uv + dir * (2.0 / 3.0 - 0.5)).rgb);
+    vec3 b = a * 0.5 + 0.25 * (texture(texture0, uv - dir * 0.5).rgb + texture(texture0, uv + dir * 0.5).rgb);
+    float lb = luma(b);
+    return (lb < lmin || lb > lmax) ? a : b;
+}
+
+void main()
+{
+    vec2 uv = fragTexCoord;
+    float shade = 1.0;
+    if (mode == 2)
+    {
+        // Slightly curved glass and darker corners.
+        vec2 n = uv / pictureUv * 2.0 - 1.0;
+        n *= 1.0 + 0.035 * dot(n.yx, n.yx);
+        if (abs(n.x) > 1.0 || abs(n.y) > 1.0)
+        {
+            finalColor = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+        uv = (n * 0.5 + 0.5) * pictureUv;
+        shade *= clamp(1.0 - 0.25 * dot(n * n, n * n), 0.0, 1.0);
+    }
+    vec3 color = fxaa == 1 ? antialiased(uv) : texture(texture0, uv).rgb;
+    if (mode >= 1)
+    {
+        // A dark gap between the picture's lines.
+        float line = fract(uv.y * textureSize.y);
+        shade *= mix(0.62, 1.0, smoothstep(0.0, 0.35, line) * smoothstep(1.0, 0.65, line));
+        color *= 1.08;
+    }
+    if (mode == 2)
+    {
+        // Phosphor triads across the screen.
+        int column = int(mod(gl_FragCoord.x, 3.0));
+        vec3 mask = column == 0 ? vec3(1.0, 0.82, 0.82) : column == 1 ? vec3(0.82, 1.0, 0.82) : vec3(0.82, 0.82, 1.0);
+        color *= mask * 1.12;
+    }
+    finalColor = vec4(color * shade, 1.0) * colDiffuse * fragColor;
+}
+)";
+
     struct PresentationSettings
     {
+        Shader shader{};
+        bool shaderTried = false;
+        int shaderMode = 0;
+        bool antialias = false;
+        int uniformTextureSize = -1;
+        int uniformPictureUv = -1;
+        int uniformMode = -1;
+        int uniformFxaa = -1;
         std::string window = "windowed";
         std::string aspect = "4:3";
         std::string filter;
@@ -2794,6 +2875,7 @@ namespace
             {
                 SetTextureFilter(frameTex, wantedFilter == "sharp" ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
                 filter = wantedFilter;
+                shaderMode = wantedFilter == "scanlines" ? 1 : wantedFilter == "crt" ? 2 : 0;
             }
             aspect = settings::get("video", "aspect");
             const int wantedVolume = settings::getNumber("audio", "volume");
@@ -2803,6 +2885,41 @@ namespace
                 volume = wantedVolume;
             }
             showFps = settings::getBool("performance", "show_fps");
+            antialias = settings::getBool("video", "antialias");
+        }
+
+        // Draws the frame, through the filter shader when a filter or FXAA is on.
+        void drawFrame(const Texture2D &frameTex, const Rectangle &src, const Rectangle &dst)
+        {
+            const bool filtered = shaderMode != 0 || antialias;
+#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+            if (filtered && !shaderTried)
+            {
+                shaderTried = true;
+                shader = LoadShaderFromMemory(nullptr, kFilterShader);
+                if (!IsShaderValid(shader))
+                    std::cerr << "[video] filter shader unavailable; showing the plain picture" << std::endl;
+                uniformTextureSize = GetShaderLocation(shader, "textureSize");
+                uniformPictureUv = GetShaderLocation(shader, "pictureUv");
+                uniformMode = GetShaderLocation(shader, "mode");
+                uniformFxaa = GetShaderLocation(shader, "fxaa");
+            }
+            if (filtered && IsShaderValid(shader))
+            {
+                const float size[2] = {static_cast<float>(frameTex.width), static_cast<float>(frameTex.height)};
+                const float corner[2] = {src.width / size[0], src.height / size[1]};
+                const int fxaa = antialias ? 1 : 0;
+                SetShaderValue(shader, uniformTextureSize, size, SHADER_UNIFORM_VEC2);
+                SetShaderValue(shader, uniformPictureUv, corner, SHADER_UNIFORM_VEC2);
+                SetShaderValue(shader, uniformMode, &shaderMode, SHADER_UNIFORM_INT);
+                SetShaderValue(shader, uniformFxaa, &fxaa, SHADER_UNIFORM_INT);
+                BeginShaderMode(shader);
+                DrawTexturePro(frameTex, src, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+                EndShaderMode();
+                return;
+            }
+#endif
+            DrawTexturePro(frameTex, src, dst, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
         }
 
         // Game frames per second (display swaps), not the 60 Hz of the window.
@@ -2939,7 +3056,7 @@ void PS2Runtime::run()
             (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        presentation.drawFrame(frameTex, srcRect, dstRect);
         presentation.drawFps(dstRect);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
