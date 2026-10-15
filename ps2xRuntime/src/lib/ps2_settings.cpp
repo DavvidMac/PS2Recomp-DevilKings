@@ -287,6 +287,17 @@ namespace ps2x::settings
             std::vector<Definition> list;
             auto add = [&](Definition definition) { list.push_back(std::move(definition)); };
             // Vídeo
+            {
+                // Only the software renderer exists; the GPU ones are listed as coming.
+                Definition renderer{"video", "renderer", "Renderizador",
+                                    "Software desenha na CPU, como o PS2: o mais fiel. Os renderizadores por GPU (com "
+                                    "resolução interna maior e MSAA) ainda não existem.",
+                                    Kind::Choice, "software", nullptr, {"software", "opengl", "vulkan", "d3d11"},
+                                    {"Software (CPU)", "OpenGL (em breve)", "Vulkan (em breve)", "Direct3D 11 (em breve)"},
+                                    0, 0, nullptr, false};
+                renderer.choiceAvailable = {true, false, false, false};
+                add(renderer);
+            }
             add({"video", "window", "Janela", "Como o jogo ocupa o monitor.", Kind::Choice, "windowed", nullptr,
                  {"windowed", "fullscreen", "borderless"}, {"Janela", "Tela cheia", "Tela cheia sem borda"}, 0, 0, nullptr,
                  true});

@@ -39,6 +39,7 @@ namespace ps2x::settings
         const char *autoLabel = nullptr;     // Number: shown for 0
         bool live = false;
         std::vector<std::string> choiceEnvironment; // Choice: PS2X_* value per choice ("" = leave unset)
+        std::vector<bool> choiceAvailable;           // Choice: false greys a choice out (empty = all)
     };
 
     // Every setting, in menu order.

@@ -142,7 +142,7 @@ void PS2SettingsMenu::draw(PS2Runtime &runtime)
 void PS2SettingsMenu::drawSettings(const char *section)
 {
     if (std::strcmp(section, "video") == 0)
-        helpLine("Em breve: renderizador por GPU (com MSAA e resolução maior) e o HUD 2D sem esticar no 16:9 e 21:9.");
+        helpLine("Em breve: o HUD 2D sem esticar no 16:9 e 21:9.");
     for (const settings::Definition &definition : settings::definitions())
     {
         if (std::strcmp(definition.section, section) != 0)
@@ -172,8 +172,12 @@ void PS2SettingsMenu::drawSettings(const char *section)
             {
                 if (index != 0)
                     ImGui::SameLine();
+                const bool available =
+                    index >= definition.choiceAvailable.size() || definition.choiceAvailable[index];
+                ImGui::BeginDisabled(!available);
                 if (ImGui::RadioButton(definition.choiceLabels[index].c_str(), value == definition.choices[index]))
                     settings::set(definition.section, definition.key, definition.choices[index]);
+                ImGui::EndDisabled();
             }
             break;
         case settings::Kind::Number:
