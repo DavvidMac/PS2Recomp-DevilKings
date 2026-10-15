@@ -23,6 +23,7 @@ private:
     bool m_visible = false;
     void *m_font = nullptr; // ImFont*
     char m_pathBuffer[512] = {};
+    int m_capture = -1; // pad button waiting for a key
 };
 
 #endif // PS2_SETTINGS_MENU_H

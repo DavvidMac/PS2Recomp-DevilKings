@@ -1,6 +1,9 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
 #include "runtime/ps2_settings.h"
 
 namespace
@@ -90,34 +93,43 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
     }
     else if (!ps2x::settings::inputBlocked())
     {
-        if (IsKeyDown(KEY_UP) || IsKeyDown(KEY_W))
-            clearBit(PAD_UP);
-        if (IsKeyDown(KEY_DOWN) || IsKeyDown(KEY_S))
-            clearBit(PAD_DOWN);
-        if (IsKeyDown(KEY_LEFT) || IsKeyDown(KEY_A))
-            clearBit(PAD_LEFT);
-        if (IsKeyDown(KEY_RIGHT) || IsKeyDown(KEY_D))
-            clearBit(PAD_RIGHT);
-        if (IsKeyDown(KEY_X) || IsKeyDown(KEY_SPACE))
-            clearBit(PAD_CROSS);
-        if (IsKeyDown(KEY_C) || IsKeyDown(KEY_ESCAPE))
-            clearBit(PAD_CIRCLE);
-        if (IsKeyDown(KEY_Z) || IsKeyDown(KEY_KP_0))
-            clearBit(PAD_SQUARE);
-        if (IsKeyDown(KEY_V) || IsKeyDown(KEY_KP_1))
-            clearBit(PAD_TRIANGLE);
-        if (IsKeyDown(KEY_Q))
-            clearBit(PAD_L1);
-        if (IsKeyDown(KEY_E))
-            clearBit(PAD_R1);
-        if (IsKeyDown(KEY_LEFT_SHIFT))
-            clearBit(PAD_L2);
-        if (IsKeyDown(KEY_RIGHT_SHIFT))
-            clearBit(PAD_R2);
-        if (IsKeyDown(KEY_ENTER))
-            clearBit(PAD_START);
-        if (IsKeyDown(KEY_TAB))
-            clearBit(PAD_SELECT);
+        // Keyboard bindings from the settings ([controls], the F1 menu), parsed again when
+        // the settings change.
+        static uint64_t s_version = 0u;
+        static std::vector<std::pair<uint16_t, std::vector<int>>> s_bindings;
+        const uint64_t version = ps2x::settings::version();
+        if (version != s_version)
+        {
+            s_bindings.clear();
+            for (const ps2x::settings::PadButton &button : ps2x::settings::padButtons())
+            {
+                std::vector<int> keys;
+                const std::string list = ps2x::settings::get("controls", button.key);
+                size_t begin = 0;
+                while (begin <= list.size())
+                {
+                    size_t comma = list.find(',', begin);
+                    if (comma == std::string::npos)
+                        comma = list.size();
+                    if (const int code = ps2x::settings::keyCode(list.substr(begin, comma - begin)))
+                        keys.push_back(code);
+                    begin = comma + 1;
+                }
+                s_bindings.emplace_back(button.bit, std::move(keys));
+            }
+            s_version = version;
+        }
+        for (const auto &[bit, keys] : s_bindings)
+        {
+            for (int key : keys)
+            {
+                if (IsKeyDown(key))
+                {
+                    clearBit(bit);
+                    break;
+                }
+            }
+        }
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

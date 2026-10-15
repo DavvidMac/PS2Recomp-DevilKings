@@ -225,25 +225,50 @@ void PS2SettingsMenu::drawSettings(const char *section)
 
 void PS2SettingsMenu::drawControls()
 {
-    helpLine("Um controle conectado tem prioridade sobre o teclado. Remapear: em breve.");
-    static const char *const kKeys[][2] = {
-        {"Direcional", "Setas ou W A S D"}, {"X (Xis)", "X ou Espaço"},  {"O (Bola)", "C ou Esc"},
-        {"Quadrado", "Z ou 0 do teclado numérico"}, {"Triângulo", "V ou 1 do teclado numérico"},
-        {"L1 / R1", "Q / E"},                {"L2 / R2", "Shift esquerdo / direito"}, {"Start / Select", "Enter / Tab"},
-        {"Opções / Depuração", "F1 / F2"},
-    };
-    if (ImGui::BeginTable("keys", 2, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV))
+    helpLine("Teclado: clique em Alterar e aperte a tecla nova. Um controle conectado tem prioridade "
+             "sobre o teclado e usa o mapa padrão. F1 abre este menu e F2 o painel de depuração.");
+    if (m_capture >= 0)
+    {
+        // The first key pressed (F1/F2 aside) becomes the button's key; Backspace clears it.
+        for (int key = GetKeyPressed(); key != 0; key = GetKeyPressed())
+        {
+            if (key == KEY_F1 || key == KEY_F2)
+                continue;
+            const auto &buttons = settings::padButtons();
+            const std::string name = key == KEY_BACKSPACE ? std::string() : settings::keyName(key);
+            if (key == KEY_BACKSPACE || !name.empty())
+            {
+                settings::set("controls", buttons[static_cast<size_t>(m_capture)].key, name);
+                m_capture = -1;
+                break;
+            }
+        }
+    }
+    if (ImGui::BeginTable("keys", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV))
     {
         ImGui::TableSetupColumn("Botão do PS2");
-        ImGui::TableSetupColumn("Teclado");
+        ImGui::TableSetupColumn("Teclas");
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 110.0f);
         ImGui::TableHeadersRow();
-        for (const auto &row : kKeys)
+        const auto &buttons = settings::padButtons();
+        for (size_t index = 0; index < buttons.size(); ++index)
         {
+            ImGui::PushID(static_cast<int>(index));
             ImGui::TableNextRow();
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(row[0]);
+            ImGui::TextUnformatted(buttons[index].label);
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(row[1]);
+            if (m_capture == static_cast<int>(index))
+                ImGui::TextColored(ImVec4(0.9f, 0.75f, 0.35f, 1.0f), "aperte uma tecla (Backspace limpa)");
+            else
+            {
+                const std::string keys = settings::get("controls", buttons[index].key);
+                ImGui::TextUnformatted(keys.empty() ? "-" : keys.c_str());
+            }
+            ImGui::TableNextColumn();
+            if (ImGui::SmallButton(m_capture == static_cast<int>(index) ? "Cancelar" : "Alterar"))
+                m_capture = m_capture == static_cast<int>(index) ? -1 : static_cast<int>(index);
+            ImGui::PopID();
         }
         ImGui::EndTable();
     }

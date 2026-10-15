@@ -1,7 +1,10 @@
 #include "runtime/ps2_settings.h"
 
+#include "raylib.h"
+
 #include <algorithm>
 #include <atomic>
+#include <ctime>
 #include <cctype>
 #include <cstdlib>
 #include <fstream>
@@ -44,6 +47,52 @@ namespace ps2x::settings
         std::string keyOf(const char *section, const char *key)
         {
             return std::string(section) + "." + key;
+        }
+
+        std::atomic<uint64_t> g_version{1};
+
+        struct KeyName
+        {
+            int code;
+            const char *name;
+        };
+
+        // Keys a binding may use (F1 and F2 open the menu and the debug panel).
+        const std::vector<KeyName> &keyNames()
+        {
+            static const std::vector<KeyName> s_names = []()
+            {
+                std::vector<KeyName> names = {
+                    {KEY_UP, "UP"}, {KEY_DOWN, "DOWN"}, {KEY_LEFT, "LEFT"}, {KEY_RIGHT, "RIGHT"},
+                    {KEY_SPACE, "SPACE"}, {KEY_ENTER, "ENTER"}, {KEY_TAB, "TAB"}, {KEY_ESCAPE, "ESCAPE"},
+                    {KEY_BACKSPACE, "BACKSPACE"}, {KEY_INSERT, "INSERT"}, {KEY_DELETE, "DELETE"},
+                    {KEY_HOME, "HOME"}, {KEY_END, "END"}, {KEY_PAGE_UP, "PAGE_UP"}, {KEY_PAGE_DOWN, "PAGE_DOWN"},
+                    {KEY_LEFT_SHIFT, "LEFT_SHIFT"}, {KEY_RIGHT_SHIFT, "RIGHT_SHIFT"},
+                    {KEY_LEFT_CONTROL, "LEFT_CONTROL"}, {KEY_RIGHT_CONTROL, "RIGHT_CONTROL"},
+                    {KEY_LEFT_ALT, "LEFT_ALT"}, {KEY_RIGHT_ALT, "RIGHT_ALT"},
+                    {KEY_COMMA, "COMMA"}, {KEY_PERIOD, "PERIOD"}, {KEY_SLASH, "SLASH"}, {KEY_SEMICOLON, "SEMICOLON"},
+                    {KEY_MINUS, "MINUS"}, {KEY_EQUAL, "EQUAL"}, {KEY_APOSTROPHE, "APOSTROPHE"}, {KEY_GRAVE, "GRAVE"},
+                    {KEY_LEFT_BRACKET, "LEFT_BRACKET"}, {KEY_RIGHT_BRACKET, "RIGHT_BRACKET"},
+                    {KEY_BACKSLASH, "BACKSLASH"}, {KEY_KP_ENTER, "KP_ENTER"},
+                };
+                static const char *const kLetters[] = {"A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "M",
+                                                       "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"};
+                for (int index = 0; index < 26; ++index)
+                    names.push_back({KEY_A + index, kLetters[index]});
+                static const char *const kDigits[] = {"0", "1", "2", "3", "4", "5", "6", "7", "8", "9"};
+                static const char *const kPad[] = {"KP_0", "KP_1", "KP_2", "KP_3", "KP_4",
+                                                   "KP_5", "KP_6", "KP_7", "KP_8", "KP_9"};
+                for (int index = 0; index < 10; ++index)
+                {
+                    names.push_back({KEY_ZERO + index, kDigits[index]});
+                    names.push_back({KEY_KP_0 + index, kPad[index]});
+                }
+                static const char *const kFunctions[] = {"F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12"};
+                for (int index = 0; index < 10; ++index)
+                    names.push_back({KEY_F3 + index, kFunctions[index]});
+                return names;
+            }();
+            return s_names;
         }
 
         struct State
@@ -254,6 +303,25 @@ namespace ps2x::settings
             add({"saves", "memcard_folder", "Pasta do memory card 1",
                  "Pasta dos saves do slot 1 (o slot 2 usa a pasta irmã mc1). Relativa à pasta do jogo.", Kind::Path,
                  "mc0", nullptr, {}, {}, 0, 0, nullptr, false});
+            // Saves: cópias de segurança
+            add({"saves", "backups", "Cópias de segurança",
+                 "Ao abrir o jogo, copia os memory cards para saves_backup/ e guarda as mais recentes.",
+                 Kind::Number, "5", nullptr, {}, {}, 0, 20, "Desligado", false});
+            // Controles (teclado): uma lista de teclas por botão
+            for (const PadButton &button : padButtons())
+            {
+                static const std::map<std::string, std::string> kDefaults = {
+                    {"up", "UP,W"},       {"down", "DOWN,S"},     {"left", "LEFT,A"},       {"right", "RIGHT,D"},
+                    {"cross", "X,SPACE"}, {"circle", "C,ESCAPE"}, {"square", "Z,KP_0"},     {"triangle", "V,KP_1"},
+                    {"l1", "Q"},          {"r1", "E"},            {"l2", "LEFT_SHIFT"},     {"r2", "RIGHT_SHIFT"},
+                    {"start", "ENTER"},   {"select", "TAB"},      {"l3", ""},               {"r3", ""},
+                };
+                const auto found = kDefaults.find(button.key);
+                Definition definition{"controls", button.key, button.label, "", Kind::Keys, "", nullptr, {}, {}};
+                definition.defaultValue = found != kDefaults.end() ? found->second.c_str() : "";
+                definition.live = true;
+                add(definition);
+            }
             // Avançado
             add({"advanced", "debug_panel", "Painel de depuração", "CPU, threads, GS, DMA e memória (F2).", Kind::Bool,
                  "false", nullptr, {}, {}, 0, 0, nullptr, true});
@@ -399,6 +467,7 @@ namespace ps2x::settings
         s.values[keyOf(section, key)] = value;
         if (std::string(section) == "hacks")
             refreshCheats(s);
+        g_version.fetch_add(1u, std::memory_order_relaxed);
     }
 
     bool overriddenByEnvironment(const char *section, const char *key)
@@ -420,6 +489,7 @@ namespace ps2x::settings
         }
         s.values[keyOf("hacks", "enabled")].clear();
         refreshCheats(s);
+        g_version.fetch_add(1u, std::memory_order_relaxed);
     }
 
     bool restartNeeded()
@@ -465,6 +535,100 @@ namespace ps2x::settings
         State &s = state();
         std::lock_guard<std::mutex> lock(s.mutex);
         return s.frameWrites;
+    }
+
+    uint64_t version()
+    {
+        return g_version.load(std::memory_order_relaxed);
+    }
+
+    const std::vector<PadButton> &padButtons()
+    {
+        static const std::vector<PadButton> s_buttons = {
+            {"up", "Direcional ↑", 0x0010u},   {"down", "Direcional ↓", 0x0040u},
+            {"left", "Direcional ←", 0x0080u}, {"right", "Direcional →", 0x0020u},
+            {"cross", "X (Xis)", 0x4000u},     {"circle", "O (Bola)", 0x2000u},
+            {"square", "Quadrado", 0x8000u},   {"triangle", "Triângulo", 0x1000u},
+            {"l1", "L1", 0x0400u},             {"r1", "R1", 0x0800u},
+            {"l2", "L2", 0x0100u},             {"r2", "R2", 0x0200u},
+            {"start", "Start", 0x0008u},       {"select", "Select", 0x0001u},
+            {"l3", "L3", 0x0002u},             {"r3", "R3", 0x0004u},
+        };
+        return s_buttons;
+    }
+
+    int keyCode(const std::string &name)
+    {
+        for (const KeyName &key : keyNames())
+        {
+            if (name == key.name)
+                return key.code;
+        }
+        return 0;
+    }
+
+    std::string keyName(int code)
+    {
+        for (const KeyName &key : keyNames())
+        {
+            if (code == key.code)
+                return key.name;
+        }
+        return std::string();
+    }
+
+    void backupMemoryCards(const std::filesystem::path &mcRoot, int keep)
+    {
+        if (keep <= 0)
+            return;
+        std::error_code error;
+        std::vector<std::filesystem::path> cards;
+        for (const std::filesystem::path &folder : {mcRoot, mcRoot.parent_path() / "mc1"})
+        {
+            if (std::filesystem::is_directory(folder, error) && !std::filesystem::is_empty(folder, error))
+                cards.push_back(folder);
+        }
+        if (cards.empty())
+            return;
+        std::filesystem::path backups;
+        {
+            State &s = state();
+            std::lock_guard<std::mutex> lock(s.mutex);
+            backups = s.elfDirectory / "saves_backup";
+        }
+        char stamp[32];
+        const std::time_t now = std::time(nullptr);
+        std::tm local{};
+#ifdef _WIN32
+        localtime_s(&local, &now);
+#else
+        localtime_r(&now, &local);
+#endif
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
+        for (const std::filesystem::path &card : cards)
+        {
+            const std::filesystem::path target = backups / stamp / card.filename();
+            std::filesystem::create_directories(target, error);
+            std::filesystem::copy(card, target,
+                                  std::filesystem::copy_options::recursive | std::filesystem::copy_options::overwrite_existing,
+                                  error);
+            if (error)
+                std::cerr << "[settings] backup of " << card.string() << " failed: " << error.message() << std::endl;
+        }
+        // Keep the newest copies (the names sort by date).
+        std::vector<std::filesystem::path> copies;
+        for (const auto &entry : std::filesystem::directory_iterator(backups, error))
+        {
+            if (entry.is_directory())
+                copies.push_back(entry.path());
+        }
+        std::sort(copies.begin(), copies.end());
+        while (copies.size() > static_cast<size_t>(keep))
+        {
+            std::filesystem::remove_all(copies.front(), error);
+            copies.erase(copies.begin());
+        }
+        std::cerr << "[settings] memory cards copied to " << (backups / stamp).string() << std::endl;
     }
 
     namespace

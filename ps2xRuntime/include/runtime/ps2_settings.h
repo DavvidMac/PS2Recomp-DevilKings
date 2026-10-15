@@ -20,6 +20,7 @@ namespace ps2x::settings
         Choice, // one of `choices`
         Number, // integer in [minimum, maximum]; 0 may mean "auto" (see autoLabel)
         Path,
+        Keys,   // keyboard keys, comma-separated raylib names (controls section)
     };
 
     struct Definition
@@ -85,6 +86,26 @@ namespace ps2x::settings
     void setCheatEnabled(const std::string &name, bool enabled);
     // The writes of every enabled group (cheap to call once per VSync).
     std::shared_ptr<const std::vector<FrameWrite>> activeFrameWrites();
+
+    // Increments on every change, for readers that cache what they parse from the settings.
+    uint64_t version();
+
+    // ---------------------------------------------------------------- keyboard and saves
+
+    struct PadButton
+    {
+        const char *key;   // setting in [controls]
+        const char *label; // shown in the menu
+        uint16_t bit;      // pad button bit (active low in the pad report)
+    };
+    const std::vector<PadButton> &padButtons();
+    int keyCode(const std::string &name); // raylib key, 0 when unknown
+    std::string keyName(int code);         // empty when the key has no name here
+
+    // Copies the memory card folders (mcRoot and its sibling mc1) to saves_backup/<date-time>
+    // next to the ELF, keeping the newest `keep` copies; nothing when keep is 0 or the cards
+    // are empty.
+    void backupMemoryCards(const std::filesystem::path &mcRoot, int keep);
 
     // ---------------------------------------------------------------- runtime state for the UI
 

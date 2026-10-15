@@ -250,6 +250,8 @@ int main(int argc, char *argv[])
             paths.mcRoot = folder;
             PS2Runtime::setIoPaths(paths);
         }
+        ps2x::settings::backupMemoryCards(PS2Runtime::getIoPaths().mcRoot,
+                                          ps2x::settings::getNumber("saves", "backups"));
 
         runtime.run();
 
