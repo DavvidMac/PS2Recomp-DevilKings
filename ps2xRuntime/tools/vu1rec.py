@@ -20,6 +20,7 @@ ps2_vu1_upper.cpp / ps2_vu1_lower.cpp. Programs using anything not handled
 here (EFU, R register, D/T breakpoints, branches in delay slots) are rejected
 and stay on the interpreter.
 """
+import glob
 import os
 import sys
 
@@ -1598,10 +1599,14 @@ def main():
     if len(args) < 2:
         raise SystemExit(__doc__)
     out_dir = args[0]
+    # cmd.exe passes wildcards through unexpanded, so expand them here.
+    images = [match for arg in args[1:] for match in (glob.glob(arg) if glob.has_magic(arg) else [arg])]
+    if not images:
+        raise SystemExit(f'no images match {" ".join(args[1:])}')
     os.makedirs(out_dir, exist_ok=True)
     done = set()
     # Sorted, so the image named in each file's header does not depend on argument order.
-    for path in sorted(args[1:], key=os.path.basename):
+    for path in sorted(images, key=os.path.basename):
         try:
             name, count, size, written = translate(path, out_dir, done)
             note = '' if written else ' (same code as an earlier image)'
