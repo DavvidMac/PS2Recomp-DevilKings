@@ -474,10 +474,12 @@ namespace
     {
         uint32_t address;
         uint32_t value;
+        uint32_t size;
     };
 
-    // PS2X_POKE=<addr>=<value>[,<addr>=<value>...] (hex) writes each 32-bit value to
-    // EE RAM on every VSync, the way a CodeBreaker constant-write code does.
+    // PS2X_POKE=<addr>[.b|.h]=<value>[,...] (hex) writes each value to EE RAM on every
+    // VSync, the way a CodeBreaker constant-write code does: 32 bits by default, 8 bits
+    // with .b and 16 bits with .h.
     const std::vector<GuestPoke> &guestPokes()
     {
         static const std::vector<GuestPoke> s_pokes = []()
@@ -488,15 +490,22 @@ namespace
             {
                 char *end = nullptr;
                 const unsigned long address = std::strtoul(cursor, &end, 16);
+                uint32_t size = 4u;
+                if (end && end[0] == '.' && (end[1] == 'b' || end[1] == 'h'))
+                {
+                    size = end[1] == 'b' ? 1u : 2u;
+                    end += 2;
+                }
                 if (!end || *end != '=')
                 {
                     std::cerr << "[poke] ignoring malformed PS2X_POKE at '" << cursor << "'" << std::endl;
                     break;
                 }
                 const unsigned long value = std::strtoul(end + 1, &end, 16);
-                pokes.push_back({static_cast<uint32_t>(address) & 0x1FFFFFFCu, static_cast<uint32_t>(value)});
+                pokes.push_back({static_cast<uint32_t>(address) & 0x1FFFFFFFu & ~(size - 1u),
+                                 static_cast<uint32_t>(value), size});
                 std::cerr << std::hex << "[poke] 0x" << pokes.back().address << " = 0x" << pokes.back().value
-                          << std::dec << " every VSync" << std::endl;
+                          << std::dec << " (" << size * 8u << " bits) every VSync" << std::endl;
                 cursor = (end && *end == ',') ? end + 1 : end;
             }
             return pokes;
@@ -509,9 +518,9 @@ void EeScheduler::dumpThreadsForDiagnostics() const
 {
     for (const GuestPoke &poke : guestPokes())
     {
-        if (m_rdram && poke.address <= PS2_RAM_SIZE - sizeof(uint32_t))
+        if (m_rdram && poke.address <= PS2_RAM_SIZE - poke.size)
         {
-            std::memcpy(m_rdram + poke.address, &poke.value, sizeof(poke.value));
+            std::memcpy(m_rdram + poke.address, &poke.value, poke.size);
         }
     }
     // Cheat groups enabled in the settings menu (cheats/*.pnach).
