@@ -17,20 +17,23 @@ void dmaTrace(const char *format, ...);
 
 namespace
 {
-    // PS2X_VU1_THREADS=<n>: worker threads for translated VU1 runs (0 or unset: none).
+    // PS2X_VU1_THREADS=<n>: worker threads for translated VU1 runs (0: none). Unset: 3 with 8
+    // or more logical CPUs, 2 with 6 or 7 (the GS bands take most of the rest), else none.
     // Read when the runtime asks for the queue (once, at start-up).
     uint32_t vu1ThreadCount()
     {
-        const char *value = std::getenv("PS2X_VU1_THREADS");
-        const int count = value ? std::atoi(value) : 0;
-        return static_cast<uint32_t>(std::clamp(count, 0, 16));
+        if (const char *value = std::getenv("PS2X_VU1_THREADS"))
+            return static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16));
+        const unsigned int cpus = std::thread::hardware_concurrency();
+        return cpus >= 8u ? 3u : cpus >= 6u ? 2u : 0u;
     }
 
-    // PS2X_VU1_DEPTH=<n>: runs that may be started and not yet in effect (default threads + 2).
+    // PS2X_VU1_DEPTH=<n>: runs that may be started and not yet in effect (default 10, the best
+    // measured with 3 threads in Devil Kings battles).
     uint32_t vu1Depth(uint32_t threads)
     {
         const char *value = std::getenv("PS2X_VU1_DEPTH");
-        const int depth = value ? std::atoi(value) : static_cast<int>(threads) + 2;
+        const int depth = value ? std::atoi(value) : std::max(10, static_cast<int>(threads) + 2);
         return static_cast<uint32_t>(std::clamp(depth, 2, 64));
     }
 

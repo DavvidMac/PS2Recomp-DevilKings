@@ -80,6 +80,8 @@ namespace ps2x::settings
         // The PS2X_* value for a setting, or empty for "leave the runtime default".
         std::string environmentValue(const Definition &definition, const std::string &value)
         {
+            if (value == "auto")
+                return std::string();
             if (definition.kind == Kind::Bool)
                 return value == "true" ? "1" : "0";
             if (definition.kind == Kind::Number)
@@ -236,9 +238,10 @@ namespace ps2x::settings
             add({"performance", "vif1_thread", "VIF1 em thread própria",
                  "Processa a geometria em paralelo com a lógica do jogo, como no console.", Kind::Bool, "true",
                  "PS2X_VIF1_THREAD", {}, {}, 0, 0, nullptr, false});
-            add({"performance", "vu1_threads", "Threads do VU1 (experimental)",
-                 "Programas do VU1 em paralelo, mesmo resultado; cerca de +10% em batalha com 3.", Kind::Number, "0",
-                 "PS2X_VU1_THREADS", {}, {}, 0, 8, "Desligado", false});
+            add({"performance", "vu1_threads", "Threads do VU1",
+                 "Programas do VU1 em paralelo, mesmo resultado; cerca de +10% em batalha. Automático usa 3 com 8 "
+                 "ou mais núcleos lógicos.", Kind::Choice, "auto", "PS2X_VU1_THREADS", {"auto", "0", "2", "3", "4"},
+                 {"Automático", "Desligado", "2", "3", "4"}, 0, 0, nullptr, false});
             add({"performance", "vu1_depth", "Execuções do VU1 adiantadas",
                  "Quantas execuções do VU1 podem começar antes das anteriores terminarem.", Kind::Number, "0",
                  "PS2X_VU1_DEPTH", {}, {}, 0, 64, "Automático", false});
