@@ -142,7 +142,8 @@ void PS2SettingsMenu::draw(PS2Runtime &runtime)
 void PS2SettingsMenu::drawSettings(const char *section)
 {
     if (std::strcmp(section, "video") == 0)
-        helpLine("Em breve: renderizador por GPU, filtros CRT e scanlines, 16:9 e 21:9 sem esticar o HUD.");
+        helpLine("Em breve: renderizador por GPU, antisserrilhado (FXAA/MSAA), filtros CRT e scanlines, 16:9 e 21:9 "
+                 "sem esticar o HUD e, com GPU, mais inimigos e objetos na tela (densidade da batalha).");
     for (const settings::Definition &definition : settings::definitions())
     {
         if (std::strcmp(definition.section, section) != 0)
