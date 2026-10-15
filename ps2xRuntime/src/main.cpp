@@ -1,7 +1,9 @@
 #include "ps2_runtime.h"
 #include "games_database.h"
+#include "runtime/ps2_settings.h"
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
 #include "ps2_debug_panel.h"
+#include "ps2_settings_menu.h"
 #endif
 
 #ifdef _DEBUG
@@ -193,26 +195,37 @@ int main(int argc, char *argv[])
             windowTitle += elfName;
         }
 
+        // settings.ini next to the ELF, before anything reads the PS2X_* variables it sets.
+        ps2x::settings::load(pathObj);
+
         PS2Runtime runtime;
 #if defined(PS2X_ENABLE_DEBUG_UI) && !defined(PLATFORM_VITA)
         // This hook is to prevent leak rlimgui deps to recompiler etc
-        PS2DebugPanel debugPanel;
+        struct UiHost
+        {
+            PS2DebugPanel debugPanel;   // F2
+            PS2SettingsMenu settingsMenu; // F1
+        } ui;
         runtime.setDebugUiCallbacks(
             [](PS2Runtime &rt, void *userData)
             {
                 (void)rt;
-                static_cast<PS2DebugPanel *>(userData)->initialize();
+                auto *host = static_cast<UiHost *>(userData);
+                host->debugPanel.initialize();
+                host->settingsMenu.initialize();
             },
             [](PS2Runtime &rt, void *userData)
             {
-                static_cast<PS2DebugPanel *>(userData)->draw(rt);
+                auto *host = static_cast<UiHost *>(userData);
+                host->debugPanel.draw(rt);
+                host->settingsMenu.draw(rt);
             },
             [](PS2Runtime &rt, void *userData)
             {
                 (void)rt;
-                static_cast<PS2DebugPanel *>(userData)->shutdown();
+                static_cast<UiHost *>(userData)->debugPanel.shutdown();
             },
-            &debugPanel);
+            &ui);
 #endif
         if (!runtime.initialize(windowTitle.c_str()))
         {
@@ -224,6 +237,18 @@ int main(int argc, char *argv[])
         {
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
             return 1;
+        }
+
+        // Memory card folder from the settings (relative to the ELF's folder).
+        const std::string memcardFolder = ps2x::settings::get("saves", "memcard_folder");
+        if (!memcardFolder.empty())
+        {
+            PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+            std::filesystem::path folder(memcardFolder);
+            if (folder.is_relative())
+                folder = paths.elfDirectory / folder;
+            paths.mcRoot = folder;
+            PS2Runtime::setIoPaths(paths);
         }
 
         runtime.run();

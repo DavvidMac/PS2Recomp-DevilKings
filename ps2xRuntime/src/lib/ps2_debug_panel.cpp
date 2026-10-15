@@ -29,6 +29,7 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include "runtime/ps2_settings.h"
 
 namespace
 {
@@ -2206,9 +2207,12 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         return;
     }
 
-    if (IsKeyPressed(KEY_F1))
+    // F2, or the switch in the settings menu (F1).
+    m_visible = ps2x::settings::getBool("advanced", "debug_panel");
+    if (IsKeyPressed(KEY_F2))
     {
-        toggleVisible();
+        m_visible = !m_visible;
+        ps2x::settings::set("advanced", "debug_panel", m_visible ? "true" : "false");
     }
 
     if (!m_visible)
@@ -2302,6 +2306,8 @@ void PS2DebugPanel::draw(PS2Runtime &runtime)
         }
     }
     ImGui::End();
+    if (!m_visible)
+        ps2x::settings::set("advanced", "debug_panel", "false");
 
     rlImGuiEnd();
 #else

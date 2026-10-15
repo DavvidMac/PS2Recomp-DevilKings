@@ -28,6 +28,7 @@
 #include <thread>
 #include <unordered_map>
 #include <sstream>
+#include "runtime/ps2_settings.h"
 
 namespace
 {
@@ -2732,6 +2733,102 @@ void PS2Runtime::HandleIntegerOverflow(R5900Context *ctx)
     raiseCop0Exception(ctx, EXCEPTION_INTEGER_OVERFLOW);
 }
 
+namespace
+{
+    // Live player settings for the window and the picture (ps2x::settings, the F1 menu),
+    // applied on the thread that owns the window.
+    struct PresentationSettings
+    {
+        std::string window = "windowed";
+        std::string aspect = "4:3";
+        std::string filter;
+        int volume = -1;
+        int vsync = -1;
+        bool showFps = false;
+        int restoreWidth = 0;
+        int restoreHeight = 0;
+        uint64_t fpsFrames = 0;
+        double fpsTime = 0.0;
+        float fps = 0.0f;
+
+        void apply(Texture2D &frameTex)
+        {
+            namespace settings = ps2x::settings;
+            const std::string wantedWindow = settings::get("video", "window");
+            if (wantedWindow != window)
+            {
+                if (window == "fullscreen")
+                    ToggleFullscreen();
+                else if (window == "borderless")
+                    ToggleBorderlessWindowed();
+                if (window != "windowed" && restoreWidth > 0)
+                    SetWindowSize(restoreWidth, restoreHeight);
+                if (wantedWindow != "windowed")
+                {
+                    restoreWidth = GetScreenWidth();
+                    restoreHeight = GetScreenHeight();
+                }
+                if (wantedWindow == "fullscreen")
+                {
+                    const int monitor = GetCurrentMonitor();
+                    SetWindowSize(GetMonitorWidth(monitor), GetMonitorHeight(monitor));
+                    ToggleFullscreen();
+                }
+                else if (wantedWindow == "borderless")
+                {
+                    ToggleBorderlessWindowed();
+                }
+                window = wantedWindow;
+            }
+            const int wantedVsync = settings::getBool("video", "vsync") ? 1 : 0;
+            if (wantedVsync != vsync)
+            {
+                if (wantedVsync)
+                    SetWindowState(FLAG_VSYNC_HINT);
+                else if (vsync >= 0)
+                    ClearWindowState(FLAG_VSYNC_HINT);
+                vsync = wantedVsync;
+            }
+            const std::string wantedFilter = settings::get("video", "filter");
+            if (wantedFilter != filter)
+            {
+                SetTextureFilter(frameTex, wantedFilter == "sharp" ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
+                filter = wantedFilter;
+            }
+            aspect = settings::get("video", "aspect");
+            const int wantedVolume = settings::getNumber("audio", "volume");
+            if (wantedVolume != volume && IsAudioDeviceReady())
+            {
+                SetMasterVolume(static_cast<float>(std::clamp(wantedVolume, 0, 100)) / 100.0f);
+                volume = wantedVolume;
+            }
+            showFps = settings::getBool("performance", "show_fps");
+        }
+
+        // Game frames per second (display swaps), not the 60 Hz of the window.
+        void drawFps(const Rectangle &picture)
+        {
+            const double now = GetTime();
+            const uint64_t frames = ps2x::settings::gameFrames();
+            if (now - fpsTime >= 0.5)
+            {
+                if (fpsTime > 0.0)
+                    fps = static_cast<float>((frames - fpsFrames) / (now - fpsTime));
+                fpsFrames = frames;
+                fpsTime = now;
+            }
+            if (!showFps)
+                return;
+            char text[32];
+            std::snprintf(text, sizeof(text), "%.0f FPS", fps);
+            const int x = static_cast<int>(picture.x) + 10;
+            const int y = static_cast<int>(picture.y) + 8;
+            DrawText(text, x + 2, y + 2, 20, BLACK);
+            DrawText(text, x, y, 20, fps >= 58.0f ? GREEN : fps >= 45.0f ? YELLOW : RED);
+        }
+    };
+}
+
 void PS2Runtime::run()
 {
     m_stopRequested.store(false, std::memory_order_relaxed);
@@ -2757,6 +2854,7 @@ void PS2Runtime::run()
     Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
+    PresentationSettings presentation;
 
     std::atomic<bool> gameThreadFinished{false};
 
@@ -2820,15 +2918,21 @@ void PS2Runtime::run()
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
 
+        presentation.apply(frameTex);
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        // A PS2 picture fills a 4:3 TV whatever the size of its frame buffer.
+        float dstWidth = screenWidth;
+        float dstHeight = screenHeight;
+        if (presentation.aspect == "4:3")
+        {
+            dstWidth = std::min(screenWidth, screenHeight * 4.0f / 3.0f);
+            dstHeight = dstWidth * 3.0f / 4.0f;
+        }
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -2836,6 +2940,7 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        presentation.drawFps(dstRect);
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

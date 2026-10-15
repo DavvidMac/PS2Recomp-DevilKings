@@ -11,6 +11,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include "runtime/ps2_settings.h"
 
 namespace
 {
@@ -511,6 +512,16 @@ void EeScheduler::dumpThreadsForDiagnostics() const
         if (m_rdram && poke.address <= PS2_RAM_SIZE - sizeof(uint32_t))
         {
             std::memcpy(m_rdram + poke.address, &poke.value, sizeof(poke.value));
+        }
+    }
+    // Cheat groups enabled in the settings menu (cheats/*.pnach).
+    if (m_rdram)
+    {
+        const auto writes = ps2x::settings::activeFrameWrites();
+        for (const ps2x::settings::FrameWrite &write : *writes)
+        {
+            if (write.address <= PS2_RAM_SIZE - write.size)
+                std::memcpy(m_rdram + write.address, &write.value, write.size);
         }
     }
 

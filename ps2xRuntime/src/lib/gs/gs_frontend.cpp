@@ -11,6 +11,7 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include "runtime/ps2_settings.h"
 
 namespace
 {
@@ -590,6 +591,7 @@ void GS::latchPresentationOnDisplaySwap()
     const uint64_t previous2 = m_lastSwapDispfb2.exchange(dispfb2);
     if (previous1 == dispfb1 && previous2 == dispfb2)
         return;
+    ps2x::settings::countGameFrame();
     static const bool traceFps = std::getenv("PS2X_FPS_TRACE") != nullptr;
     if (traceFps)
     {
