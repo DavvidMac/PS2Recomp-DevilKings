@@ -37,6 +37,9 @@ public:
     // (the usual case: every path but a masked PATH3 drains right away).
     void submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool path2DirectHl = false);
     bool empty() const { return m_queue.empty(); }
+    // The path of the packet this thread is handing to the process function, 0 outside a
+    // dispatch (packets the GS receives without the arbiter, such as XGKICK, come from PATH1).
+    static uint8_t dispatchingPath();
 
 private:
     ProcessPacketFn m_processFn;

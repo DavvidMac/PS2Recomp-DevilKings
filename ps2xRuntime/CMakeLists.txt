@@ -527,6 +527,27 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+
+# Vulkan renderer: paraLLEl-GS (the GS emulated in Vulkan compute, LGPL-3.0+), built when
+# PS2X_PGS_DIR points at a checkout of https://github.com/Arntzen-Software/parallel-gs (or a fork)
+# with its Granite submodule initialised recursively (on Windows: git config core.longpaths true).
+set(PS2X_PGS_DIR "" CACHE PATH "paraLLEl-GS checkout for the Vulkan renderer (empty: not built)")
+if(PS2X_PGS_DIR AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID AND NOT APPLE)
+    if(EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND EXISTS "${PS2X_PGS_DIR}/Granite/third_party/volk/volk.c")
+        set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
+        # paraLLEl-GS picks the static MSVC runtime unless one is set; the runtime links the DLL one.
+        set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+        add_subdirectory("${PS2X_PGS_DIR}" "${CMAKE_BINARY_DIR}/parallel-gs" EXCLUDE_FROM_ALL)
+        target_sources(ps2_runtime PRIVATE src/lib/gs/gs_pgs.cpp)
+        target_link_libraries(ps2_runtime PUBLIC parallel-gs)
+        target_compile_definitions(ps2_runtime PUBLIC PS2X_HAVE_PGS=1)
+        message(STATUS "[pgs] Vulkan renderer (paraLLEl-GS) from ${PS2X_PGS_DIR}")
+    else()
+        message(WARNING "[pgs] PS2X_PGS_DIR=${PS2X_PGS_DIR} is not a complete paraLLEl-GS checkout "
+                        "(run git submodule update --init --recursive in it); the Vulkan renderer is not built")
+    endif()
+endif()
+
 target_link_libraries(ps2EntryRunner
     PRIVATE
     ps2_runtime

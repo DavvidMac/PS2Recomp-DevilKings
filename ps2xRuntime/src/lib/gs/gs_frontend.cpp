@@ -1,5 +1,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_pgs.h"
+#include "runtime/gs/ps2_gif_arbiter.h"
 #include "ps2_log.h"
 #include "runtime/ps2_memory.h"
 #include <atomic>
@@ -166,6 +168,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     m_localMemoryStorage = vram;
     m_localMemorySize = vramSize;
     m_privRegs = privRegs;
+    ps2x::pgs::setRegisters(privRegs);
     if (!m_backend)
         m_backend = std::make_unique<GSCpuBackend>();
     m_backend->Initialize(vram, vramSize);
@@ -610,6 +613,12 @@ void GS::latchPresentationOnDisplaySwap()
     }
     m_lastSwapLatchTick.store(m_privRegs->vsyncTick.load(std::memory_order_acquire));
     m_hasSwapLatch.store(true);
+    if (ps2x::pgs::active())
+    {
+        // Every packet of the frame just flipped to went to the Vulkan renderer before this one.
+        ps2x::pgs::vsync();
+        return;
+    }
 
     GSCpuBackend *cpuBackend = dynamic_cast<GSCpuBackend *>(m_backend.get());
     if (!cpuBackend)
@@ -647,6 +656,11 @@ bool GS::isPresentationSwapDriven(uint64_t vsyncTick) const
 
 void GS::latchHostPresentationFrame()
 {
+    if (ps2x::pgs::active())
+    {
+        ps2x::pgs::vsync();
+        return;
+    }
     GSPresentationRequest request{};
     {
         std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
@@ -765,6 +779,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+
+    if (ps2x::pgs::active())
+    {
+        const uint8_t path = GifArbiter::dispatchingPath();
+        ps2x::pgs::gifTransfer(path ? path - 1u : ps2x::pgs::PathVu1, data, sizeBytes);
+    }
 
     if (tryProcessNativeImageUploadPacket(data, sizeBytes))
         return;
@@ -894,6 +914,8 @@ bool GS::processNativePackedGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     if (!processed)
         return false;
 
+    if (ps2x::pgs::active())
+        ps2x::pgs::gifTransfer(ps2x::pgs::PathGif, data, sizeBytes);
     ++m_nativePackedGIFPacketCount;
     return true;
 }
@@ -906,6 +928,25 @@ void GS::uploadImageNative(uint64_t bitbltbuf,
                            uint32_t sizeBytes)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x::pgs::active() && data && sizeBytes != 0u)
+    {
+        // The same upload as a GIF packet: the four transfer registers through A+D, then IMAGE.
+        const uint32_t imageQwords = (sizeBytes + 15u) / 16u;
+        std::vector<uint8_t> packet((6u + imageQwords) * 16u, 0u);
+        const auto put64 = [&packet](size_t offset, uint64_t value) { std::memcpy(packet.data() + offset, &value, 8u); };
+        put64(0u, 4ull | (1ull << 60));   // NLOOP 4, PACKED, NREG 1
+        put64(8u, 0xEull);                // A+D
+        const uint64_t setup[4][2] = {{bitbltbuf, GS_REG_BITBLTBUF}, {trxpos, GS_REG_TRXPOS},
+                                      {trxreg, GS_REG_TRXREG}, {trxdir, GS_REG_TRXDIR}};
+        for (size_t i = 0; i < 4u; ++i)
+        {
+            put64(16u + i * 16u, setup[i][0]);
+            put64(24u + i * 16u, setup[i][1]);
+        }
+        put64(80u, static_cast<uint64_t>(imageQwords) | (1ull << 15) | (2ull << 58));   // IMAGE, EOP
+        std::memcpy(packet.data() + 96u, data, sizeBytes);
+        ps2x::pgs::gifTransfer(ps2x::pgs::PathHost, packet.data(), static_cast<uint32_t>(packet.size()));
+    }
     uploadImageNativeUnlocked(bitbltbuf, trxpos, trxreg, trxdir, data, sizeBytes);
 }
 
@@ -1184,6 +1225,12 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x::pgs::active())
+    {
+        // One A+D write: NLOOP 1, EOP, PACKED, NREG 1.
+        const uint64_t packet[4] = {1ull | (1ull << 15) | (1ull << 60), 0xEull, value, regAddr};
+        ps2x::pgs::gifTransfer(ps2x::pgs::PathHost, reinterpret_cast<const uint8_t *>(packet), sizeof(packet));
+    }
     writeRegisterUnlocked(regAddr, value);
 }
 
@@ -1513,6 +1560,13 @@ void GS::writeRegisterUnlocked(uint8_t regAddr, uint64_t value)
             command.trxpos = m_trxpos;
             command.trxreg = m_trxreg;
             command.direction = m_trxdir;
+            // GS->EE: the CPU backend reads its own VRAM, which only paraLLEl-GS draws into.
+            if (command.direction == 1u && ps2x::pgs::exclusive())
+            {
+                m_backend->Flush();
+                m_backend->Sync(GSSyncReason::DebugReadback);
+                ps2x::pgs::readVram(m_localMemoryStorage, m_localMemorySize);
+            }
             if (drawTraceActive(m_privRegs))
                 std::fprintf(stderr, "[gs:xfer] t=%llu dir=%u dbp=%u dbw=%u dpsm=%x sbp=%u dx=%u dy=%u w=%u h=%u\n",
                              static_cast<unsigned long long>(m_privRegs->vsyncTick.load()), m_trxdir,
@@ -1740,7 +1794,7 @@ void GS::vertexKick(bool drawing)
             std::fputc('\n', stderr);
         }
         updatePreferredDisplaySourceForDraw(batch);
-        if (!drawSkippedForDiagnostics(batch))
+        if (!drawSkippedForDiagnostics(batch) && !ps2x::pgs::exclusive())
             m_backend->Submit(batch);
         recordDrawDebugEventUnlocked(needed);
     }
@@ -1782,12 +1836,16 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x::pgs::exclusive())
+        return true; // the clear's register writes reach paraLLEl-GS through writeRegister()
     return m_backend && m_backend->ClearFramebuffer(m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    if (ps2x::pgs::exclusive())
+        return true;
     return m_backend && m_backend->ClearFramebuffer(activeContext(), rgba);
 }
 

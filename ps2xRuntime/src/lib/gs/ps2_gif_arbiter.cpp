@@ -2,6 +2,22 @@
 #include <algorithm>
 #include <cstring>
 
+namespace
+{
+    thread_local uint8_t t_dispatchingPath = 0;
+
+    struct DispatchScope
+    {
+        explicit DispatchScope(GifPathId pathId) { t_dispatchingPath = static_cast<uint8_t>(pathId); }
+        ~DispatchScope() { t_dispatchingPath = 0; }
+    };
+}
+
+uint8_t GifArbiter::dispatchingPath()
+{
+    return t_dispatchingPath;
+}
+
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))
 {
@@ -42,6 +58,7 @@ void GifArbiter::submitAndDrain(GifPathId pathId, const uint8_t *data, uint32_t 
     }
     if (!data || sizeBytes < 16 || !m_processFn)
         return;
+    DispatchScope scope(pathId);
     m_processFn(data, sizeBytes);
 }
 
@@ -69,6 +86,7 @@ void GifArbiter::drain()
         auto &pkt = m_queue[i];
         if (!pkt.data.empty())
         {
+            DispatchScope scope(pkt.pathId);
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }

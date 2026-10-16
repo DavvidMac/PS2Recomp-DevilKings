@@ -288,15 +288,29 @@ namespace ps2x::settings
             auto add = [&](Definition definition) { list.push_back(std::move(definition)); };
             // Vídeo
             {
-                // Only the software renderer exists; the GPU ones are listed as coming.
+                // Vulkan is paraLLEl-GS, in builds configured with PS2X_PGS_DIR (gs_pgs.h).
+#if defined(PS2X_HAVE_PGS)
+                constexpr bool kHaveVulkan = true;
+#else
+                constexpr bool kHaveVulkan = false;
+#endif
                 Definition renderer{"video", "renderer", "Renderizador",
-                                    "Software desenha na CPU, como o PS2: o mais fiel. Os renderizadores por GPU (com "
-                                    "resolução interna maior e MSAA) ainda não existem.",
-                                    Kind::Choice, "software", nullptr, {"software", "opengl", "vulkan", "d3d11"},
-                                    {"Software (CPU)", "OpenGL (em breve)", "Vulkan (em breve)", "Direct3D 11 (em breve)"},
+                                    "Software desenha na CPU. Vulkan desenha na placa de vídeo (paraLLEl-GS, tão fiel "
+                                    "quanto o Software) e permite resolução interna maior.",
+                                    Kind::Choice, "software", "PS2X_RENDERER", {"software", "vulkan"},
+                                    {"Software (CPU)", kHaveVulkan ? "Vulkan (GPU)" : "Vulkan (não incluído nesta build)"},
                                     0, 0, nullptr, false};
-                renderer.choiceAvailable = {true, false, false, false};
+                renderer.choiceEnvironment = {"", "vulkan"};
+                renderer.choiceAvailable = {true, kHaveVulkan};
                 add(renderer);
+                Definition scale{"video", "internal_resolution", "Resolução interna",
+                                 "Só no Vulkan. 2x e 4x desenham com 4 e 16 amostras por pixel: bordas suaves e "
+                                 "detalhe nítido em telas grandes, com mais trabalho para a placa de vídeo.",
+                                 Kind::Choice, "1", "PS2X_PGS_SCALE", {"1", "2", "4"}, {"1x (nativa)", "2x", "4x"},
+                                 0, 0, nullptr, false};
+                scale.choiceEnvironment = {"", "2", "4"};
+                scale.choiceAvailable = {true, kHaveVulkan, kHaveVulkan};
+                add(scale);
             }
             add({"video", "window", "Janela", "Como o jogo ocupa o monitor.", Kind::Choice, "windowed", nullptr,
                  {"windowed", "fullscreen", "borderless"}, {"Janela", "Tela cheia", "Tela cheia sem borda"}, 0, 0, nullptr,

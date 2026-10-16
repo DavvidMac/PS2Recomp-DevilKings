@@ -6,6 +6,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_pgs.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -489,6 +490,193 @@ namespace
 #endif
 }
 
+// Interlaced field rendering: games draw each field into a half-height buffer (e.g. 512x224 for
+// a 448-line display) and alternate buffers per VSync, offsetting the odd field by half a line.
+// Showing each field as a full frame makes the picture bob up and down; weave the latest two
+// fields instead, like a TV does. PS2X_DEINTERLACE=0 disables this.
+static bool DeinterlaceEnabled()
+{
+    static const bool s_deinterlace = []()
+    {
+        const char *value = std::getenv("PS2X_DEINTERLACE");
+        return !(value && value[0] == '0');
+    }();
+    return s_deinterlace;
+}
+
+class FieldWeaver
+{
+public:
+    // Writes `field` (width x height, packed RGBA) woven with the previous field into `out`:
+    // 2 * height rows, outStrideBytes apart.
+    void weave(const uint8_t *field, size_t fieldBytes, uint32_t width, uint32_t height, uint64_t tick, uint8_t *out,
+               size_t outStrideBytes)
+    {
+        const size_t rowBytes = static_cast<size_t>(width) * 4u;
+        const bool havePrevious = m_width == width && m_height == height && m_previous.size() >= rowBytes * height;
+        // Which output rows the current field owns. The field shown can lag the VSync it is
+        // shown on (asynchronous rasterisation, dropped frames, a GPU readback), so pick the
+        // order that combs least against the previous field instead of trusting VSync parity,
+        // and only switch on a clear win.
+        uint32_t parity = static_cast<uint32_t>(tick & 1u);
+        if (havePrevious && height > 4u)
+        {
+            uint64_t combEven = 0u; // current on even rows: missing row above is previous[y-1]
+            uint64_t combOdd = 0u;  // current on odd rows: missing row below is previous[y+1]
+            for (uint32_t y = 1u; y + 1u < height; y += 2u)
+            {
+                const uint8_t *current = field + static_cast<size_t>(y) * rowBytes;
+                const uint8_t *above = m_previous.data() + static_cast<size_t>(y - 1u) * rowBytes;
+                const uint8_t *below = m_previous.data() + static_cast<size_t>(y + 1u) * rowBytes;
+                for (uint32_t x = 0; x < width; x += 4u)
+                {
+                    const uint8_t *c = current + x * 4u;
+                    const uint8_t *a = above + x * 4u;
+                    const uint8_t *b = below + x * 4u;
+                    for (uint32_t ch = 0; ch < 3u; ++ch)
+                    {
+                        combEven += static_cast<uint32_t>(std::abs(static_cast<int>(c[ch]) - static_cast<int>(a[ch])));
+                        combOdd += static_cast<uint32_t>(std::abs(static_cast<int>(c[ch]) - static_cast<int>(b[ch])));
+                    }
+                }
+            }
+            if (combEven * 5u < combOdd * 4u)
+                m_parity = 0u;
+            else if (combOdd * 5u < combEven * 4u)
+                m_parity = 1u;
+            parity = m_parity;
+        }
+        const uint32_t fieldRows = std::min<uint32_t>(height, static_cast<uint32_t>(fieldBytes / rowBytes));
+        for (uint32_t y = 0; y < fieldRows; ++y)
+        {
+            const uint8_t *current = field + static_cast<size_t>(y) * rowBytes;
+            const uint8_t *previous = havePrevious ? m_previous.data() + static_cast<size_t>(y) * rowBytes : current;
+            // The missing line sits between current lines y and y+1 (even field) or y-1 and y
+            // (odd field).
+            const uint32_t neighbourY = parity == 0u ? std::min(y + 1u, fieldRows - 1u) : (y == 0u ? 0u : y - 1u);
+            const uint8_t *neighbour = field + static_cast<size_t>(neighbourY) * rowBytes;
+            std::memcpy(out + static_cast<size_t>(2u * y + parity) * outStrideBytes, current, rowBytes);
+            uint8_t *missing = out + static_cast<size_t>(2u * y + (1u - parity)) * outStrideBytes;
+            // Motion adaptive: keep the previous field where the picture is static (full
+            // vertical detail), interpolate where it moved so consecutive frames do not comb.
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                const uint8_t *cur = current + x * 4u;
+                const uint8_t *nb = neighbour + x * 4u;
+                const uint8_t *prev = previous + x * 4u;
+                uint8_t *dst = missing + x * 4u;
+                int difference = 0;
+                uint8_t interpolated[4];
+                for (uint32_t c = 0; c < 4u; ++c)
+                {
+                    interpolated[c] = static_cast<uint8_t>((static_cast<uint32_t>(cur[c]) + nb[c] + 1u) >> 1u);
+                    if (c < 3u)
+                        difference += std::abs(static_cast<int>(prev[c]) - static_cast<int>(interpolated[c]));
+                }
+                if (difference > 48)
+                    std::memcpy(dst, interpolated, 4u);
+                else
+                    std::memcpy(dst, prev, 4u);
+            }
+        }
+        m_previous.assign(field, field + std::min(fieldBytes, rowBytes * height));
+        m_width = width;
+        m_height = height;
+    }
+
+private:
+    std::vector<uint8_t> m_previous;
+    uint32_t m_width = 0u;
+    uint32_t m_height = 0u;
+    uint32_t m_parity = 0u;
+};
+
+// Diagnostics: PS2X_FRAME_DUMP_DIR=<dir> saves the presented frame as PNG every
+// PS2X_FRAME_DUMP_INTERVAL ticks (120 by default) from PS2X_FRAME_DUMP_FROM on, so a run can be
+// inspected without watching the window.
+static void DumpPresentedFrame(uint64_t currentTick, const uint8_t *rgba, uint32_t width, uint32_t height,
+                               uint32_t strideBytes, uint32_t displayFbp)
+{
+    static const char *s_frameDumpDir = std::getenv("PS2X_FRAME_DUMP_DIR");
+    static uint64_t s_lastFrameDumpTick = 0u;
+    static uint32_t s_frameDumpIndex = 0u;
+    static const uint64_t s_frameDumpInterval = []() -> uint64_t
+    {
+        const char *value = std::getenv("PS2X_FRAME_DUMP_INTERVAL");
+        return value ? std::max<uint64_t>(1u, std::strtoull(value, nullptr, 10)) : 120u;
+    }();
+    static const uint64_t s_frameDumpFromTick = []() -> uint64_t
+    {
+        const char *value = std::getenv("PS2X_FRAME_DUMP_FROM");
+        return value ? std::strtoull(value, nullptr, 10) : 0u;
+    }();
+    if (!s_frameDumpDir || !*s_frameDumpDir || currentTick < s_frameDumpFromTick ||
+        currentTick < s_lastFrameDumpTick + s_frameDumpInterval)
+        return;
+    s_lastFrameDumpTick = currentTick;
+    const uint32_t dumpWidth = std::max<uint32_t>(1u, width);
+    const uint32_t dumpHeight = std::max<uint32_t>(1u, height);
+    std::vector<uint8_t> pixels(static_cast<size_t>(dumpWidth) * dumpHeight * 4u);
+    for (uint32_t y = 0; y < dumpHeight; ++y)
+    {
+        std::memcpy(pixels.data() + static_cast<size_t>(y) * dumpWidth * 4u,
+                    rgba + static_cast<size_t>(y) * strideBytes,
+                    static_cast<size_t>(dumpWidth) * 4u);
+    }
+    for (size_t i = 3; i < pixels.size(); i += 4u)
+    {
+        pixels[i] = 0xFFu; // PS2 alpha is 0..0x80; make the dump opaque
+    }
+    Image frame{};
+    frame.data = pixels.data();
+    frame.width = static_cast<int>(dumpWidth);
+    frame.height = static_cast<int>(dumpHeight);
+    frame.mipmaps = 1;
+    frame.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
+    const std::string path = std::string(s_frameDumpDir) + "/frame_" + std::to_string(s_frameDumpIndex++) + "_t" +
+                             std::to_string(currentTick) + "_fbp" + std::to_string(displayFbp) + ".png";
+    ExportImage(frame, path.c_str());
+}
+
+// The Vulkan renderer's newest scanout, in a texture resized to it: 2x and 4x internal
+// resolution scan out larger frames than the 640x512 one the software renderer fills.
+static void UploadVulkanFrame(Texture2D &tex, uint64_t currentTick, uint32_t &outWidth, uint32_t &outHeight)
+{
+    static std::vector<uint8_t> s_frame;
+    static uint32_t s_width = 0u;
+    static uint32_t s_height = 0u;
+    static std::vector<uint8_t> s_woven;
+    static FieldWeaver s_weaver;
+    uint32_t width = 0u;
+    uint32_t height = 0u;
+    bool field = false;
+    if (ps2x::pgs::takeFrame(s_frame, width, height, field) && width != 0u && height != 0u)
+    {
+        const uint8_t *pixels = s_frame.data();
+        if (field && DeinterlaceEnabled())
+        {
+            s_woven.resize(static_cast<size_t>(width) * height * 8u);
+            s_weaver.weave(s_frame.data(), s_frame.size(), width, height, currentTick, s_woven.data(),
+                           static_cast<size_t>(width) * 4u);
+            pixels = s_woven.data();
+            height *= 2u;
+        }
+        if (tex.width != static_cast<int>(width) || tex.height != static_cast<int>(height))
+        {
+            UnloadTexture(tex);
+            Image blank = GenImageColor(static_cast<int>(width), static_cast<int>(height), BLANK);
+            tex = LoadTextureFromImage(blank);
+            UnloadImage(blank);
+        }
+        UpdateTexture(tex, pixels);
+        s_width = width;
+        s_height = height;
+        DumpPresentedFrame(currentTick, pixels, width, height, width * 4u, 0u);
+    }
+    outWidth = s_width != 0u ? s_width : FB_WIDTH;
+    outHeight = s_height != 0u ? s_height : DEFAULT_DISPLAY_HEIGHT;
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -512,7 +700,12 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
-    else if (s_hasUploadedFrame)
+    if (ps2x::pgs::active())
+    {
+        UploadVulkanFrame(tex, currentTick, outWidth, outHeight);
+        return;
+    }
+    if (!needsLatch && s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
         outHeight = (s_lastHeight != 0u) ? s_lastHeight : DEFAULT_DISPLAY_HEIGHT;
@@ -568,20 +761,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    // Interlaced field rendering: games draw each field into a half-height
-    // buffer (e.g. 512x224 for a 448-line display) and alternate buffers per
-    // VSync, offsetting the odd field by half a line. Showing each field as a
-    // full frame makes the picture bob up and down; weave the latest two
-    // fields instead, like a TV does. PS2X_DEINTERLACE=0 disables this.
-    static const bool s_deinterlace = []()
-    {
-        const char *value = std::getenv("PS2X_DEINTERLACE");
-        return !(value && value[0] == '0');
-    }();
-    static std::vector<uint8_t> s_previousField;
-    static uint32_t s_previousFieldWidth = 0u;
-    static uint32_t s_previousFieldHeight = 0u;
-    const bool weaveFields = s_deinterlace && !s_scratch.empty() && width != 0u && height != 0u &&
+    static FieldWeaver s_weaver;
+    const bool weaveFields = DeinterlaceEnabled() && !s_scratch.empty() && width != 0u && height != 0u &&
                              height <= 256u && height * 2u <= static_cast<uint32_t>(FB_HEIGHT) &&
                              width <= static_cast<uint32_t>(FB_WIDTH);
 
@@ -589,80 +770,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     uint32_t presentedHeight = height;
     if (weaveFields)
     {
-        const size_t rowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
-        const bool havePrevious = s_previousFieldWidth == width && s_previousFieldHeight == height &&
-                                  s_previousField.size() >= rowBytes * height;
-        // Which output rows the current field owns. The latched field can lag the
-        // VSync it is shown on (asynchronous rasterisation, dropped frames), so
-        // pick the order that combs least against the previous field instead of
-        // trusting VSync parity, and only switch on a clear win.
-        static uint32_t s_fieldParity = 0u;
-        uint32_t parity = static_cast<uint32_t>(currentTick & 1u);
-        if (havePrevious && height > 4u)
-        {
-            uint64_t combEven = 0u; // current on even rows: missing row above is previous[y-1]
-            uint64_t combOdd = 0u;  // current on odd rows: missing row below is previous[y+1]
-            for (uint32_t y = 1u; y + 1u < height; y += 2u)
-            {
-                const uint8_t *current = s_scratch.data() + static_cast<size_t>(y) * rowBytes;
-                const uint8_t *above = s_previousField.data() + static_cast<size_t>(y - 1u) * rowBytes;
-                const uint8_t *below = s_previousField.data() + static_cast<size_t>(y + 1u) * rowBytes;
-                for (uint32_t x = 0; x < width; x += 4u)
-                {
-                    const uint8_t *c = current + x * 4u;
-                    const uint8_t *a = above + x * 4u;
-                    const uint8_t *b = below + x * 4u;
-                    for (uint32_t ch = 0; ch < 3u; ++ch)
-                    {
-                        combEven += static_cast<uint32_t>(std::abs(static_cast<int>(c[ch]) - static_cast<int>(a[ch])));
-                        combOdd += static_cast<uint32_t>(std::abs(static_cast<int>(c[ch]) - static_cast<int>(b[ch])));
-                    }
-                }
-            }
-            if (combEven * 5u < combOdd * 4u)
-                s_fieldParity = 0u;
-            else if (combOdd * 5u < combEven * 4u)
-                s_fieldParity = 1u;
-            parity = s_fieldParity;
-        }
-        const uint32_t fieldRows = std::min<uint32_t>(height, static_cast<uint32_t>(s_scratch.size() / rowBytes));
-        for (uint32_t y = 0; y < fieldRows; ++y)
-        {
-            const uint8_t *current = s_scratch.data() + static_cast<size_t>(y) * rowBytes;
-            const uint8_t *previous = havePrevious ? s_previousField.data() + static_cast<size_t>(y) * rowBytes : current;
-            // The missing line sits between current lines y and y+1 (even
-            // field) or y-1 and y (odd field).
-            const uint32_t neighbourY = parity == 0u ? std::min(y + 1u, fieldRows - 1u) : (y == 0u ? 0u : y - 1u);
-            const uint8_t *neighbour = s_scratch.data() + static_cast<size_t>(neighbourY) * rowBytes;
-            std::memcpy(s_uploadBuffer.data() + static_cast<size_t>(2u * y + parity) * dstRowBytes, current, rowBytes);
-            uint8_t *missing = s_uploadBuffer.data() + static_cast<size_t>(2u * y + (1u - parity)) * dstRowBytes;
-            // Motion adaptive: keep the previous field where the picture is
-            // static (full vertical detail), interpolate where it moved so
-            // consecutive frames do not comb.
-            for (uint32_t x = 0; x < width; ++x)
-            {
-                const uint8_t *cur = current + x * 4u;
-                const uint8_t *nb = neighbour + x * 4u;
-                const uint8_t *prev = previous + x * 4u;
-                uint8_t *dst = missing + x * 4u;
-                int difference = 0;
-                uint8_t interpolated[4];
-                for (uint32_t c = 0; c < 4u; ++c)
-                {
-                    interpolated[c] = static_cast<uint8_t>((static_cast<uint32_t>(cur[c]) + nb[c] + 1u) >> 1u);
-                    if (c < 3u)
-                        difference += std::abs(static_cast<int>(prev[c]) - static_cast<int>(interpolated[c]));
-                }
-                if (difference > 48)
-                    std::memcpy(dst, interpolated, 4u);
-                else
-                    std::memcpy(dst, prev, 4u);
-            }
-        }
-        s_previousField.assign(s_scratch.begin(), s_scratch.begin() + std::min(s_scratch.size(), rowBytes * height));
-        s_previousFieldWidth = width;
-        s_previousFieldHeight = height;
+        s_weaver.weave(s_scratch.data(), s_scratch.size(), width, height, currentTick, s_uploadBuffer.data(),
+                       static_cast<size_t>(FB_WIDTH) * 4u);
         presentedHeight = height * 2u;
     }
     else if (!s_scratch.empty() && width != 0u && height != 0u)
@@ -691,46 +800,8 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastHeight = presentedHeight;
     s_hasUploadedFrame = true;
 
-    // Diagnostics: PS2X_FRAME_DUMP_DIR=<dir> saves the presented frame as PNG
-    // every 120 ticks, so a run can be inspected without watching the window.
-    static const char *s_frameDumpDir = std::getenv("PS2X_FRAME_DUMP_DIR");
-    static uint64_t s_lastFrameDumpTick = 0u;
-    static uint32_t s_frameDumpIndex = 0u;
-    static const uint64_t s_frameDumpInterval = []() -> uint64_t
-    {
-        const char *value = std::getenv("PS2X_FRAME_DUMP_INTERVAL");
-        return value ? std::max<uint64_t>(1u, std::strtoull(value, nullptr, 10)) : 120u;
-    }();
-    static const uint64_t s_frameDumpFromTick = []() -> uint64_t
-    {
-        const char *value = std::getenv("PS2X_FRAME_DUMP_FROM");
-        return value ? std::strtoull(value, nullptr, 10) : 0u;
-    }();
-    if (s_frameDumpDir && *s_frameDumpDir && currentTick >= s_frameDumpFromTick && currentTick >= s_lastFrameDumpTick + s_frameDumpInterval)
-    {
-        s_lastFrameDumpTick = currentTick;
-        const uint32_t dumpWidth = std::max<uint32_t>(1u, std::min<uint32_t>(width, FB_WIDTH));
-        const uint32_t dumpHeight = std::max<uint32_t>(1u, std::min<uint32_t>(presentedHeight, FB_HEIGHT));
-        std::vector<uint8_t> pixels(static_cast<size_t>(dumpWidth) * dumpHeight * 4u);
-        for (uint32_t y = 0; y < dumpHeight; ++y)
-        {
-            std::memcpy(pixels.data() + static_cast<size_t>(y) * dumpWidth * 4u,
-                        s_uploadBuffer.data() + static_cast<size_t>(y) * FB_WIDTH * 4u,
-                        static_cast<size_t>(dumpWidth) * 4u);
-        }
-        for (size_t i = 3; i < pixels.size(); i += 4u)
-        {
-            pixels[i] = 0xFFu; // PS2 alpha is 0..0x80; make the dump opaque
-        }
-        Image frame{};
-        frame.data = pixels.data();
-        frame.width = static_cast<int>(dumpWidth);
-        frame.height = static_cast<int>(dumpHeight);
-        frame.mipmaps = 1;
-        frame.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-        const std::string path = std::string(s_frameDumpDir) + "/frame_" + std::to_string(s_frameDumpIndex++) + "_t" + std::to_string(currentTick) + "_fbp" + std::to_string(displayFbp) + ".png";
-        ExportImage(frame, path.c_str());
-    }
+    DumpPresentedFrame(currentTick, s_uploadBuffer.data(), std::min<uint32_t>(width, FB_WIDTH),
+                       std::min<uint32_t>(presentedHeight, FB_HEIGHT), FB_WIDTH * 4u, displayFbp);
 }
 
 PS2Runtime::PS2Runtime()
