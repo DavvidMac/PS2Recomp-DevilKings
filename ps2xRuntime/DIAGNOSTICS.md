@@ -64,6 +64,7 @@ These debugging switches are read once at startup from the environment (some are
 |---|---|---|
 | `PS2X_IOP_HOST_SYNC` | `0` or other | Disables IOP host synchronization when first character is `0`; enabled by default. |
 | `PS2X_IOP_MODULE_ARGS` | `<path-fragment>:<arg>[,<arg>...][;...]` | Appends arguments to matching IOP module loads; path fragment matching is case-insensitive. |
+| `PS2X_IOP_NATIVE` | `0` | Keeps every IOP routine interpreted. By default, hot routines of known IOP libraries whose code matches word for word run natively (the IOP log says `[IOP] native <module>+<offset>`); first one: the CRI ADX mixer's clamp to 16 bits, about 30% of the IOP's interpreted instructions in a Devil Kings battle. |
 | `PS2X_IOP_PC_STATS` | Any value | Samples the IOP program counter every 1024 instructions and about every five seconds prints `[iop-pc]` with the IOP instruction rate and the 16 busiest addresses, each with the module (IRX) and offset holding it. |
 | `PS2X_IOPHEAP_TRACE` | Any value | Logs IOP heap allocation and free operations with `[iopheap]`; enabled by presence. |
 | `PS2X_SIF_TRACE` | `<level>` | Logs SIF transfers as `[sif:dma]`; level 2 also prints the first 64 payload bytes. Default 0. |

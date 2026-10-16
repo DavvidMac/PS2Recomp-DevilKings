@@ -386,6 +386,84 @@ namespace ps2x::iop::detail
             return ImportDisposition::Missing;
         }
 
+        // Native versions of hot routines in IOP libraries (HLE). A routine is replaced only when
+        // a module's code matches it word for word (jump targets aside: the loader relocates
+        // them). Its first word then becomes an opcode-31 marker, which the R3000 does not
+        // decode; step() runs the native version, counts the cycles the original takes so the
+        // IOP's clock stays where it was, and returns to the caller.
+        struct NativeRoutine
+        {
+            const char *module;         // file name prefix, e.g. "CRI_ADXI"
+            uint32_t offset;            // from the module's base
+            std::vector<uint32_t> code; // the routine as linked
+            uint32_t cycles;            // what the original takes
+            void (*run)(Impl &, CpuState &);
+        };
+        static constexpr uint32_t kNativeMarker = 0x7C000000u;
+
+        // CRI ADX sound driver (CRI_ADXI.IRX): the mixer's last step turns 256 accumulated
+        // 32-bit samples at a0 into 16-bit ones in place, saturating to +-32767.
+        static void adxMixClampToS16(Impl &impl, CpuState &cpu)
+        {
+            uint32_t source = cpu.gpr[4];
+            uint32_t destination = source;
+            for (uint32_t i = 0; i < 256u; ++i, source += 4u, destination += 2u)
+            {
+                const int32_t value = static_cast<int32_t>(impl.memory.read32(source));
+                const int32_t clamped = value > 32767 ? 32767 : value < -32767 ? -32767 : value;
+                impl.memory.write16(destination, static_cast<uint16_t>(clamped));
+            }
+            cpu.gpr[2] = 0u;
+        }
+
+        static const std::vector<NativeRoutine> &nativeRoutines()
+        {
+            static const std::vector<NativeRoutine> s_routines = {
+                {"CRI_ADXI", 0x36F4u,
+                 {0x00801821u, 0x00003021u, 0x24077FFFu, 0x24088001u, 0x8C850000u, 0x00000000u, 0x00E5102Au,
+                  0x14400008u, 0x28A28001u, 0x14400008u, 0x00000000u, 0x94820000u, 0x24840004u, 0xA4620000u,
+                  0x08000DD2u, 0x24630002u, 0x08000DD0u, 0xA4670000u, 0xA4680000u, 0x24630002u, 0x24840004u,
+                  0x24C60001u, 0x2CC20100u, 0x1440FFECu, 0x00000000u, 0x03E00008u, 0x00000000u},
+                 256u * 15u + 6u, &Impl::adxMixClampToS16},
+            };
+            return s_routines;
+        }
+
+        // PS2X_IOP_NATIVE=0 keeps every routine interpreted.
+        void installNativeRoutines(const Module &module)
+        {
+            static const bool s_enabled = []()
+            {
+                const char *value = std::getenv("PS2X_IOP_NATIVE");
+                return !(value && value[0] == '0');
+            }();
+            if (!s_enabled)
+                return;
+            const std::vector<NativeRoutine> &routines = nativeRoutines();
+            for (size_t id = 0; id < routines.size(); ++id)
+            {
+                const NativeRoutine &routine = routines[id];
+                if (module.name.rfind(routine.module, 0) != 0 ||
+                    routine.offset + routine.code.size() * 4u > module.size)
+                    continue;
+                const uint32_t address = module.base + routine.offset;
+                bool matches = true;
+                for (size_t i = 0; i < routine.code.size() && matches; ++i)
+                {
+                    const uint32_t expected = routine.code[i];
+                    const uint32_t actual = memory.read32(address + static_cast<uint32_t>(i) * 4u);
+                    const bool jump = (expected >> 26) == 2u || (expected >> 26) == 3u;
+                    matches = jump ? (actual >> 26) == (expected >> 26) : actual == expected;
+                }
+                if (!matches)
+                    continue;
+                memory.write32(address, kNativeMarker | static_cast<uint32_t>(id));
+                std::ostringstream out;
+                out << "[IOP] native " << routine.module << "+0x" << std::hex << routine.offset;
+                log(LogLevel::Info, out.str());
+            }
+        }
+
         PS2X_IOP_INLINE bool step(CpuState &cpu)
         {
             if (cpu.stopped)
@@ -406,9 +484,24 @@ namespace ps2x::iop::detail
             if (checkInterrupt(cpu))
                 return true;
 
+            const uint32_t word = memory.read32(cpu.pc);
+            if ((word & 0xFC000000u) == kNativeMarker)
+            {
+                const uint32_t id = word & 0xFFFFu;
+                if (id < nativeRoutines().size())
+                {
+                    const NativeRoutine &routine = nativeRoutines()[id];
+                    routine.run(*this, cpu);
+                    totalInstructions += routine.cycles;
+                    totalCycles += routine.cycles;
+                    cpu.pc = cpu.gpr[31];
+                    cpu.branchPending = false;
+                    return !cpu.stopped;
+                }
+            }
+
             // Import stubs start with jr ra (decode checks it too); skip the call otherwise.
-            if (const auto import = memory.read32(cpu.pc) == 0x03E00008u ? imports.decode(cpu.pc)
-                                                                          : std::optional<IopImportCall>{})
+            if (const auto import = word == 0x03E00008u ? imports.decode(cpu.pc) : std::optional<IopImportCall>{})
             {
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
@@ -740,6 +833,7 @@ namespace ps2x::iop::detail
             module.size = loaded.size;
             module.entry = loaded.entry;
             module.gp = loaded.gp;
+            installNativeRoutines(module);
 
             // IRX entry: start(int argc, char *argv[]). Like loadcore, argv[0] is
             // the module path and the NUL-separated load arguments follow.
