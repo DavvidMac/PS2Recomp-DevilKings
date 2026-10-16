@@ -41,6 +41,14 @@ namespace
     // sample one of these TBP0 values, to find which draws produce part of a frame.
     bool drawSkippedForDiagnostics(const GSPrimitiveBatch &batch)
     {
+        // PS2X_GS_NO_DRAW=1: the CPU backend draws nothing, to measure what the rest costs.
+        static const bool s_noDraw = []()
+        {
+            const char *value = std::getenv("PS2X_GS_NO_DRAW");
+            return value && value[0] == '1';
+        }();
+        if (s_noDraw)
+            return true;
         static const std::vector<uint32_t> s_skipTbp = []()
         {
             std::vector<uint32_t> tbps;

@@ -13,6 +13,7 @@
 #include <iostream>
 #include <string>
 #include <filesystem>
+#include <fstream>
 #include <exception>
 #include <algorithm>
 #include <cstdlib>
@@ -48,7 +49,9 @@ namespace
         }
     }
 
-    void redirectStdioToLogcat()
+    // stderr goes to logcat (tag ps2x) and to logFile; stdout, where RUNTIME_LOG writes a line
+    // for nearly every DMA and disc request, is dropped unless PS2X_STDOUT=1 sends it along.
+    void redirectStdioToLogcat(const std::filesystem::path &logFile)
     {
         if (pipe(g_logcatPipeFds) != 0)
         {
@@ -57,10 +60,15 @@ namespace
 
         setvbuf(stdout, nullptr, _IOLBF, 0);
         setvbuf(stderr, nullptr, _IONBF, 0);
-        dup2(g_logcatPipeFds[1], STDOUT_FILENO);
+        const char *keepStdout = std::getenv("PS2X_STDOUT");
+        if (keepStdout && keepStdout[0] == '1')
+            dup2(g_logcatPipeFds[1], STDOUT_FILENO);
+        else if (FILE *null = std::fopen("/dev/null", "w"))
+            dup2(fileno(null), STDOUT_FILENO);
         dup2(g_logcatPipeFds[1], STDERR_FILENO);
 
-        g_logcatThread = std::thread([]()
+        FILE *log = logFile.empty() ? nullptr : std::fopen(logFile.string().c_str(), "w");
+        g_logcatThread = std::thread([log]()
                                      {
                                          FILE *reader = fdopen(g_logcatPipeFds[0], "r");
                                          if (!reader)
@@ -70,6 +78,11 @@ namespace
                                          char line[1024];
                                          while (fgets(line, sizeof(line), reader))
                                          {
+                                             if (log)
+                                             {
+                                                 std::fputs(line, log);
+                                                 std::fflush(log);
+                                             }
                                              size_t len = std::strlen(line);
                                              if (len > 0 && line[len - 1] == '\n')
                                              {
@@ -78,6 +91,8 @@ namespace
                                              __android_log_write(ANDROID_LOG_INFO, "ps2x", line);
                                          }
                                          fclose(reader);
+                                         if (log)
+                                             std::fclose(log);
                                          g_logcatPipeFds[0] = -1;
                                      });
         if (std::atexit(stopLogcatRedirect) != 0)
@@ -90,6 +105,23 @@ namespace
             {
                 g_logcatThread.join();
             }
+        }
+    }
+
+    // An app has no command line to set PS2X_* variables on: ps2x.env next to the game's ELF
+    // holds NAME=value lines (# starts a comment); a variable already set is left alone.
+    void loadEnvironmentFile(const std::filesystem::path &file)
+    {
+        std::ifstream in(file);
+        std::string text;
+        while (std::getline(in, text))
+        {
+            while (!text.empty() && (text.back() == '\r' || text.back() == ' '))
+                text.pop_back();
+            const size_t equals = text.find('=');
+            if (text.empty() || text[0] == '#' || equals == std::string::npos || equals == 0)
+                continue;
+            setenv(text.substr(0, equals).c_str(), text.substr(equals + 1).c_str(), 0);
         }
     }
 #endif
@@ -169,7 +201,25 @@ namespace
 int main(int argc, char *argv[])
 {
 #if defined(__ANDROID__)
-    redirectStdioToLogcat();
+    {
+        std::filesystem::path bootElf;
+        try
+        {
+            bootElf = getExecutablePath(argc, argv);
+        }
+        catch (const std::exception &)
+        {
+        }
+        if (!bootElf.empty())
+        {
+            // An app starts in "/"; the runtime's default paths (the IOP's cdrom0: among them)
+            // come from the current folder, which the Windows launcher sets to the game's.
+            std::error_code error;
+            std::filesystem::current_path(bootElf.parent_path(), error);
+            loadEnvironmentFile(bootElf.parent_path() / "ps2x.env");
+        }
+        redirectStdioToLogcat(bootElf.empty() ? std::filesystem::path() : bootElf.parent_path() / "ultima-sessao.log");
+    }
 #endif
     setupTerminateLogger();
 

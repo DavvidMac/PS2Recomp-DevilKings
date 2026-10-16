@@ -623,6 +623,19 @@ static void DumpPresentedFrame(uint64_t currentTick, const uint8_t *rgba, uint32
                     rgba + static_cast<size_t>(y) * strideBytes,
                     static_cast<size_t>(dumpWidth) * 4u);
     }
+    const std::string name = std::string(s_frameDumpDir) + "/frame_" + std::to_string(s_frameDumpIndex++) + "_t" +
+                             std::to_string(currentTick) + "_fbp" + std::to_string(displayFbp);
+#if defined(__ANDROID__)
+    // raylib on Android prefixes every file it writes with the app's internal data folder, so
+    // write a PPM here instead of going through ExportImage.
+    if (FILE *out = std::fopen((name + ".ppm").c_str(), "wb"))
+    {
+        std::fprintf(out, "P6\n%u %u\n255\n", dumpWidth, dumpHeight);
+        for (size_t i = 0; i < pixels.size(); i += 4u)
+            std::fwrite(&pixels[i], 1u, 3u, out);
+        std::fclose(out);
+    }
+#else
     for (size_t i = 3; i < pixels.size(); i += 4u)
     {
         pixels[i] = 0xFFu; // PS2 alpha is 0..0x80; make the dump opaque
@@ -633,9 +646,8 @@ static void DumpPresentedFrame(uint64_t currentTick, const uint8_t *rgba, uint32
     frame.height = static_cast<int>(dumpHeight);
     frame.mipmaps = 1;
     frame.format = PIXELFORMAT_UNCOMPRESSED_R8G8B8A8;
-    const std::string path = std::string(s_frameDumpDir) + "/frame_" + std::to_string(s_frameDumpIndex++) + "_t" +
-                             std::to_string(currentTick) + "_fbp" + std::to_string(displayFbp) + ".png";
-    ExportImage(frame, path.c_str());
+    ExportImage(frame, (name + ".png").c_str());
+#endif
 }
 
 // The Vulkan renderer's newest scanout, in a texture resized to it: 2x and 4x internal

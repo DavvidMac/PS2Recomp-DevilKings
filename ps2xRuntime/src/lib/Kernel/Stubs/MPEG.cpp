@@ -1128,7 +1128,10 @@ namespace ps2_stubs
                 playback.decoder.reset();
                 playback.waitingForVideoSequenceHeader = true;
                 playback.videoSequenceSyncBuffer.clear();
-                playback.decoderFailed = false;
+                // A later sequence header lets FFmpeg recover. Without FFmpeg nothing ever
+                // decodes, so report the failure: picture waiters wake, and the movie ends
+                // (on a black screen) when its stream does, instead of the game waiting forever.
+                playback.decoderFailed = !PS2X_HAS_FFMPEG;
                 return;
             }
 
