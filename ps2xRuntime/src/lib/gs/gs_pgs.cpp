@@ -83,11 +83,30 @@ namespace ps2x::pgs
             return s_wanted;
         }
 
-        int internalScale()
+        // PS2X_PGS_SCALE: the scanout is 1, 2 or 4 times the native size (paraLLEl-GS scans out
+        // at power-of-two sizes); "aa" draws more samples per pixel at the same size, which
+        // smooths edges. A 2x scanout needs 4 samples per pixel and a 4x one 16.
+        struct Quality
+        {
+            SuperSampling samples;
+            uint32_t scanoutShift;
+            const char *name;
+        };
+
+        Quality internalQuality()
         {
             const char *value = std::getenv("PS2X_PGS_SCALE");
-            const int scale = value ? std::atoi(value) : 1;
-            return scale >= 4 ? 4 : scale >= 2 ? 2 : 1;
+            const std::string scale = value ? value : "1";
+            if (scale == "1aa")
+                return {SuperSampling::X4, 0u, "1x with 4 samples per pixel"};
+            if (scale == "2aa")
+                return {SuperSampling::X8, 1u, "2x with 8 samples per pixel"};
+            const int factor = std::atoi(scale.c_str());
+            if (factor >= 4)
+                return {SuperSampling::X16, 2u, "4x"};
+            if (factor >= 2)
+                return {SuperSampling::X4, 1u, "2x"};
+            return {SuperSampling::X1, 0u, "1x"};
         }
 
         // Granite keys its command pools by a per-thread index. Every call is serialised by the
@@ -127,13 +146,12 @@ namespace ps2x::pgs
             s.device.set_context(s.context);
             s.device.init_frame_contexts(4);
 
-            // Super-sampling 4x and 16x are what a 2x and a 4x scanout need.
-            const int scale = internalScale();
+            const Quality quality = internalQuality();
             GSOptions options = {};
             options.vram_size = 4u * 1024u * 1024u;
-            options.super_sampling = scale >= 4 ? SuperSampling::X16 : scale >= 2 ? SuperSampling::X4 : SuperSampling::X1;
+            options.super_sampling = quality.samples;
             options.super_sampled_textures = true;
-            s.scanoutShift = scale >= 4 ? 2u : scale >= 2 ? 1u : 0u;
+            s.scanoutShift = quality.scanoutShift;
             if (!s.gs.init(&s.device, options))
                 return fail("GSInterface init failed");
             s.gs.set_signal_interface(&s.signals);
@@ -141,8 +159,8 @@ namespace ps2x::pgs
             s.failed = false;
             s.started = true;
             g_started.store(1);
-            std::fprintf(stderr, "[pgs] Vulkan renderer (paraLLEl-GS) on %s, internal resolution %dx\n",
-                         s.device.get_gpu_properties().deviceName, scale);
+            std::fprintf(stderr, "[pgs] Vulkan renderer (paraLLEl-GS) on %s, internal resolution %s\n",
+                         s.device.get_gpu_properties().deviceName, quality.name);
             return true;
         }
 
