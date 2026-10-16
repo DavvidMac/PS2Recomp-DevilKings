@@ -519,6 +519,17 @@ endif()
 
 if(MSVC)
     target_compile_options(ps2EntryRunner PRIVATE /FS)
+    # Record only the PDB's file name in the executable, not the build folder's path.
+    target_link_options(ps2EntryRunner PRIVATE "/PDBALTPATH:%_PDB%")
+endif()
+
+# PS2X_RUNNER_ICON=<file.ico>: the game's icon for the Windows executable. GLFW gives its windows
+# the resource named GLFW_ICON, so the window and the taskbar show it too.
+set(PS2X_RUNNER_ICON "" CACHE FILEPATH "Icon (.ico) embedded in the Windows runner executable")
+if(WIN32 AND PS2X_RUNNER_ICON)
+    file(TO_CMAKE_PATH "${PS2X_RUNNER_ICON}" PS2X_RUNNER_ICON_PATH)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ps2x_runner_icon.rc" "GLFW_ICON ICON \"${PS2X_RUNNER_ICON_PATH}\"\n")
+    target_sources(ps2EntryRunner PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/ps2x_runner_icon.rc")
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
@@ -532,7 +543,7 @@ target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
 # PS2X_PGS_DIR points at a checkout of https://github.com/Arntzen-Software/parallel-gs (or a fork)
 # with its Granite submodule initialised recursively (on Windows: git config core.longpaths true).
 set(PS2X_PGS_DIR "" CACHE PATH "paraLLEl-GS checkout for the Vulkan renderer (empty: not built)")
-if(PS2X_PGS_DIR AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID AND NOT APPLE)
+if(PS2X_PGS_DIR AND NOT PS2X_IS_VITA AND NOT APPLE)
     if(EXISTS "${PS2X_PGS_DIR}/CMakeLists.txt" AND EXISTS "${PS2X_PGS_DIR}/Granite/third_party/volk/volk.c")
         set(PARALLEL_GS_STANDALONE ON CACHE BOOL "" FORCE)
         # paraLLEl-GS picks the static MSVC runtime unless one is set; the runtime links the DLL one.

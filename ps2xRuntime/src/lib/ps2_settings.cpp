@@ -105,6 +105,9 @@ namespace ps2x::settings
             std::map<std::string, std::string> values;    // section.key -> value
             std::map<std::string, std::string> atLoad;    // values the runtime started with
             std::map<std::string, bool> fromEnvironment;  // section.key -> the environment set it
+            // section.key -> the file's own value (or the default) of a setting the environment
+            // overrides: save() writes it back, so a variable set for one run does not stick.
+            std::map<std::string, std::string> fileValue;
             std::vector<CheatGroup> cheats;
             std::shared_ptr<const std::vector<FrameWrite>> frameWrites =
                 std::make_shared<const std::vector<FrameWrite>>();
@@ -445,6 +448,7 @@ namespace ps2x::settings
             {
                 if (const char *env = std::getenv(definition.environment))
                 {
+                    s.fileValue[key] = value;
                     value = fromEnvironmentValue(definition, env);
                     s.fromEnvironment[key] = true;
                 }
@@ -484,7 +488,9 @@ namespace ps2x::settings
                 section = definition.section;
                 out << "\n[" << section << "]\n";
             }
-            out << definition.key << " = " << s.values[keyOf(definition.section, definition.key)] << "\n";
+            const std::string key = keyOf(definition.section, definition.key);
+            const auto fromFile = s.fileValue.find(key);
+            out << definition.key << " = " << (fromFile != s.fileValue.end() ? fromFile->second : s.values[key]) << "\n";
         }
         out << "\n[hacks]\n; grupos de cheats/*.pnach ligados, separados por |\n";
         out << "enabled = " << s.values[keyOf("hacks", "enabled")] << "\n";
@@ -545,6 +551,8 @@ namespace ps2x::settings
             const std::string key = keyOf(definition.section, definition.key);
             if (!s.fromEnvironment.count(key))
                 s.values[key] = definition.defaultValue;
+            else
+                s.fileValue[key] = definition.defaultValue;
         }
         s.values[keyOf("hacks", "enabled")].clear();
         refreshCheats(s);
