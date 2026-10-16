@@ -20,7 +20,11 @@
 
 #if defined(__ANDROID__)
 #include <android/log.h>
+#include <android/native_activity.h>
+#include <android/window.h>
+#include <android_native_app_glue.h>
 #include <unistd.h>
+extern "C" struct android_app *GetAndroidApp(void); // raylib (rcore_android.c)
 #include <thread>
 #include <cstdio>
 #include <cstring>
@@ -219,6 +223,10 @@ int main(int argc, char *argv[])
             loadEnvironmentFile(bootElf.parent_path() / "ps2x.env");
         }
         redirectStdioToLogcat(bootElf.empty() ? std::filesystem::path() : bootElf.parent_path() / "ultima-sessao.log");
+        // Keep the screen on while the game runs: once it sleeps, Android moves the app to
+        // the background, where it only gets the slow cores.
+        if (android_app *app = GetAndroidApp())
+            ANativeActivity_setWindowFlags(app->activity, AWINDOW_FLAG_KEEP_SCREEN_ON, 0);
     }
 #endif
     setupTerminateLogger();

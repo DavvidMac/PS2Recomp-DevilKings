@@ -75,7 +75,9 @@ if(PS2X_IS_ARM_TARGET)
     elseif(PS2X_IS_AARCH64_TARGET)
         # Linux ARM64 - add NEON flags
         message(STATUS "Non-Apple ARM64 - adding NEON compiler flags")
-        add_compile_options(-march=armv8-a+fp+simd)
+        # Phones from 2019 on (Cortex-A76 and later) take armv8.2-a+fp16+dotprod.
+        set(PS2X_ARM_MARCH "armv8-a+fp+simd" CACHE STRING "-march for ARM64 builds")
+        add_compile_options(-march=${PS2X_ARM_MARCH})
 
         # Try to enable crypto and CRC extensions if supported
         include(CheckCXXCompilerFlag)
@@ -84,7 +86,7 @@ if(PS2X_IS_ARM_TARGET)
             set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -march=armv8-a+fp+simd+crypto+crc")
             message(STATUS "Crypto and CRC extensions enabled")
         else()
-            add_compile_options(-march=armv8-a+fp+simd)
+            add_compile_options(-march=${PS2X_ARM_MARCH})
         endif()
     endif()
 endif()

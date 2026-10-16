@@ -642,6 +642,8 @@ endif()
 
 if(PS2X_IS_ANDROID)
     target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
+    # main.cpp keeps the screen on through the activity of raylib's android_app.
+    target_include_directories(ps2EntryRunner PRIVATE "${ANDROID_NDK}/sources/android/native_app_glue")
 endif()
 
 install(TARGETS ps2_runtime ps2EntryRunner
