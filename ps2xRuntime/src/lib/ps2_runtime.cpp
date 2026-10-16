@@ -6,6 +6,7 @@
 #include "game_overrides.h"
 #include "ps2_runtime_macros.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/gs/gs_hud_layout.h"
 #include "runtime/gs/gs_pgs.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
@@ -3126,13 +3127,15 @@ void PS2Runtime::run()
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
         // A PS2 picture fills a 4:3 TV whatever the size of its frame buffer.
-        // 16:9 and 21:9 show the picture a game override widened (PS2X_WIDESCREEN) at that shape.
+        // 16:9 and 21:9 show the picture a game override widened (PS2X_WIDESCREEN) at that shape;
+        // a 2D screen it did not widen (menu, map, movie) stays 4:3 when the HUD is laid out (ps2x::hud).
         float dstWidth = screenWidth;
         float dstHeight = screenHeight;
-        const float shape = presentation.aspect == "4:3"    ? 4.0f / 3.0f
-                            : presentation.aspect == "16:9" ? 16.0f / 9.0f
-                            : presentation.aspect == "21:9" ? 21.0f / 9.0f
-                                                            : 0.0f;
+        const bool wide = (presentation.aspect == "16:9" || presentation.aspect == "21:9") && !ps2x::hud::pillarbox();
+        const float shape = !wide && presentation.aspect != "stretch" ? 4.0f / 3.0f
+                            : presentation.aspect == "16:9"           ? 16.0f / 9.0f
+                            : presentation.aspect == "21:9"           ? 21.0f / 9.0f
+                                                                      : 0.0f;
         if (shape > 0.0f)
         {
             dstWidth = std::min(screenWidth, screenHeight * shape);

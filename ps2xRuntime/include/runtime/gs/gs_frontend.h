@@ -243,6 +243,7 @@ private:
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
     std::vector<uint8_t> m_hostPresentationFrame;
+    std::vector<uint8_t> m_hudScratch;   // GIF packet with the widescreen HUD squeezed (ps2x::hud)
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
     uint32_t m_hostPresentationDisplayFbp = 0;

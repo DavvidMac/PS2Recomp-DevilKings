@@ -1,5 +1,6 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
+#include "runtime/gs/gs_hud_layout.h"
 #include "runtime/gs/gs_pgs.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "ps2_log.h"
@@ -621,6 +622,11 @@ void GS::latchPresentationOnDisplaySwap()
     }
     m_lastSwapLatchTick.store(m_privRegs->vsyncTick.load(std::memory_order_acquire));
     m_hasSwapLatch.store(true);
+    {
+        // The read circuit 2 when PMODE enables it, else circuit 1.
+        const uint64_t dispfb = (m_privRegs->pmode & 2u) ? dispfb2 : dispfb1;
+        ps2x::hud::noteSwap(static_cast<uint32_t>(dispfb & 0x1FFu), m_privRegs->vsyncTick.load(std::memory_order_relaxed));
+    }
     if (ps2x::pgs::active())
     {
         // Every packet of the frame just flipped to went to the Vulkan renderer before this one.
@@ -787,6 +793,25 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_backend)
         return;
+
+    if (ps2x::hud::active())
+    {
+        ps2x::hud::GsState hudState;
+        hudState.primCtxt = m_primRegister.ctxt;
+        hudState.prmodeCtxt = m_prmodeRegister.ctxt;
+        hudState.prmodeCont = m_prmodecont;
+        hudState.primTme = m_primRegister.tme;
+        hudState.prmodeTme = m_prmodeRegister.tme;
+        hudState.tick = m_privRegs ? m_privRegs->vsyncTick.load(std::memory_order_relaxed) : 0u;
+        for (uint32_t i = 0; i < 2u; ++i)
+        {
+            hudState.ofx[i] = m_ctx[i].xyoffset.ofx;
+            hudState.width[i] = m_ctx[i].frame.fbw * 64u;
+            hudState.fbp[i] = m_ctx[i].frame.fbp;
+            hudState.tbp[i] = m_ctx[i].tex0.tbp0;
+        }
+        data = ps2x::hud::apply(GifArbiter::dispatchingPath(), data, sizeBytes, hudState, m_hudScratch);
+    }
 
     if (ps2x::pgs::active())
     {
@@ -1772,11 +1797,12 @@ void GS::vertexKick(bool drawing)
             const auto &v0 = batch.vertices[0];
             const auto &vl = batch.vertices[needed - 1];
             std::fprintf(stderr,
-                         "[gs:draw] t=%llu prim=%u tme=%u abe=%u fst=%u fbp=%u fbw=%u fpsm=%x fbmsk=%x zbp=%u zpsm=%x zmsk=%u test=%llx alpha=%llx "
+                         "[gs:draw] t=%llu path=%u prim=%u tme=%u abe=%u fst=%u fbp=%u fbw=%u fpsm=%x fbmsk=%x zbp=%u zpsm=%x zmsk=%u test=%llx alpha=%llx "
                          "tbp=%u tbw=%u tpsm=%x tw=%u th=%u tfx=%u tcc=%u scissor=%d,%d-%d,%d ofs=%d,%d "
                          "v0=(%.1f,%.1f z=%u rgba=%u,%u,%u,%u uv=%u,%u stq=%g,%g,%g) vN=(%.1f,%.1f rgba=%u,%u,%u,%u uv=%u,%u) "
                          "pmode=%llx dispfb1=%llx dispfb2=%llx display2=%llx\n",
-                         static_cast<unsigned long long>(m_privRegs->vsyncTick.load()), static_cast<uint32_t>(m_prim.type),
+                         static_cast<unsigned long long>(m_privRegs->vsyncTick.load()),
+                         static_cast<uint32_t>(GifArbiter::dispatchingPath()), static_cast<uint32_t>(m_prim.type),
                          static_cast<uint32_t>(batch.state.prim.tme), static_cast<uint32_t>(batch.state.prim.abe),
                          static_cast<uint32_t>(batch.state.prim.fst), c.frame.fbp, c.frame.fbw, static_cast<uint32_t>(c.frame.psm),
                          c.frame.fbmsk, c.zbuf.zbp, static_cast<uint32_t>(c.zbuf.psm), static_cast<uint32_t>(c.zbuf.zmask),
