@@ -77,6 +77,7 @@ These debugging switches are read once at startup from the environment (some are
 | Variable | Syntax | What it does |
 |---|---|---|
 | `PS2X_PAD_SCRIPT` | `<from>-<to>:<BUTTON>[+<BUTTON>...][;...]` | Holds named pad buttons on port 0 for inclusive VSync ranges. Names include directions, face buttons, START/SELECT, and L1/R1/L2/R2/L3/R3. |
+| `PS2X_PAD_SCRIPT_CLOCK` | `frames` | Times `PS2X_PAD_SCRIPT` in game frames (display swaps) instead of VSyncs, so a script recorded on one host still lands on the same screens on a slower one, where loading takes more VSyncs. |
 | `PS2X_POKE` | `<addr>[.b/.h]=<value>[,...]` (hex) | Writes each value to EE RAM on every VSync, like a CodeBreaker constant-write code: 32 bits, or 8/16 bits with `.b`/`.h`; prints each as `[poke]` at startup. |
 | `PS2X_WIDESCREEN` | `16:9`, `21:9` or a factor | Asks the game override for a wider 3D view (Devil Kings: scales X of the view-to-screen and camera clip matrices after each projection set-up); the settings menu sets it with Video > Aspect 16:9 / 21:9, which also shows the picture at that shape. Read at start-up. The 2D HUD is not adjusted yet. |
 | `PS2X_SKIP_INTRO` | `1` | Asks the game override to skip the start-up logos (Devil Kings: straight from the memory card notice to the opening). Read at start-up. |

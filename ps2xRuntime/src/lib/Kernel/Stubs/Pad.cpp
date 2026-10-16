@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "runtime/ee_scheduler.h"
+#include "runtime/ps2_settings.h"
 #include <vector>
 #include <string>
 #include <cstdlib>
@@ -89,6 +90,9 @@ namespace ps2_stubs
         // PS2X_PAD_SCRIPT="from-to:BTN+BTN;..." presses buttons on port 0 for
         // the given VSync tick ranges, e.g. "1700-1730:LEFT;1760-1790:CROSS".
         // Lets automated runs drive menus without host keyboard focus.
+        // PS2X_PAD_SCRIPT_CLOCK=frames counts the game's frames (display swaps)
+        // instead: on a slower host, loading takes more VSyncs, but the presses
+        // still come at the same point of the game.
         struct PadScriptStep
         {
             uint64_t from = 0u;
@@ -155,7 +159,12 @@ namespace ps2_stubs
             {
                 return;
             }
-            const uint64_t tick = runtime->eeScheduler().currentVSyncTick();
+            static const bool s_gameFrames = []()
+            {
+                const char *clock = std::getenv("PS2X_PAD_SCRIPT_CLOCK");
+                return clock && std::string(clock) == "frames";
+            }();
+            const uint64_t tick = s_gameFrames ? ps2x::settings::gameFrames() : runtime->eeScheduler().currentVSyncTick();
             for (const PadScriptStep &step : padScript())
             {
                 if (tick >= step.from && tick <= step.to)
