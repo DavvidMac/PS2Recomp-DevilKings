@@ -267,7 +267,9 @@ else()
     endif()
 endif()
 
-if(PS2X_IS_ANDROID)
+set(PS2X_FFMPEG_ANDROID_DIR "" CACHE PATH
+    "Android: FFmpeg built by android/build_ffmpeg.sh (static avcodec, avutil and swscale)")
+if(PS2X_IS_ANDROID AND NOT PS2X_FFMPEG_ANDROID_DIR)
     set(PS2X_ENABLE_FFMPEG_DEFAULT OFF)
 else()
     set(PS2X_ENABLE_FFMPEG_DEFAULT ON)
@@ -278,6 +280,19 @@ option(PS2X_ENABLE_FFMPEG "Enable FFmpeg-backed MPEG video decoding" ${PS2X_ENAB
 if(NOT PS2X_ENABLE_FFMPEG)
     message(STATUS "FFmpeg disabled; MPEG video decode falls back to stub frames")
     add_library(ffmpeg INTERFACE)
+elseif(PS2X_IS_ANDROID)
+    # Only the MPEG video decoder, its parser and swscale, built from source for arm64.
+    if(NOT PS2X_FFMPEG_ANDROID_DIR)
+        message(FATAL_ERROR "FFmpeg on Android needs PS2X_FFMPEG_ANDROID_DIR (see android/build_ffmpeg.sh)")
+    endif()
+    add_library(ffmpeg INTERFACE)
+    target_include_directories(ffmpeg INTERFACE "${PS2X_FFMPEG_ANDROID_DIR}/include")
+    target_link_libraries(ffmpeg INTERFACE
+        "${PS2X_FFMPEG_ANDROID_DIR}/lib/libavcodec.a"
+        "${PS2X_FFMPEG_ANDROID_DIR}/lib/libswscale.a"
+        "${PS2X_FFMPEG_ANDROID_DIR}/lib/libavutil.a"
+        m
+    )
 elseif(WIN32)
     include(ExternalProject)
 
