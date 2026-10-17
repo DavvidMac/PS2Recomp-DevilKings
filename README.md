@@ -4,6 +4,32 @@
 
 Also check our [WIKI](https://github.com/ran-j/PS2Recomp/wiki)
 
+### About this repository
+
+This is [ran-j/PS2Recomp](https://github.com/ran-j/PS2Recomp) plus the runtime work done while
+porting Devil Kings (PS2, NTSC-U) to native Windows. It contains no game files, generated code or
+executables: each person recompiles their own copy of the game. The port's own guide and tools are
+distributed separately.
+
+What it adds:
+
+* EE, IOP, VIF and GS runtime fixes found while taking a full game to playable, from boot to the
+  ending.
+* Speed: translated VU1 programs (`ps2xRuntime/tools/vu1rec.py`), VU1 worker threads, VIF1 on its
+  own thread and native IOP routines. A desktop CPU holds 60 fps in battle once the development
+  logs are off (`-DPS2X_ENABLE_RUNTIME_LOGS=OFF -DPS2X_ENABLE_IOP_RPC_TRACE=OFF`).
+* An optional Vulkan renderer through paraLLEl-GS (`-DPS2X_PGS_DIR=<parallel-gs checkout>`), with
+  internal resolution up to 4x.
+* An in-game settings menu (F1): video, presentation filters, performance, audio, controls, memory
+  card backups and `.pnach` cheats.
+* Relocatable SN Systems DLL modules (SNR2), recompiled once and run at any load address.
+* A widescreen HUD layout for games whose override widens the 3D view (experimental).
+* An Android test build (NativeActivity without Gradle, `android/make_test_apk.py`), software
+  renderer only for now.
+
+Runtime switches and traces are listed in `ps2xRuntime/DIAGNOSTICS.md`. The license is GPL-3.0,
+as upstream.
+
 
 This project statically recompiles PS2 ELF binaries into C++ and provides a runtime to execute the generated code.
 
