@@ -20,6 +20,11 @@
 #include <cstring>
 #include <limits>
 
+// The "exact" result of an FMAC, wide enough to see overflow and underflow before rounding to float.
+// double, as VuExactFloat already is with MSVC and clang-cl (where the translated VU1 programs
+// were checked against the interpreter); on ARM64 VuExactFloat is a 128-bit type done in software.
+using VuExactFloat = double;
+
 #if defined(USE_SSE2NEON)
 #include "sse2neon.h"
 #else
@@ -98,28 +103,28 @@ namespace ps2x::vu1c
     }
 
     // Same as VU1Interpreter::normalizeFmacExactResult.
-    inline uint8_t exactFlags(float &value, long double exact)
+    inline uint8_t exactFlags(float &value, VuExactFloat exact)
     {
 #if defined(__clang__) || defined(__GNUC__)
-        // std::signbit(long double) is an out-of-line CRT call (_ldsign) on MSVC targets.
+        // std::signbit(VuExactFloat) is an out-of-line CRT call (_ldsign) on MSVC targets.
         const bool negative = __builtin_signbit(exact);
 #else
         const bool negative = std::signbit(exact);
 #endif
-        const long double magnitude = std::fabs(exact);
+        const VuExactFloat magnitude = std::fabs(exact);
         uint8_t flags = negative ? 0x2u : 0u;
         uint32_t bits = negative ? 0x80000000u : 0u;
-        if (magnitude == 0.0L)
+        if (magnitude == 0.0)
         {
             flags |= 0x1u;
             value = bitsFloat(bits);
         }
-        else if (magnitude > static_cast<long double>(std::numeric_limits<float>::max()))
+        else if (magnitude > static_cast<VuExactFloat>(std::numeric_limits<float>::max()))
         {
             flags |= 0x8u;
             value = bitsFloat(bits | 0x7F7FFFFFu);
         }
-        else if (magnitude < static_cast<long double>(std::numeric_limits<float>::min()))
+        else if (magnitude < static_cast<VuExactFloat>(std::numeric_limits<float>::min()))
         {
             flags |= 0x5u;
             value = bitsFloat(bits);
@@ -150,7 +155,7 @@ namespace ps2x::vu1c
         const uint32_t exponent = (bits >> 23) & 0xFFu;
         if (exponent >= 2u && exponent <= 253u)
             return (bits & 0x80000000u) != 0u ? 0x2u : 0u;
-        return exactFlags(product, static_cast<long double>(left) * static_cast<long double>(right)) & 0xFu;
+        return exactFlags(product, static_cast<VuExactFloat>(left) * static_cast<VuExactFloat>(right)) & 0xFu;
     }
 
     // DEST lanes (x = 8 ... w = 1) as vector lane bits (x = 1 ... w = 8). The mapping
@@ -858,10 +863,10 @@ namespace ps2x::vu1c
                 if ((dest & lane(c)) == 0u)
                     continue;
                 // ACC is always normalised, so its raw value is accNorm.
-                laneFlags[c] = fmacLane(out[c], kProductSum, a[c], [&]() -> long double
+                laneFlags[c] = fmacLane(out[c], kProductSum, a[c], [&]() -> VuExactFloat
                 {
-                    const long double lv = l[c];
-                    const long double rv = r[c];
+                    const VuExactFloat lv = l[c];
+                    const VuExactFloat rv = r[c];
                     if constexpr (kKind == kFmacAdd)
                         return lv + rv;
                     else if constexpr (kKind == kFmacSub)
@@ -869,13 +874,13 @@ namespace ps2x::vu1c
                     else if constexpr (kKind == kFmacMul)
                         return lv * rv;
                     else if constexpr (kKind == kFmacMadd)
-                        return static_cast<long double>(a[c]) + lv * rv;
+                        return static_cast<VuExactFloat>(a[c]) + lv * rv;
                     else if constexpr (kKind == kFmacMsub)
-                        return static_cast<long double>(a[c]) - lv * rv;
+                        return static_cast<VuExactFloat>(a[c]) - lv * rv;
                     else if constexpr (kKind == kFmacOpmsub)
-                        return c == 3u ? 0.0L : static_cast<long double>(a[c]) - lv * rv;
+                        return c == 3u ? 0.0 : static_cast<VuExactFloat>(a[c]) - lv * rv;
                     else
-                        return c == 3u ? 0.0L : lv * rv;
+                        return c == 3u ? 0.0 : lv * rv;
                 });
             }
             uint32_t sticky = 0u;

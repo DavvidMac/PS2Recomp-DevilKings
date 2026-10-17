@@ -433,7 +433,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
             continue;
         }
 
-        long double exactResult = 0.0L;
+        VuExactFloat exactResult = 0.0;
         if (calculateFmacExactResult(component, exactResult))
         {
             laneFlags[component] = normalizeFmacExactResult(result[component], exactResult);
@@ -447,7 +447,7 @@ void VU1Interpreter::normalizeFmacResult(float *result, uint8_t dest,
 }
 
 bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
-                                               long double &result) const
+                                               VuExactFloat &result) const
 {
     const uint32_t upper = m_currentUpperInstruction;
     const uint8_t op = static_cast<uint8_t>(upper & 0x3Fu);
@@ -459,7 +459,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
 
     const auto operand = [this](float value)
     {
-        return static_cast<long double>(normalizeOperand(value));
+        return static_cast<VuExactFloat>(normalizeOperand(value));
     };
     const auto vs = [&](uint32_t lane)
     {
@@ -474,8 +474,8 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
         return operand(m_state.acc[lane]);
     };
 
-    const long double q = operand(m_state.q);
-    const long double i = operand(m_state.i);
+    const VuExactFloat q = operand(m_state.q);
+    const VuExactFloat i = operand(m_state.i);
 
     if (op < 0x3Cu)
     {
@@ -543,7 +543,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
                 static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
                 static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
                 result = component == 3u
-                             ? 0.0L
+                             ? 0.0
                              : acc(component) - vs(left[component]) * vt(right[component]);
                 break;
             }
@@ -618,7 +618,7 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
             static constexpr uint8_t left[4] = {1u, 2u, 0u, 3u};
             static constexpr uint8_t right[4] = {2u, 0u, 1u, 3u};
             result = component == 3u
-                         ? 0.0L
+                         ? 0.0
                          : vs(left[component]) * vt(right[component]);
             break;
         }
@@ -630,16 +630,16 @@ bool VU1Interpreter::calculateFmacExactResult(uint32_t component,
 }
 
 uint8_t VU1Interpreter::normalizeFmacExactResult(float &value,
-                                                  long double exactResult) const
+                                                  VuExactFloat exactResult) const
 {
     const bool negative = std::signbit(exactResult);
-    const long double magnitude = std::fabs(exactResult);
-    const long double maximum = static_cast<long double>(std::numeric_limits<float>::max());
-    const long double minimum = static_cast<long double>(std::numeric_limits<float>::min());
+    const VuExactFloat magnitude = std::fabs(exactResult);
+    const VuExactFloat maximum = static_cast<VuExactFloat>(std::numeric_limits<float>::max());
+    const VuExactFloat minimum = static_cast<VuExactFloat>(std::numeric_limits<float>::min());
     uint8_t flags = negative ? 0x2u : 0u;
 
     uint32_t bits = negative ? 0x80000000u : 0u;
-    if (magnitude == 0.0L)
+    if (magnitude == 0.0)
     {
         flags |= 0x1u;
         std::memcpy(&value, &bits, sizeof(value));
@@ -717,7 +717,7 @@ uint32_t VU1Interpreter::calculateFmacProductSticky(uint8_t dest) const
             extraSticky |= (productBits & 0x80000000u) != 0u ? 0x2u : 0u;
             continue;
         }
-        const long double exactProduct = static_cast<long double>(left) * static_cast<long double>(right);
+        const VuExactFloat exactProduct = static_cast<VuExactFloat>(left) * static_cast<VuExactFloat>(right);
         const uint8_t productFlags = normalizeFmacExactResult(product, exactProduct);
         // Product-sum instructions report Z/S/U/O from the add/subtract result
         // as current flags, while every product condition accumulates into the

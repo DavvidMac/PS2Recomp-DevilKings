@@ -7,6 +7,11 @@
 #include <memory>
 #include <vector>
 
+// The "exact" result of an FMAC, wide enough to see overflow and underflow before rounding to float.
+// double, as VuExactFloat already is with MSVC and clang-cl (where the translated VU1 programs
+// were checked against the interpreter); on ARM64 VuExactFloat is a 128-bit type done in software.
+using VuExactFloat = double;
+
 class GS;
 class PS2Memory;
 class Vu1RunQueue;
@@ -308,8 +313,8 @@ private:
     void applyFmacDest(float *dst, float *result, uint8_t dest);
     void applyFmacDestAcc(float *result, uint8_t dest);
     void normalizeFmacResult(float *result, uint8_t dest, uint8_t laneFlags[4]);
-    bool calculateFmacExactResult(uint32_t component, long double &result) const;
-    uint8_t normalizeFmacExactResult(float &value, long double exactResult) const;
+    bool calculateFmacExactResult(uint32_t component, VuExactFloat &result) const;
+    uint8_t normalizeFmacExactResult(float &value, VuExactFloat exactResult) const;
     uint32_t calculateFmacProductSticky(uint8_t dest) const;
     void updateFmacFlags(const uint8_t laneFlags[4], uint8_t dest, uint32_t extraSticky);
     void queueFsset(uint16_t immediate);
