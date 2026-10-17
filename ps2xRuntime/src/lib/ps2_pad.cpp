@@ -141,6 +141,11 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         data[6] = static_cast<uint8_t>(128 + stickX * 127);
         data[7] = static_cast<uint8_t>(128 + stickY * 127);
     }
+    if (ps2x::touch::rightStick(stickX, stickY))
+    {
+        data[4] = static_cast<uint8_t>(128 + stickX * 127);
+        data[5] = static_cast<uint8_t>(128 + stickY * 127);
+    }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);
     data[3] = static_cast<uint8_t>(btns >> 8);

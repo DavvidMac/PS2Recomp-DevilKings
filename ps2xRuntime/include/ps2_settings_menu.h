@@ -16,6 +16,7 @@ public:
 private:
     void drawSettings(const char *section);
     void drawControls();
+    void drawTouch();
     void drawHacks();
     void close();
 

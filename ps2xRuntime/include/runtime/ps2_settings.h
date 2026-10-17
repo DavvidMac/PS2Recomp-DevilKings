@@ -21,6 +21,7 @@ namespace ps2x::settings
         Number, // integer in [minimum, maximum]; 0 may mean "auto" (see autoLabel)
         Path,
         Keys,   // keyboard keys, comma-separated raylib names (controls section)
+        Text,   // free text the runtime writes itself (not shown in the menu)
     };
 
     struct Definition

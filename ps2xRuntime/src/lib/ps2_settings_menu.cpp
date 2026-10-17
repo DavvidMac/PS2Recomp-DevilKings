@@ -26,7 +26,7 @@ namespace
 
     constexpr Tab kTabs[] = {
         {"Vídeo", "video"},   {"Desempenho", "performance"}, {"Áudio", "audio"},       {"Controles", nullptr},
-        {"Toque", "touch"},   {"Saves", "saves"},            {"Hacks", nullptr},       {"Avançado", "advanced"},
+        {"Toque", nullptr},   {"Saves", "saves"},            {"Hacks", nullptr},       {"Avançado", "advanced"},
     };
 
     void helpLine(const char *text)
@@ -81,6 +81,17 @@ void PS2SettingsMenu::close()
 void PS2SettingsMenu::draw(PS2Runtime &runtime)
 {
     (void)runtime;
+    // The touch position editor owns the screen; F1 or Back leave it without saving.
+    if (ps2x::touch::editing())
+    {
+        if (IsKeyPressed(KEY_F1)
+#if defined(__ANDROID__)
+            || IsKeyPressed(KEY_BACK)
+#endif
+        )
+            ps2x::touch::cancelEditing();
+        return;
+    }
     // F1 on a keyboard; the menu button of the touch controls or Back on a phone.
     const bool toggle = IsKeyPressed(KEY_F1) || ps2x::touch::takeMenuRequest()
 #if defined(__ANDROID__)
@@ -129,6 +140,8 @@ void PS2SettingsMenu::draw(PS2Runtime &runtime)
                     drawSettings(tab.section);
                 else if (std::strcmp(tab.title, "Controles") == 0)
                     drawControls();
+                else if (std::strcmp(tab.title, "Toque") == 0)
+                    drawTouch();
                 else
                     drawHacks();
                 ImGui::EndChild();
@@ -163,7 +176,8 @@ void PS2SettingsMenu::drawSettings(const char *section)
 {
     for (const settings::Definition &definition : settings::definitions())
     {
-        if (std::strcmp(definition.section, section) != 0)
+        if (std::strcmp(definition.section, section) != 0 || definition.kind == settings::Kind::Text ||
+            std::strncmp(definition.key, "show_", 5) == 0)
             continue;
         ImGui::PushID(definition.key);
         const bool locked = settings::overriddenByEnvironment(definition.section, definition.key);
@@ -292,6 +306,44 @@ void PS2SettingsMenu::drawControls()
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+}
+
+void PS2SettingsMenu::drawTouch()
+{
+    drawSettings("touch");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Controles na tela");
+    helpLine("Escolha quais aparecem. O analógico direito move a câmera; L3 e R3 são o clique dos analógicos.");
+    if (ImGui::BeginTable("touch-controls", 3))
+    {
+        for (const settings::Definition &definition : settings::definitions())
+        {
+            if (std::strcmp(definition.section, "touch") != 0 || std::strncmp(definition.key, "show_", 5) != 0)
+                continue;
+            ImGui::TableNextColumn();
+            bool on = settings::getBool(definition.section, definition.key);
+            if (ImGui::Checkbox(definition.label, &on))
+                settings::set(definition.section, definition.key, on ? "true" : "false");
+        }
+        ImGui::EndTable();
+    }
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::TextUnformatted("Posições");
+    helpLine("Editar abre a tela de jogo com os controles: arraste cada um para onde quiser, use - e + para o "
+             "tamanho e toque em Salvar. Retrato e paisagem guardam posições separadas.");
+    if (ImGui::Button("Editar posições"))
+    {
+        close();
+        ps2x::touch::beginEditing();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Posições padrão"))
+    {
+        settings::set("touch", "layout_landscape", "");
+        settings::set("touch", "layout_portrait", "");
     }
 }
 

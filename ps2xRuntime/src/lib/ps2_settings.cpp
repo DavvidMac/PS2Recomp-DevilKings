@@ -387,6 +387,27 @@ namespace ps2x::settings
                  "55", nullptr, {}, {}, 10, 100, nullptr, true});
             add({"touch", "size", "Tamanho", "Tamanho dos controles na tela, em % do padrão.", Kind::Number, "100",
                  nullptr, {}, {}, 50, 200, nullptr, true});
+            // Which controls are on the screen (the Toque tab lists them as a grid of checkboxes).
+            const struct
+            {
+                const char *key;
+                const char *label;
+                const char *defaultValue;
+            } shown[] = {
+                {"show_left_stick", "Analógico esquerdo", "true"}, {"show_right_stick", "Analógico direito", "true"},
+                {"show_dpad", "Direcional", "false"},              {"show_face", "Triângulo, bola, X, quadrado", "true"},
+                {"show_l1", "L1", "true"},                         {"show_l2", "L2", "true"},
+                {"show_r1", "R1", "true"},                         {"show_r2", "R2", "true"},
+                {"show_l3", "L3", "false"},                        {"show_r3", "R3", "false"},
+                {"show_select", "Select", "true"},                 {"show_start", "Start", "true"},
+            };
+            for (const auto &control : shown)
+                add({"touch", control.key, control.label, "", Kind::Bool, control.defaultValue, nullptr, {}, {}, 0, 0,
+                     nullptr, true});
+            // Where each control sits, per orientation, written by the position editor
+            // (ps2x::touch): "id=x,y,size;..." with x, y in fractions of the screen.
+            add({"touch", "layout_landscape", "", "", Kind::Text, "", nullptr, {}, {}, 0, 0, nullptr, true});
+            add({"touch", "layout_portrait", "", "", Kind::Text, "", nullptr, {}, {}, 0, 0, nullptr, true});
             // Saves
             add({"saves", "memcard_folder", "Pasta do memory card 1",
                  "Pasta dos saves do slot 1 (o slot 2 usa a pasta irmã mc1). Relativa à pasta do jogo.", Kind::Path,
@@ -642,8 +663,8 @@ namespace ps2x::settings
     const std::vector<PadButton> &padButtons()
     {
         static const std::vector<PadButton> s_buttons = {
-            {"up", "Direcional ↑", 0x0010u},   {"down", "Direcional ↓", 0x0040u},
-            {"left", "Direcional ←", 0x0080u}, {"right", "Direcional →", 0x0020u},
+            {"up", "Direcional (cima)", 0x0010u},   {"down", "Direcional (baixo)", 0x0040u},
+            {"left", "Direcional (esquerda)", 0x0080u}, {"right", "Direcional (direita)", 0x0020u},
             {"cross", "X (Xis)", 0x4000u},     {"circle", "O (Bola)", 0x2000u},
             {"square", "Quadrado", 0x8000u},   {"triangle", "Triângulo", 0x1000u},
             {"l1", "L1", 0x0400u},             {"r1", "R1", 0x0800u},
