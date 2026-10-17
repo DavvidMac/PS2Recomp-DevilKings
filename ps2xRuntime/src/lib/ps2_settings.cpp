@@ -297,12 +297,18 @@ namespace ps2x::settings
 #else
                 constexpr bool kHaveVulkan = false;
 #endif
+                // On phones the software renderer is too slow and paraLLEl-GS needs Vulkan 1.3.
+#if defined(__ANDROID__)
+                constexpr const char *kDefaultRenderer = "opengl";
+#else
+                constexpr const char *kDefaultRenderer = "software";
+#endif
                 Definition renderer{"video", "renderer", "Renderizador",
                                     "Software desenha na CPU. Vulkan desenha na placa de vídeo (paraLLEl-GS, tão fiel "
                                     "quanto o Software) e permite resolução interna maior. OpenGL também desenha na "
                                     "placa de vídeo e roda em celulares sem Vulkan 1.3 (em desenvolvimento: alguns "
                                     "efeitos ainda faltam).",
-                                    Kind::Choice, "software", "PS2X_RENDERER", {"software", "vulkan", "opengl"},
+                                    Kind::Choice, kDefaultRenderer, "PS2X_RENDERER", {"software", "vulkan", "opengl"},
                                     {"Software (CPU)", kHaveVulkan ? "Vulkan (GPU)" : "Vulkan (não incluído nesta build)",
                                      "OpenGL (GPU)"},
                                     0, 0, nullptr, false};

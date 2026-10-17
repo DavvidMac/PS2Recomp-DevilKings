@@ -64,7 +64,9 @@ public:
     void WriteRectRaw(uint32_t psm, uint32_t base, uint32_t bw, uint32_t width, uint32_t height,
                       const uint32_t *values);
     // Applies uploads, transfers and palette loads as they are submitted, whatever PS2X_GS_ASYNC says.
-    void SetSynchronous();
+    void SetSynchronous() { SetAsynchronous(false); }
+    // Or queues them for the worker and band threads (as PS2X_GS_ASYNC=1 does).
+    void SetAsynchronous(bool async);
     // The 256 colours the palette gives the indices of the state's texture format (TEXA applied).
     void PaletteRgba(const GSDrawState &state, uint32_t *out);
 

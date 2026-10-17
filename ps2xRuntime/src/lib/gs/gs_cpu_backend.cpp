@@ -2465,12 +2465,12 @@ void GSCpuBackend::PaletteRgba(const GSDrawState &state, uint32_t *out)
         out[i] = LookupCLUT(state, m_clut, static_cast<uint8_t>(i), tex.cpsm, tex.csm, tex.csa, tex.psm);
 }
 
-void GSCpuBackend::SetSynchronous()
+void GSCpuBackend::SetAsynchronous(bool async)
 {
     DrainQueue();
     std::lock_guard<std::mutex> queueLock(m_queueMutex);
     m_asyncResolved = true;
-    m_async = false;
+    m_async = async;
 }
 
 void GSCpuBackend::MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)

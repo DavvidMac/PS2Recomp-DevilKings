@@ -17,6 +17,7 @@ namespace ps2x::gles
 #include "runtime/gs/ps2_gs_common.h"
 #include "runtime/gs/ps2_gs_memory.h"
 #include "ThreadNaming.h"
+#include "runtime/ps2_settings.h"
 
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
@@ -40,6 +41,7 @@ namespace ps2x::gles
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -71,6 +73,18 @@ namespace ps2x::gles
         {
             const uint64_t swaps = g_swaps.load(std::memory_order_relaxed);
             return g_frameLogSwap != 0u && swaps >= g_frameLogSwap && swaps < g_frameLogSwap + 2u;
+        }
+
+        // PS2X_GLES_COMPARE=<dir>: a software renderer fed the same calls draws every picture too,
+        // and the GL thread reports how far apart they are and saves the pictures that differ.
+        const char *compareDirectory()
+        {
+            static const char *s_dir = []() -> const char *
+            {
+                const char *value = std::getenv("PS2X_GLES_COMPARE");
+                return value && *value ? value : nullptr;
+            }();
+            return s_dir;
         }
 
         // What the renderer draws differently from the console, said once per kind.
@@ -288,6 +302,12 @@ namespace ps2x::gles
             uint32_t count = 0;
             ReadbackJob *job = nullptr;
             PresentParams present{};
+            // Present with PS2X_GLES_COMPARE: the software renderer's picture (RGBA, rows of
+            // referenceStride pixels).
+            std::shared_ptr<std::vector<uint8_t>> reference;
+            uint32_t referenceWidth = 0;
+            uint32_t referenceHeight = 0;
+            uint32_t referenceStride = 0;
         };
 
         struct Batch
@@ -828,7 +848,7 @@ void main()
             GLuint framebufferFor(uint32_t color, uint32_t depth);
             void forgetFramebuffers(uint32_t target);
             void draw(const Command &command);
-            void present(const PresentParams &params);
+            void present(const PresentParams &params, const Command *command = nullptr);
             void readback(ReadbackJob &job);
             GLuint newTexture(GLint internalFormat, GLenum format, GLenum type, uint32_t width, uint32_t height,
                               const void *pixels);
@@ -849,6 +869,17 @@ void main()
             bool m_haveField = false;
             uint32_t m_fieldParity = 0;
             std::vector<uint8_t> m_fieldPixels[2];
+            void compare(const Command &command, const std::vector<uint8_t> &picture, uint32_t width, uint32_t height);
+            struct CompareStats
+            {
+                uint64_t presents = 0;
+                uint64_t total = 0;
+                double offSum = 0.0;
+                double worst = 0.0;
+                uint64_t worstPresent = 0;
+                uint64_t lastDump = 0;
+                uint32_t dumps = 0;
+            } m_compare;
             GLuint m_vao = 0;
             GLuint m_vbo = 0;
             GLuint m_emptyVao = 0;
@@ -1150,7 +1181,77 @@ void main()
                          GL_UNSIGNED_BYTE, job.pixels.data());
         }
 
-        void Renderer::present(const PresentParams &params)
+        // Pixels whose colour differs by more than 8 in a channel count as off.
+        void Renderer::compare(const Command &command, const std::vector<uint8_t> &picture, uint32_t width,
+                               uint32_t height)
+        {
+            const std::vector<uint8_t> &reference = *command.reference;
+            const uint32_t w = std::min(width, command.referenceWidth);
+            const uint32_t h = std::min(height, command.referenceHeight);
+            if (w == 0u || h == 0u)
+                return;
+            uint64_t off = 0;
+            for (uint32_t y = 0; y < h; ++y)
+                for (uint32_t x = 0; x < w; ++x)
+                {
+                    const uint8_t *a = picture.data() + (static_cast<size_t>(y) * width + x) * 4u;
+                    const uint8_t *b = reference.data() + (static_cast<size_t>(y) * command.referenceStride + x) * 4u;
+                    if (std::abs(a[0] - b[0]) > 8 || std::abs(a[1] - b[1]) > 8 || std::abs(a[2] - b[2]) > 8)
+                        ++off;
+                }
+            const double percent = 100.0 * static_cast<double>(off) / static_cast<double>(static_cast<uint64_t>(w) * h);
+            CompareStats &c = m_compare;
+            ++c.presents;
+            ++c.total;
+            c.offSum += percent;
+            if (percent > c.worst)
+            {
+                c.worst = percent;
+                c.worstPresent = c.total;
+            }
+            // Side by side: GL, software, difference x4. At most one every 120 swaps, 200 in all.
+            if (percent >= 1.0 && c.total >= c.lastDump + 120u && c.dumps < 200u)
+            {
+                c.lastDump = c.total;
+                ++c.dumps;
+                const std::string path = std::string(compareDirectory()) + "/compare_" + std::to_string(c.total) + "_" +
+                                         std::to_string(static_cast<int>(percent * 10.0)) + ".ppm";
+                if (FILE *file = std::fopen(path.c_str(), "wb"))
+                {
+                    std::fprintf(file, "P6\n%u %u\n255\n", w * 3u, h);
+                    std::vector<uint8_t> row(static_cast<size_t>(w) * 9u);
+                    for (uint32_t y = 0; y < h; ++y)
+                    {
+                        for (uint32_t x = 0; x < w; ++x)
+                        {
+                            const uint8_t *a = picture.data() + (static_cast<size_t>(y) * width + x) * 4u;
+                            const uint8_t *b =
+                                reference.data() + (static_cast<size_t>(y) * command.referenceStride + x) * 4u;
+                            for (uint32_t ch = 0; ch < 3u; ++ch)
+                            {
+                                row[x * 3u + ch] = a[ch];
+                                row[(w + x) * 3u + ch] = b[ch];
+                                row[(2u * w + x) * 3u + ch] =
+                                    static_cast<uint8_t>(std::min(255, std::abs(a[ch] - b[ch]) * 4));
+                            }
+                        }
+                        std::fwrite(row.data(), 1u, row.size(), file);
+                    }
+                    std::fclose(file);
+                }
+            }
+            if (c.presents == 300u)
+            {
+                std::fprintf(stderr, "[gles-compare] swaps to %llu: %.2f%% of the pixels off on average, worst %.2f%% (swap %llu)\n",
+                             static_cast<unsigned long long>(c.total), c.offSum / static_cast<double>(c.presents), c.worst,
+                             static_cast<unsigned long long>(c.worstPresent));
+                c.presents = 0;
+                c.offSum = 0.0;
+                c.worst = 0.0;
+            }
+        }
+
+        void Renderer::present(const PresentParams &params, const Command *command)
         {
             int slotIndex = 0;
             {
@@ -1280,6 +1381,16 @@ void main()
                 glDrawArrays(GL_TRIANGLES, 0, 3);
                 m_fieldCurrent = previous;
                 m_haveField = true;
+                if (command && command->reference)
+                    compare(*command, field, w, h);
+            }
+            else if (command && command->reference)
+            {
+                std::vector<uint8_t> picture(static_cast<size_t>(slot.width) * slot.height * 4u);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, slot.framebuffer);
+                glReadPixels(0, 0, static_cast<GLsizei>(slot.width), static_cast<GLsizei>(slot.height), GL_RGBA,
+                             GL_UNSIGNED_BYTE, picture.data());
+                compare(*command, picture, slot.width, slot.height);
             }
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, 0u);
@@ -1396,7 +1507,7 @@ void main()
                     break;
                 }
                 case Command::Kind::Present:
-                    present(command.present);
+                    present(command.present, &command);
                     break;
                 }
             }
@@ -1768,6 +1879,11 @@ void main()
             };
             std::vector<CachedPalette> m_palettes;
             bool m_swizzleSent = false;
+            // PS2X_GLES_COMPARE: the software renderer drawing the same stream, in a local memory
+            // of its own.
+            std::unique_ptr<GSCpuBackend> m_reference;
+            std::vector<uint8_t> m_referenceVram;
+            bool m_feedingReference = true;
             void trace();
 
             mutable std::recursive_mutex m_mutex;
@@ -1818,6 +1934,16 @@ void main()
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             m_cpu.SetSynchronous();
             m_cpu.Initialize(vram, vramSize);
+            if (compareDirectory() && vram && vramSize != 0u)
+            {
+                m_referenceVram.assign(vram, vram + vramSize);
+                m_reference = std::make_unique<GSCpuBackend>();
+                // Threaded, so a comparison run still plays.
+                m_reference->SetAsynchronous(true);
+                m_reference->Initialize(m_referenceVram.data(), vramSize);
+                std::fprintf(stderr, "[gles-compare] comparing every picture with the software renderer, dumps in %s\n",
+                             compareDirectory());
+            }
             if (!m_swizzleSent)
             {
                 const std::vector<int32_t> tables = buildSwizzleTables();
@@ -1832,6 +1958,8 @@ void main()
         void GlesCore::Reset()
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_reference)
+                m_reference->Reset();
             m_cpu.Reset();
             while (!m_targets.empty())
                 deleteTarget(m_targets.size() - 1u);
@@ -2342,6 +2470,8 @@ void main()
             if (batch.vertexCount == 0u)
                 return;
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_reference && m_feedingReference)
+                m_reference->Submit(batch);
             const GSDrawState &state = batch.state;
             const GSContext &ctx = state.context;
             const uint64_t test = ctx.test;
@@ -2699,6 +2829,8 @@ void main()
             if (frameLogging())
                 std::fprintf(stderr, "[framelog] clut cbp %u cpsm %u csm %u csa %u cld %u tex psm %u tbp %u\n", tex0.cbp,
                              tex0.cpsm, tex0.csm, tex0.csa, tex0.cld, tex0.psm, tex0.tbp0);
+            if (m_reference)
+                m_reference->LoadClut(tex0, texclut);
             const bool indexed = tex0.psm == GS_PSM_T8 || tex0.psm == GS_PSM_T4 || tex0.psm == GS_PSM_T8H ||
                                  tex0.psm == GS_PSM_T4HL || tex0.psm == GS_PSM_T4HH;
             if (tex0.cld != 0u && indexed)
@@ -2715,6 +2847,8 @@ void main()
         void GlesCore::BeginTransfer(const GSTransferCommand &command)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_reference)
+                m_reference->BeginTransfer(command);
             if (frameLogging())
                 std::fprintf(stderr, "[framelog] transfer dir %u sbp %u sbw %u spsm %u -> dbp %u dbw %u dpsm %u src %u,%u dst %u,%u %ux%u\n",
                              command.direction, command.bitbltbuf.sbp, command.bitbltbuf.sbw, command.bitbltbuf.spsm,
@@ -2770,6 +2904,8 @@ void main()
         void GlesCore::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_reference)
+                m_reference->UploadImage(data, sizeBytes);
             m_cpu.UploadImage(data, sizeBytes);
             noteCpuWrite();
             if (m_directUpload.active)
@@ -2820,6 +2956,8 @@ void main()
         void GlesCore::TextureFlush()
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_reference)
+                m_reference->TextureFlush();
             m_cpu.TextureFlush();
         }
 
@@ -2898,7 +3036,20 @@ void main()
                 return !(value && value[0] == '0');
             }();
             params.weave = s_deinterlace && params.outHeight <= 256u && params.outWidth <= 640u;
-            push(Command::Kind::Present).present = params;
+            Command &presentCommand = push(Command::Kind::Present);
+            presentCommand.present = params;
+            if (m_reference)
+            {
+                PresentationFrame picture = m_reference->Present(request);
+                if (picture)
+                {
+                    const size_t fullFrame = static_cast<size_t>(640u) * 512u * 4u;
+                    presentCommand.referenceStride = picture.pixels.size() == fullFrame ? 640u : picture.width;
+                    presentCommand.referenceWidth = picture.width;
+                    presentCommand.referenceHeight = picture.height;
+                    presentCommand.reference = std::make_shared<std::vector<uint8_t>>(std::move(picture.pixels));
+                }
+            }
             if (frameLogging())
                 std::fprintf(stderr, "[framelog] present fbp %u/%u\n", params.target[0], params.target[1]);
             g_swaps.fetch_add(1u, std::memory_order_relaxed);
@@ -2934,6 +3085,9 @@ void main()
         {
             if (context.frame.fbw == 0u)
                 return false;
+            std::lock_guard<std::recursive_mutex> lock(m_mutex);
+            if (m_reference)
+                m_reference->ClearFramebuffer(context, rgba);
             // A sprite over the scissor, the way the CPU backend fills it.
             GSPrimitiveBatch clear{};
             clear.vertexCount = 2u;
@@ -2952,7 +3106,9 @@ void main()
                 v.b = static_cast<uint8_t>(rgba >> 16);
                 v.a = static_cast<uint8_t>(rgba >> 24);
             }
+            m_feedingReference = false;
             Submit(clear);
+            m_feedingReference = true;
             return true;
         }
 
@@ -2974,6 +3130,8 @@ void main()
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             writeBackOverlapping(bufferPages(base, bw, static_cast<uint8_t>(psm), x + 1u, y + 1u), "WriteVram");
+            if (m_reference)
+                m_reference->WriteVram(psm, base, bw, x, y, value);
             m_cpu.WriteVram(psm, base, bw, x, y, value);
             noteCpuWrite();
         }
@@ -3257,8 +3415,10 @@ void main()
     {
         static const bool s_requested = []()
         {
-            const char *value = std::getenv("PS2X_RENDERER");
-            return value && std::strcmp(value, "opengl") == 0;
+            // The variable, else the setting: its default (OpenGL on Android) sets no variable.
+            if (const char *value = std::getenv("PS2X_RENDERER"))
+                return std::strcmp(value, "opengl") == 0;
+            return ps2x::settings::get("video", "renderer") == "opengl";
         }();
         return s_requested;
     }
