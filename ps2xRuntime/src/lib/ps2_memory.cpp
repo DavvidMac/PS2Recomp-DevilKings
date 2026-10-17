@@ -2,6 +2,7 @@
 #include "runtime/ps2_address.h"
 #include "runtime/gs/gs_frontend.h"
 #include "ps2_log.h"
+#include "ThreadNaming.h"
 #include <atomic>
 #include <cstring>
 #include <limits>
@@ -2412,6 +2413,7 @@ void PS2Memory::queueVif1Transfers()
 void PS2Memory::vif1ThreadMain()
 {
     t_onVif1Thread = true;
+    ThreadNaming::SetCurrentThreadName("VIF1");
     for (;;)
     {
         Vif1Job job;
