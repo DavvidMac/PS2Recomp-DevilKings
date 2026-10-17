@@ -2456,6 +2456,15 @@ void GSCpuBackend::WriteRectRaw(uint32_t psm, uint32_t base, uint32_t bw, uint32
         }
 }
 
+void GSCpuBackend::PaletteRgba(const GSDrawState &state, uint32_t *out)
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const GSTex0Reg &tex = state.context.tex0;
+    for (uint32_t i = 0; i < 256u; ++i)
+        out[i] = LookupCLUT(state, m_clut, static_cast<uint8_t>(i), tex.cpsm, tex.csm, tex.csa, tex.psm);
+}
+
 void GSCpuBackend::SetSynchronous()
 {
     DrainQueue();

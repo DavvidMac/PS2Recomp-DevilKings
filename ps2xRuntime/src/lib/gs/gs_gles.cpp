@@ -15,6 +15,8 @@ namespace ps2x::gles
 
 #include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/gs/ps2_gs_common.h"
+#include "runtime/gs/ps2_gs_memory.h"
+#include "ThreadNaming.h"
 
 #if defined(__ANDROID__)
 #include <EGL/egl.h>
@@ -102,7 +104,92 @@ namespace ps2x::gles
             SourceCache = 1,       // decoded from local memory
             SourceTarget = 2,      // a frame buffer the GPU drew
             SourceTargetCopy = 3,  // the frame buffer being drawn to (copied first)
+            SourceReinterpret = 4,      // a frame buffer the GPU drew, read in another layout
+            SourceReinterpretCopy = 5,  // the same, of the frame buffer being drawn to
         };
+
+        // GS memory layouts for the shader, in one integer texture 128 wide: per page, the
+        // element each pixel of a format is stored at (layout tables), and the pixel each element
+        // of a frame buffer format holds, as x | y << 8 (inverse tables).
+        struct Layout
+        {
+            int table;
+            int pageWidth;
+            int pageHeight;
+            int strideBits;
+        };
+        constexpr Layout kLayout32{0, 64, 32, 32};
+        constexpr Layout kLayout16{2048, 64, 64, 16};
+        constexpr Layout kLayout16S{6144, 64, 64, 16};
+        constexpr Layout kLayout8{10240, 128, 64, 8};
+        constexpr Layout kLayout4{18432, 128, 128, 4};
+        constexpr int kInverse32 = 34816;
+        constexpr int kInverse16 = 36864;
+        constexpr int kInverse16S = 40960;
+        constexpr int kSwizzleEntries = 45056;
+        constexpr int kSwizzleWidth = 128;
+
+        // Found by writing each pixel's index through the CPU backend's own swizzles and seeing
+        // where it lands, so the shader cannot disagree with local memory.
+        std::vector<int32_t> buildSwizzleTables()
+        {
+            std::vector<int32_t> table(kSwizzleEntries, 0);
+            std::vector<uint8_t> memory(GSMem::MEMORY_SIZE, 0u);
+            uint8_t *mem = memory.data();
+            const auto words = [&](uint32_t i) { uint32_t v; std::memcpy(&v, mem + i * 4u, 4u); return v; };
+            const auto halves = [&](uint32_t i) { uint16_t v; std::memcpy(&v, mem + i * 2u, 2u); return static_cast<uint32_t>(v); };
+            for (uint32_t y = 0; y < 32u; ++y)
+                for (uint32_t x = 0; x < 64u; ++x)
+                    GSMem::WriteCT32(mem, 0u, 1u, x, y, y * 64u + x);
+            for (uint32_t w = 0; w < 2048u; ++w)
+            {
+                const uint32_t pixel = words(w) & 2047u;
+                table[kLayout32.table + pixel] = static_cast<int32_t>(w);
+                table[kInverse32 + w] = static_cast<int32_t>((pixel % 64u) | ((pixel / 64u) << 8));
+            }
+            const auto sixteen = [&](void (*write)(uint8_t *, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t),
+                                     int layout, int inverse)
+            {
+                std::fill(memory.begin(), memory.begin() + 8192, 0u);
+                for (uint32_t y = 0; y < 64u; ++y)
+                    for (uint32_t x = 0; x < 64u; ++x)
+                        write(mem, 0u, 1u, x, y, y * 64u + x);
+                for (uint32_t h = 0; h < 4096u; ++h)
+                {
+                    const uint32_t pixel = halves(h) & 4095u;
+                    table[layout + pixel] = static_cast<int32_t>(h);
+                    table[inverse + h] = static_cast<int32_t>((pixel % 64u) | ((pixel / 64u) << 8));
+                }
+            };
+            sixteen(GSMem::WriteCT16, kLayout16.table, kInverse16);
+            sixteen(GSMem::WriteCT16S, kLayout16S.table, kInverse16S);
+            // 8 and 4 bits: the index does not fit an element, so it goes in several passes.
+            std::vector<uint32_t> index(16384u, 0u);
+            for (uint32_t pass = 0; pass < 2u; ++pass)
+            {
+                for (uint32_t y = 0; y < 64u; ++y)
+                    for (uint32_t x = 0; x < 128u; ++x)
+                        GSMem::WriteP8(mem, 0u, 2u, x, y, ((y * 128u + x) >> (pass * 8u)) & 0xFFu);
+                for (uint32_t b = 0; b < 8192u; ++b)
+                    index[b] = (pass == 0u ? 0u : index[b]) | (static_cast<uint32_t>(mem[b]) << (pass * 8u));
+            }
+            for (uint32_t b = 0; b < 8192u; ++b)
+                table[kLayout8.table + (index[b] & 8191u)] = static_cast<int32_t>(b);
+            for (uint32_t pass = 0; pass < 4u; ++pass)
+            {
+                for (uint32_t y = 0; y < 128u; ++y)
+                    for (uint32_t x = 0; x < 128u; ++x)
+                        GSMem::WriteP4(mem, 0u, 2u, x, y, ((y * 128u + x) >> (pass * 4u)) & 0xFu);
+                for (uint32_t n = 0; n < 16384u; ++n)
+                {
+                    const uint32_t nibble = (mem[n / 2u] >> ((n & 1u) * 4u)) & 0xFu;
+                    index[n] = (pass == 0u ? 0u : index[n]) | (nibble << (pass * 4u));
+                }
+            }
+            for (uint32_t n = 0; n < 16384u; ++n)
+                table[kLayout4.table + (index[n] & 16383u)] = static_cast<int32_t>(n);
+            return table;
+        }
 
         // Everything the GL state of a draw depends on: consecutive draws with the same key
         // share one call. Filled after a memset, compared with memcmp.
@@ -111,6 +198,14 @@ namespace ps2x::gles
             uint32_t target;
             uint32_t depth;      // 0: none
             uint32_t texture;
+            uint32_t palette;    // reinterpreted indexed textures: 256 x 1 colours
+            uint32_t fbmsk;      // destination mode
+            uint16_t reTable, reInverse, rePageOffset;
+            uint8_t rePageWidth, rePageHeight, rePagesPerRow, reStrideBits, reValueBits, reBitOffset, reKind;
+            uint8_t reTargetPageWidth, reTargetPageHeight, reTargetPagesPerRow, reTargetBits;
+            // Destination mode: the shader reads the frame buffer (a copy) and does the GS blend,
+            // FBMSK and DATE itself, for what GL blending and colour masks cannot express.
+            uint8_t dstMode, blendSel, shaderBlend, pabe, date, datm, frameKind;
             uint16_t targetWidth, targetHeight;
             uint16_t texWidth, texHeight;      // 2^TW, 2^TH
             uint16_t storeWidth, storeHeight;  // the GL texture's size
@@ -173,6 +268,7 @@ namespace ps2x::gles
                 UploadTarget,
                 UploadTexture,
                 DeleteTexture,
+                UploadSwizzle,
                 Readback,
                 Present,
             };
@@ -336,13 +432,23 @@ void main()
         // reads source and destination alpha as factors directly.
         const char *kDrawFragment = R"(
 uniform sampler2D uTex;
-uniform ivec4 uMode;     // tme, tfx, tcc, linear
-uniform ivec4 uWrap;     // wms, wmt, texture width, texture height
-uniform ivec4 uRegion;   // minu, maxu, minv, maxv
-uniform ivec4 uStore;    // stored width, stored height, texa mode, 16-bit frame
-uniform vec4 uTexa;      // ta0, ta1, aem, alpha scale
-uniform vec4 uFog;       // fog colour, aref
-uniform ivec4 uTest;     // fge, atst (-1 none), pass (0 passing, 1 failing), alpha out mode
+uniform sampler2D uPalette;
+uniform sampler2D uDst;
+uniform highp isampler2D uSwizzle;
+uniform ivec4 uMode;      // tme, tfx, tcc, linear
+uniform ivec4 uWrap;      // wms, wmt, texture width, texture height
+uniform ivec4 uRegion;    // minu, maxu, minv, maxv
+uniform ivec4 uStore;     // stored width, stored height, texa mode, 16-bit frame
+uniform vec4 uTexa;       // ta0, ta1, aem, alpha scale
+uniform vec4 uFog;        // fog colour, aref
+uniform ivec4 uTest;      // fge, atst (-1 none), pass (0 passing, 1 failing), alpha out mode
+uniform ivec4 uReTex;     // layout table, page width, page height, pages per row
+uniform ivec4 uReTex2;    // element stride bits, value bits, bit offset, value kind
+uniform ivec4 uReTarget;  // inverse table, page width, page height, pages per row
+uniform ivec4 uReTarget2; // element bits, first page, reinterpreting, 0
+uniform ivec4 uDstMode;   // on, blend selectors, blend, pabe
+uniform ivec4 uDstMode2;  // date, datm, frame kind (0 32-bit, 1 24-bit, 2 16-bit), fix
+uniform uint uFbmsk;
 in vec3 vTex;
 in vec4 vColor;
 in float vFog;
@@ -356,10 +462,71 @@ int wrapCoord(int c, int size, int mode, int lo, int hi)
     return (c & lo) | hi;
 }
 
+int swizzle(int i)
+{
+    return texelFetch(uSwizzle, ivec2(i & 127, i >> 7), 0).r;
+}
+
+// count bits of GS memory at bitAddr (from the frame buffer's base), out of the frame buffer's
+// pixels: count is at most the frame buffer's element size.
+uint targetBits(int bitAddr, int count)
+{
+    int elementBits = uReTarget2.x;
+    int page = bitAddr >> 16;
+    int inPage = bitAddr & 65535;
+    int element = inPage / elementBits;
+    int shift = inPage - element * elementBits;
+    int xy = swizzle(uReTarget.x + element);
+    int x = (page % uReTarget.w) * uReTarget.y + (xy & 255);
+    int y = (page / uReTarget.w) * uReTarget.z + (xy >> 8);
+    vec4 t = vec4(0.0);
+    if (x < uStore.x && y < uStore.y)
+        t = texelFetch(uTex, ivec2(x, y), 0);
+    uvec3 c = uvec3(floor(t.rgb * 255.0 + 0.5));
+    uint raw;
+    if (elementBits == 32)
+        raw = c.r | (c.g << 8) | (c.b << 16) | (uint(floor(t.a * 128.0 + 0.5)) << 24);
+    else
+        raw = (c.r >> 3) | ((c.g >> 3) << 5) | ((c.b >> 3) << 10) | (t.a > 0.5 ? 0x8000u : 0u);
+    raw >>= uint(shift);
+    return count >= 32 ? raw : (raw & ((1u << uint(count)) - 1u));
+}
+
+// The texel at (u, v) of a texture whose memory a GPU frame buffer of another layout holds.
+vec4 reinterpretTexel(int u, int v)
+{
+    int pw = uReTex.y;
+    int ph = uReTex.z;
+    int page = uReTarget2.y + (v / ph) * uReTex.w + (u / pw);
+    int element = swizzle(uReTex.x + (v % ph) * pw + (u % pw));
+    int bitAddr = page * 65536 + element * uReTex2.x + uReTex2.z;
+    uint value = uReTex2.y > uReTarget2.x ? (targetBits(bitAddr, 16) | (targetBits(bitAddr + 16, 16) << 16))
+                                          : targetBits(bitAddr, uReTex2.y);
+    int kind = uReTex2.w;
+    if (kind == 3)
+    {
+        vec4 p = texelFetch(uPalette, ivec2(int(value), 0), 0);
+        return floor(p * 255.0 + 0.5);
+    }
+    vec4 c;
+    if (kind == 2)
+        c = vec4(float((value & 31u) << 3), float(((value >> 5) & 31u) << 3), float(((value >> 10) & 31u) << 3), 0.0);
+    else
+        c = vec4(float(value & 255u), float((value >> 8) & 255u), float((value >> 16) & 255u), float(value >> 24));
+    bool black = c.r == 0.0 && c.g == 0.0 && c.b == 0.0;
+    if (kind == 1)
+        c.a = (uTexa.z > 0.5 && black) ? 0.0 : uTexa.x;
+    else if (kind == 2)
+        c.a = (value & 0x8000u) != 0u ? uTexa.y : ((uTexa.z > 0.5 && black) ? 0.0 : uTexa.x);
+    return c;
+}
+
 vec4 fetchTexel(int u, int v)
 {
     u = wrapCoord(u, uWrap.z, uWrap.x, uRegion.x, uRegion.y);
     v = wrapCoord(v, uWrap.w, uWrap.y, uRegion.z, uRegion.w);
+    if (uReTarget2.z == 1)
+        return reinterpretTexel(u, v);
     vec4 t = vec4(0.0);
     if (u >= 0 && v >= 0 && u < uStore.x && v < uStore.y)
         t = texelFetch(uTex, ivec2(u, v), 0);
@@ -402,6 +569,38 @@ bool alphaPasses(float a)
     if (atst == 5) return a >= aref;
     if (atst == 6) return a > aref;
     return a != aref;
+}
+
+vec3 blendInput(int sel, vec3 cs, vec3 cd)
+{
+    return sel == 0 ? cs : (sel == 1 ? cd : vec3(0.0));
+}
+
+// The GS pixel pipeline after the alpha test, reading the frame buffer: DATE, blending
+// (A - B) * C >> 7 + D, then FBMSK, in the units the GS works in.
+vec4 applyDestination(vec4 c)
+{
+    vec4 d = texelFetch(uDst, ivec2(gl_FragCoord.xy), 0);
+    vec3 cd = floor(d.rgb * 255.0 + 0.5);
+    float ad = uDstMode2.z == 1 ? 128.0 : (uDstMode2.z == 2 ? (d.a > 0.5 ? 128.0 : 0.0) : floor(d.a * 128.0 + 0.5));
+    if (uDstMode2.x == 1 && ((ad >= 128.0) != (uDstMode2.y == 1)))
+        discard;
+    vec3 rgb = c.rgb;
+    if (uDstMode.z == 1 && !(uDstMode.w == 1 && c.a < 128.0))
+    {
+        int sel = uDstMode.y;
+        int cSel = (sel >> 4) & 3;
+        float factor = cSel == 0 ? c.a : (cSel == 1 ? ad : float(uDstMode2.w));
+        vec3 a = blendInput(sel & 3, c.rgb, cd);
+        vec3 b = blendInput((sel >> 2) & 3, c.rgb, cd);
+        vec3 dd = blendInput((sel >> 6) & 3, c.rgb, cd);
+        rgb = clamp(floor((a - b) * factor / 128.0) + dd, 0.0, 255.0);
+    }
+    uvec4 s = uvec4(uvec3(rgb), uint(min(c.a, 255.0)));
+    uvec4 o = uvec4(uvec3(cd), uint(ad));
+    uvec4 m = uvec4(uFbmsk & 255u, (uFbmsk >> 8) & 255u, (uFbmsk >> 16) & 255u, uFbmsk >> 24);
+    s = (s & ~m) | (o & m);
+    return vec4(s);
 }
 
 void main()
@@ -447,6 +646,8 @@ void main()
         if (uTest.z == 0 ? !passes : passes)
             discard;
     }
+    if (uDstMode.x == 1)
+        c = applyDestination(c);
     vec3 rgb = c.rgb;
     float a = min(c.a / 128.0, 1.0);
     if (uStore.w == 1)
@@ -611,9 +812,14 @@ void main()
             uint32_t m_copyWidth = 0;
             uint32_t m_copyHeight = 0;
             GLuint m_copyFramebuffer = 0;
+            GLuint m_dstTexture = 0;
+            uint32_t m_dstWidth = 0;
+            uint32_t m_dstHeight = 0;
+            GLuint m_swizzleTexture = 0;
             struct DrawUniforms
             {
-                GLint targetSize, tex, mode, wrap, region, store, texa, fog, test;
+                GLint targetSize, tex, mode, wrap, region, store, texa, fog, test, palette, dst, swizzle, reTex, reTex2,
+                    reTarget, reTarget2, dstMode, dstMode2, fbmsk;
             } m_du{};
             struct PresentUniforms
             {
@@ -644,7 +850,16 @@ void main()
                 return false;
             const auto du = [&](const char *name) { return glGetUniformLocation(m_drawProgram, name); };
             m_du = {du("uTargetSize"), du("uTex"), du("uMode"), du("uWrap"), du("uRegion"),
-                    du("uStore"), du("uTexa"), du("uFog"), du("uTest")};
+                    du("uStore"), du("uTexa"), du("uFog"), du("uTest"), du("uPalette"),
+                    du("uDst"), du("uSwizzle"), du("uReTex"), du("uReTex2"), du("uReTarget"),
+                    du("uReTarget2"), du("uDstMode"), du("uDstMode2"), du("uFbmsk")};
+            // Units: 0 the texture, 1 the second read circuit (present), 2 the palette, 3 the frame
+            // buffer copy of destination mode, 4 the layout tables.
+            glUseProgram(m_drawProgram);
+            glUniform1i(m_du.tex, 0);
+            glUniform1i(m_du.palette, 2);
+            glUniform1i(m_du.dst, 3);
+            glUniform1i(m_du.swizzle, 4);
             const auto pu = [&](const char *name) { return glGetUniformLocation(m_presentProgram, name); };
             m_pu = {pu("uOutSize"), pu("uCrt1"), pu("uCrt2"), pu("uOrigin"), pu("uSize"),
                     pu("uStore"), pu("uEnable"), pu("uBg"), pu("uField")};
@@ -738,13 +953,14 @@ void main()
                 if (found != m_textures.end())
                     texture = found->second.texture;
             }
-            else if (k.source == SourceTarget || k.source == SourceTargetCopy)
+            else if (k.source == SourceTarget || k.source == SourceTargetCopy || k.source == SourceReinterpret ||
+                     k.source == SourceReinterpretCopy)
             {
                 const auto found = m_targets.find(k.texture);
                 if (found != m_targets.end())
                 {
                     texture = found->second.texture;
-                    if (k.source == SourceTargetCopy)
+                    if (k.source == SourceTargetCopy || k.source == SourceReinterpretCopy)
                     {
                         // GL does not define sampling the texture a draw writes: copy it first.
                         const uint32_t w = found->second.width;
@@ -767,6 +983,34 @@ void main()
             }
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, texture);
+            if (k.palette != 0u)
+            {
+                const auto found = m_textures.find(k.palette);
+                glActiveTexture(GL_TEXTURE2);
+                glBindTexture(GL_TEXTURE_2D, found != m_textures.end() ? found->second.texture : 0u);
+            }
+            if (k.dstMode)
+            {
+                // The rectangle the draw covers, copied for the shader to read.
+                const uint32_t w = colorTarget->second.width;
+                const uint32_t h = colorTarget->second.height;
+                glActiveTexture(GL_TEXTURE3);
+                if (!m_dstTexture || m_dstWidth != w || m_dstHeight != h)
+                {
+                    if (m_dstTexture)
+                        glDeleteTextures(1, &m_dstTexture);
+                    m_dstTexture = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, w, h, nullptr);
+                    m_dstWidth = w;
+                    m_dstHeight = h;
+                }
+                glBindTexture(GL_TEXTURE_2D, m_dstTexture);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, framebufferFor(k.target, 0u));
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(command.x), static_cast<GLint>(command.y),
+                                    static_cast<GLint>(command.x), static_cast<GLint>(command.y),
+                                    static_cast<GLsizei>(command.width), static_cast<GLsizei>(command.height));
+                glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
+            }
+            glActiveTexture(GL_TEXTURE0);
 
             glUseProgram(m_drawProgram);
             glUniform2f(m_du.targetSize, static_cast<float>(k.targetWidth), static_cast<float>(k.targetHeight));
@@ -777,6 +1021,14 @@ void main()
             glUniform4i(m_du.store, k.storeWidth, k.storeHeight, k.texaMode, k.frame16);
             glUniform4f(m_du.texa, k.ta0, k.ta1, k.aem, k.alphaScale);
             glUniform4f(m_du.fog, k.fogR, k.fogG, k.fogB, k.aref);
+            const bool reinterpret = k.source == SourceReinterpret || k.source == SourceReinterpretCopy;
+            glUniform4i(m_du.reTex, k.reTable, k.rePageWidth, k.rePageHeight, k.rePagesPerRow);
+            glUniform4i(m_du.reTex2, k.reStrideBits, k.reValueBits, k.reBitOffset, k.reKind);
+            glUniform4i(m_du.reTarget, k.reInverse, k.reTargetPageWidth, k.reTargetPageHeight, k.reTargetPagesPerRow);
+            glUniform4i(m_du.reTarget2, k.reTargetBits, k.rePageOffset, reinterpret ? 1 : 0, 0);
+            glUniform4i(m_du.dstMode, k.dstMode, k.blendSel, k.shaderBlend, k.pabe);
+            glUniform4i(m_du.dstMode2, k.date, k.datm, k.frameKind, k.blendFix);
+            glUniform1ui(m_du.fbmsk, k.fbmsk);
             const int alphaOut = k.forceAlpha ? 1 : (k.keepBlendAlpha ? 2 : 0);
 
             if (k.blend)
@@ -991,6 +1243,16 @@ void main()
                     texture.height = command.height;
                     break;
                 }
+                case Command::Kind::UploadSwizzle:
+                {
+                    glActiveTexture(GL_TEXTURE4);
+                    if (m_swizzleTexture)
+                        glDeleteTextures(1, &m_swizzleTexture);
+                    m_swizzleTexture = newTexture(GL_R32I, GL_RED_INTEGER, GL_INT, kSwizzleWidth,
+                                                  kSwizzleEntries / kSwizzleWidth, batch.blob.data() + command.blob);
+                    glActiveTexture(GL_TEXTURE0);
+                    break;
+                }
                 case Command::Kind::DeleteTexture:
                 {
                     const auto found = m_textures.find(command.id);
@@ -1018,6 +1280,7 @@ void main()
 
         void glThreadMain()
         {
+            ThreadNaming::SetCurrentThreadName("GLES");
             Channel &ch = channel();
             Renderer renderer;
             const bool ok = makeContextCurrent() && renderer.init();
@@ -1172,6 +1435,7 @@ void main()
             uint16_t src = GL_ONE;
             uint16_t dst = GL_ZERO;
             bool usesSourceAlpha = false;
+            bool exact = true;  // false: the GL form only keeps the main term
         };
 
         // GS blending, (A - B) * C + D with A, B, D in {Cs, Cd, 0} and C in {As, Ad, FIX} (0x80
@@ -1200,7 +1464,7 @@ void main()
             };
             const auto approximate = [&](uint16_t equation, uint16_t src, uint16_t dst)
             {
-                noteOnce("blend " + std::to_string(alphaReg & 0xFFu) + " approximated");
+                s.exact = false;
                 set(equation, src, dst);
             };
             constexpr uint32_t Cs = 0u, Cd = 1u, Z = 2u;
@@ -1274,11 +1538,12 @@ void main()
 
         // ------------------------------------------------------------------ the backend
 
-        class GlesBackend final : public GSRasterBackend
+        // The renderer's work on the GS side, run in stream order by GlesBackend's worker.
+        class GlesCore final : public GSRasterBackend
         {
         public:
-            GlesBackend() = default;
-            ~GlesBackend() override = default;
+            GlesCore() = default;
+            ~GlesCore() override = default;
 
             void Initialize(uint8_t *vram, uint32_t vramSize) override;
             void Reset() override;
@@ -1312,9 +1577,18 @@ void main()
                 bool gpuDirty = false;
                 uint64_t syncEpoch = 0;
                 uint64_t checkedWrites = 0;
+                // Every draw tests overlaps against every target: computed again only when rows change
+                // (a change of format within the 32- or 16-bit class keeps the page layout).
+                mutable PageRange cachedPages;
+                mutable uint32_t cachedRows = ~0u;
                 PageRange pages() const
                 {
-                    return bufferPages(fbp * 32u, fbw, psm, width, std::max<uint32_t>(rows, 1u));
+                    if (cachedRows != rows)
+                    {
+                        cachedPages = bufferPages(fbp * 32u, fbw, psm, width, std::max<uint32_t>(rows, 1u));
+                        cachedRows = rows;
+                    }
+                    return cachedPages;
                 }
             };
             // A texture decoded from local memory.
@@ -1333,7 +1607,10 @@ void main()
                 uint64_t epoch = 0;
                 uint64_t checkedWrites = 0;
                 uint64_t lastUse = 0;
+                uint64_t key = 0;
             };
+            // m_textures by a hash of what identifies an entry.
+            std::unordered_map<uint64_t, uint32_t> m_textureSlots;
 
             void handOver(bool wait);
             Command &push(Command::Kind kind);
@@ -1352,6 +1629,21 @@ void main()
             void writeBackAll();
             bool bindTexture(const GSDrawState &state, const Target &drawTarget, DrawKey &key);
             void noteCpuWrite() { ++m_cpuWrites; }
+            uint32_t paletteFor(const GSDrawState &state);
+            // Reads texture memory that one dirty GPU frame buffer holds in another layout from
+            // the shader; false when the texture is not wholly inside one.
+            bool bindReinterpreted(const GSDrawState &state, const PageRange &pages, const Target &drawTarget,
+                                   DrawKey &key);
+            struct CachedPalette
+            {
+                uint32_t id = 0;
+                uint64_t clutVersion = 0;
+                uint8_t psm = 0, cpsm = 0, csm = 0, csa = 0, ta0 = 0, ta1 = 0;
+                bool aem = false;
+                uint64_t lastUse = 0;
+            };
+            std::vector<CachedPalette> m_palettes;
+            bool m_swizzleSent = false;
             void trace();
 
             mutable std::recursive_mutex m_mutex;
@@ -1368,7 +1660,7 @@ void main()
             struct Stats
             {
                 uint64_t draws = 0, vertices = 0, uploads = 0, uploadTexels = 0, writeBacks = 0, reloads = 0,
-                         targetsCreated = 0, presents = 0, writeBackNs = 0, directUploads = 0;
+                         targetsCreated = 0, presents = 0, writeBackNs = 0, directUploads = 0, dstDraws = 0;
             } m_stats;
             // A host-to-local transfer into a rectangle of a GPU frame buffer of its format: the
             // pixels go to the GPU too when it ends, instead of copying the buffer back first.
@@ -1397,14 +1689,23 @@ void main()
         // Batches go to the GL thread at the end of a GIF packet once this many vertices are queued.
         constexpr size_t kHandOverVertices = 3000u;
 
-        void GlesBackend::Initialize(uint8_t *vram, uint32_t vramSize)
+        void GlesCore::Initialize(uint8_t *vram, uint32_t vramSize)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             m_cpu.SetSynchronous();
             m_cpu.Initialize(vram, vramSize);
+            if (!m_swizzleSent)
+            {
+                const std::vector<int32_t> tables = buildSwizzleTables();
+                Command &upload = push(Command::Kind::UploadSwizzle);
+                upload.blob = m_batch.blob.size();
+                for (const int32_t value : tables)
+                    m_batch.blob.push_back(static_cast<uint32_t>(value));
+                m_swizzleSent = true;
+            }
         }
 
-        void GlesBackend::Reset()
+        void GlesCore::Reset()
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             m_cpu.Reset();
@@ -1413,11 +1714,12 @@ void main()
             for (const CachedTexture &texture : m_textures)
                 push(Command::Kind::DeleteTexture).id = texture.id;
             m_textures.clear();
+            m_textureSlots.clear();
             noteCpuWrite();
             handOver(false);
         }
 
-        Command &GlesBackend::push(Command::Kind kind)
+        Command &GlesCore::push(Command::Kind kind)
         {
             m_batch.commands.emplace_back();
             m_batch.commands.back().kind = kind;
@@ -1426,7 +1728,7 @@ void main()
         }
 
         // Queues the batch for the GL thread; with wait, returns once the thread has run it.
-        void GlesBackend::handOver(bool wait)
+        void GlesCore::handOver(bool wait)
         {
             if (m_batch.empty())
                 return;
@@ -1458,7 +1760,7 @@ void main()
             }
         }
 
-        GlesBackend::Target *GlesBackend::findTarget(uint32_t fbp, uint32_t fbw, uint8_t psm, bool depth)
+        GlesCore::Target *GlesCore::findTarget(uint32_t fbp, uint32_t fbw, uint8_t psm, bool depth)
         {
             for (Target &target : m_targets)
                 if (target.depth == depth && target.fbp == fbp && target.fbw == fbw && is16Bit(target.psm) == is16Bit(psm))
@@ -1466,7 +1768,7 @@ void main()
             return nullptr;
         }
 
-        GlesBackend::Target *GlesBackend::targetById(uint32_t id)
+        GlesCore::Target *GlesCore::targetById(uint32_t id)
         {
             for (Target &target : m_targets)
                 if (target.id == id)
@@ -1474,7 +1776,7 @@ void main()
             return nullptr;
         }
 
-        void GlesBackend::deleteTarget(size_t index)
+        void GlesCore::deleteTarget(size_t index)
         {
             push(Command::Kind::DeleteTarget).id = m_targets[index].id;
             m_targets.erase(m_targets.begin() + static_cast<std::ptrdiff_t>(index));
@@ -1482,7 +1784,7 @@ void main()
 
         // A buffer reuses memory other targets stood for: those go (copied back first when the
         // GPU drew them), and memory they leave is local memory again.
-        void GlesBackend::removeOverlapping(const PageRange &pages, uint32_t keepId)
+        void GlesCore::removeOverlapping(const PageRange &pages, uint32_t keepId)
         {
             for (size_t i = m_targets.size(); i-- > 0;)
             {
@@ -1495,7 +1797,7 @@ void main()
             }
         }
 
-        void GlesBackend::growRows(Target &target, uint32_t rows)
+        void GlesCore::growRows(Target &target, uint32_t rows)
         {
             rows = std::min(rows, target.height);
             if (rows <= target.rows)
@@ -1507,7 +1809,7 @@ void main()
                 removeOverlapping(grown, target.id);
         }
 
-        bool GlesBackend::cpuWroteSince(Target &target)
+        bool GlesCore::cpuWroteSince(Target &target)
         {
             if (target.checkedWrites == m_cpuWrites)
                 return false;
@@ -1520,7 +1822,7 @@ void main()
         }
 
         // The target's whole allocation from local memory.
-        void GlesBackend::reloadTarget(Target &target)
+        void GlesCore::reloadTarget(Target &target)
         {
             m_cpu.ReadRectRaw(target.psm, target.fbp * 32u, target.fbw, 0u, 0u, target.width, target.height, m_scratch);
             Command &upload = push(Command::Kind::UploadTarget);
@@ -1537,7 +1839,7 @@ void main()
             ++m_stats.reloads;
         }
 
-        void GlesBackend::writeBack(Target &target)
+        void GlesCore::writeBack(Target &target)
         {
             if (!target.gpuDirty || target.depth)
                 return;
@@ -1561,7 +1863,7 @@ void main()
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
         }
 
-        void GlesBackend::writeBackOverlapping(const PageRange &pages, const std::string &why)
+        void GlesCore::writeBackOverlapping(const PageRange &pages, const std::string &why)
         {
             for (Target &target : m_targets)
                 if (target.gpuDirty && !target.depth && target.pages().overlaps(pages))
@@ -1574,13 +1876,13 @@ void main()
                 }
         }
 
-        void GlesBackend::writeBackAll()
+        void GlesCore::writeBackAll()
         {
             for (Target &target : m_targets)
                 writeBack(target);
         }
 
-        GlesBackend::Target &GlesBackend::colorTarget(const GSFrameReg &frame, uint32_t rowsNeeded)
+        GlesCore::Target &GlesCore::colorTarget(const GSFrameReg &frame, uint32_t rowsNeeded)
         {
             const uint32_t fbw = std::max<uint32_t>(frame.fbw, 1u);
             if (Target *found = findTarget(frame.fbp, fbw, frame.psm, false))
@@ -1615,7 +1917,7 @@ void main()
             return added;
         }
 
-        GlesBackend::Target &GlesBackend::depthTarget(const GSZbufReg &zbuf, uint32_t fbw, const Target &color,
+        GlesCore::Target &GlesCore::depthTarget(const GSZbufReg &zbuf, uint32_t fbw, const Target &color,
                                                       uint32_t rowsNeeded)
         {
             for (Target &target : m_targets)
@@ -1648,9 +1950,115 @@ void main()
             return m_targets.back();
         }
 
+        uint32_t GlesCore::paletteFor(const GSDrawState &state)
+        {
+            const GSTex0Reg &tex = state.context.tex0;
+            const uint64_t version = m_cpu.ClutVersion();
+            for (CachedPalette &palette : m_palettes)
+                if (palette.clutVersion == version && palette.psm == tex.psm && palette.cpsm == tex.cpsm &&
+                    palette.csm == tex.csm && palette.csa == tex.csa && palette.ta0 == state.texa.ta0 &&
+                    palette.ta1 == state.texa.ta1 && palette.aem == state.texa.aem)
+                {
+                    palette.lastUse = ++m_useCounter;
+                    return palette.id;
+                }
+            CachedPalette *entry = nullptr;
+            if (m_palettes.size() < 64u)
+            {
+                m_palettes.emplace_back();
+                entry = &m_palettes.back();
+                entry->id = m_nextId++;
+            }
+            else
+                entry = &*std::min_element(m_palettes.begin(), m_palettes.end(),
+                                           [](const CachedPalette &l, const CachedPalette &r) { return l.lastUse < r.lastUse; });
+            entry->clutVersion = version;
+            entry->psm = tex.psm;
+            entry->cpsm = tex.cpsm;
+            entry->csm = tex.csm;
+            entry->csa = tex.csa;
+            entry->ta0 = state.texa.ta0;
+            entry->ta1 = state.texa.ta1;
+            entry->aem = state.texa.aem;
+            entry->lastUse = ++m_useCounter;
+            uint32_t colours[256];
+            m_cpu.PaletteRgba(state, colours);
+            Command &upload = push(Command::Kind::UploadTexture);
+            upload.id = entry->id;
+            upload.width = 256u;
+            upload.height = 1u;
+            upload.blob = m_batch.blob.size();
+            m_batch.blob.insert(m_batch.blob.end(), colours, colours + 256);
+            return entry->id;
+        }
+
+        bool GlesCore::bindReinterpreted(const GSDrawState &state, const PageRange &pages, const Target &drawTarget,
+                                            DrawKey &key)
+        {
+            const GSTex0Reg &tex = state.context.tex0;
+            if (tex.tbp0 % 32u != 0u)
+                return false;
+            Layout layout{};
+            uint8_t valueBits = 0, bitOffset = 0, kind = 0;
+            switch (tex.psm)
+            {
+            case GS_PSM_CT32: layout = kLayout32; valueBits = 32; kind = 0; break;
+            case GS_PSM_CT24: layout = kLayout32; valueBits = 32; kind = 1; break;
+            case GS_PSM_CT16: layout = kLayout16; valueBits = 16; kind = 2; break;
+            case GS_PSM_CT16S: layout = kLayout16S; valueBits = 16; kind = 2; break;
+            case GS_PSM_T8: layout = kLayout8; valueBits = 8; kind = 3; break;
+            case GS_PSM_T4: layout = kLayout4; valueBits = 4; kind = 3; break;
+            case GS_PSM_T8H: layout = kLayout32; valueBits = 8; bitOffset = 24; kind = 3; break;
+            case GS_PSM_T4HL: layout = kLayout32; valueBits = 4; bitOffset = 24; kind = 3; break;
+            case GS_PSM_T4HH: layout = kLayout32; valueBits = 4; bitOffset = 28; kind = 3; break;
+            default: return false;
+            }
+            for (const Target &target : m_targets)
+            {
+                if (target.depth || !target.gpuDirty)
+                    continue;
+                const PageRange held = target.pages();
+                if (pages.first < held.first || pages.last > held.last)
+                    continue;
+                int inverse = 0;
+                uint8_t targetPageHeight = 32, targetBits = 32;
+                switch (target.psm)
+                {
+                case GS_PSM_CT32:
+                case GS_PSM_CT24: inverse = kInverse32; break;
+                case GS_PSM_CT16: inverse = kInverse16; targetPageHeight = 64; targetBits = 16; break;
+                case GS_PSM_CT16S: inverse = kInverse16S; targetPageHeight = 64; targetBits = 16; break;
+                default: return false;
+                }
+                key.source = target.id == drawTarget.id ? SourceReinterpretCopy : SourceReinterpret;
+                key.texture = target.id;
+                key.storeWidth = static_cast<uint16_t>(target.width);
+                key.storeHeight = static_cast<uint16_t>(target.height);
+                key.reTable = static_cast<uint16_t>(layout.table);
+                key.rePageWidth = static_cast<uint8_t>(layout.pageWidth);
+                key.rePageHeight = static_cast<uint8_t>(layout.pageHeight);
+                key.rePagesPerRow = static_cast<uint8_t>(
+                    std::max<uint32_t>(1u, (std::max<uint32_t>(1u, tex.tbw) * 64u + layout.pageWidth - 1u) / layout.pageWidth));
+                key.reStrideBits = static_cast<uint8_t>(layout.strideBits);
+                key.reValueBits = valueBits;
+                key.reBitOffset = bitOffset;
+                key.reKind = kind;
+                key.reInverse = static_cast<uint16_t>(inverse);
+                key.reTargetPageWidth = 64u;
+                key.reTargetPageHeight = targetPageHeight;
+                key.reTargetPagesPerRow = static_cast<uint8_t>(std::max<uint32_t>(1u, target.fbw));
+                key.reTargetBits = targetBits;
+                key.rePageOffset = static_cast<uint16_t>(tex.tbp0 / 32u - target.fbp);
+                if (kind == 3u)
+                    key.palette = paletteFor(state);
+                return true;
+            }
+            return false;
+        }
+
         // Fills the key's texture fields: a GPU target when the texture is one, else a texture
         // decoded from local memory (after copying back what the GPU drew over it).
-        bool GlesBackend::bindTexture(const GSDrawState &state, const Target &drawTarget, DrawKey &key)
+        bool GlesCore::bindTexture(const GSDrawState &state, const Target &drawTarget, DrawKey &key)
         {
             const GSTex0Reg &tex = state.context.tex0;
             const uint32_t width = state.textureWidth;
@@ -1696,14 +2104,6 @@ void main()
                 growRows(target, height);
                 return true;
             }
-            writeBackOverlapping(pages, traceEnabled() ? "texture tbp " + std::to_string(tex.tbp0) + " tbw " +
-                                                             std::to_string(tex.tbw) + " psm " + std::to_string(tex.psm) +
-                                                             " " + std::to_string(width) + "x" + std::to_string(height)
-                                                       : std::string());
-            for (const Target &target : m_targets)
-                if (target.depth && target.gpuDirty && target.pages().overlaps(pages))
-                    noteOnce("a texture reads a depth buffer the GPU drew (local memory has none of it)");
-
             const bool indexed = tex.psm == GS_PSM_T8 || tex.psm == GS_PSM_T4 || tex.psm == GS_PSM_T8H ||
                                  tex.psm == GS_PSM_T4HL || tex.psm == GS_PSM_T4HH;
             if (indexed && m_pendingClut.active)
@@ -1716,22 +2116,41 @@ void main()
                 reload.cld = 1u;
                 m_cpu.LoadClut(reload, pending.texclut);
             }
+            if (bindReinterpreted(state, pages, drawTarget, key))
+                return true;
+            writeBackOverlapping(pages, traceEnabled() ? "texture tbp " + std::to_string(tex.tbp0) + " tbw " +
+                                                             std::to_string(tex.tbw) + " psm " + std::to_string(tex.psm) +
+                                                             " " + std::to_string(width) + "x" + std::to_string(height)
+                                                       : std::string());
+            for (const Target &target : m_targets)
+                if (target.depth && target.gpuDirty && target.pages().overlaps(pages))
+                    noteOnce("a texture reads a depth buffer the GPU drew (local memory has none of it)");
+
             const bool usesTexa = tex.psm != GS_PSM_CT32 &&
                                   (!indexed || tex.cpsm == GS_PSM_CT16 || tex.cpsm == GS_PSM_CT16S || tex.cpsm == GS_PSM_CT24);
             const uint64_t clutVersion = indexed ? m_cpu.ClutVersion() : 0u;
-            CachedTexture *entry = nullptr;
-            for (CachedTexture &candidate : m_textures)
+            uint64_t textureKey = 0xcbf29ce484222325ull;
+            const auto mix = [&](uint64_t value) { textureKey = (textureKey ^ value) * 0x100000001b3ull; };
+            mix(tex.tbp0 | (static_cast<uint64_t>(tex.tbw) << 16) | (static_cast<uint64_t>(tex.psm) << 24) |
+                (static_cast<uint64_t>(width) << 32) | (static_cast<uint64_t>(height) << 48));
+            if (usesTexa)
+                mix(state.texa.ta0 | (static_cast<uint64_t>(state.texa.ta1) << 8) | (state.texa.aem ? 1ull << 16 : 0ull));
+            if (indexed)
             {
+                mix(tex.cpsm | (static_cast<uint64_t>(tex.csm) << 8) | (static_cast<uint64_t>(tex.csa) << 16));
+                mix(clutVersion);
+            }
+            CachedTexture *entry = nullptr;
+            if (const auto slot = m_textureSlots.find(textureKey); slot != m_textureSlots.end())
+            {
+                CachedTexture &candidate = m_textures[slot->second];
                 if (candidate.tbp0 == tex.tbp0 && candidate.tbw == tex.tbw && candidate.psm == tex.psm &&
                     candidate.width == width && candidate.height == height &&
                     (!usesTexa || (candidate.ta0 == state.texa.ta0 && candidate.ta1 == state.texa.ta1 &&
                                    candidate.aem == state.texa.aem)) &&
                     (!indexed || (candidate.cpsm == tex.cpsm && candidate.csm == tex.csm && candidate.csa == tex.csa &&
                                   candidate.clutVersion == clutVersion)))
-                {
                     entry = &candidate;
-                    break;
-                }
             }
             bool decode = entry == nullptr;
             if (entry && entry->checkedWrites != m_cpuWrites)
@@ -1751,7 +2170,12 @@ void main()
                 {
                     entry = &*std::min_element(m_textures.begin(), m_textures.end(),
                                                [](const CachedTexture &l, const CachedTexture &r) { return l.lastUse < r.lastUse; });
+                    const auto old = m_textureSlots.find(entry->key);
+                    if (old != m_textureSlots.end() && &m_textures[old->second] == entry)
+                        m_textureSlots.erase(old);
                 }
+                entry->key = textureKey;
+                m_textureSlots[textureKey] = static_cast<uint32_t>(entry - m_textures.data());
                 entry->tbp0 = tex.tbp0;
                 entry->tbw = tex.tbw;
                 entry->psm = tex.psm;
@@ -1789,7 +2213,7 @@ void main()
             return true;
         }
 
-        void GlesBackend::Submit(const GSPrimitiveBatch &batch)
+        void GlesCore::Submit(const GSPrimitiveBatch &batch)
         {
             if (batch.vertexCount == 0u)
                 return;
@@ -1806,8 +2230,6 @@ void main()
             const uint32_t afail = static_cast<uint32_t>((test >> 12) & 3u);
             if (ate && atst == 0u && afail == 0u)
                 return;
-            if (((test >> 14) & 1u) != 0u)
-                noteOnce("DATE (destination alpha test) not drawn");
 
             const int ofx = ctx.xyoffset.ofx >> 4;
             const int ofy = ctx.xyoffset.ofy >> 4;
@@ -2047,6 +2469,7 @@ void main()
             if (key.depth == 0u)
                 key.depthFunc = 0u;
 
+            bool blendExact = true;
             if (state.prim.abe)
             {
                 const BlendSetup blend = mapBlend(ctx.alpha);
@@ -2056,15 +2479,11 @@ void main()
                 key.blendDst = blend.dst;
                 key.blendFix = static_cast<uint8_t>((ctx.alpha >> 32) & 0xFFu);
                 key.keepBlendAlpha = (blend.enable && blend.usesSourceAlpha) ? 1u : 0u;
-                if (state.pabe)
-                    noteOnce("PABE (per-pixel blend enable) drawn as plain blending");
-                if (((ctx.alpha >> 32) & 0xFFu) > 0x80u && ((ctx.alpha >> 4) & 3u) == 2u)
-                    noteOnce("blend FIX above 0x80 clamped to 1.0");
+                blendExact = blend.exact && !state.pabe &&
+                             !(((ctx.alpha >> 32) & 0xFFu) > 0x80u && ((ctx.alpha >> 4) & 3u) == 2u);
             }
             const bool fba = (ctx.fba & 1u) != 0u && ctx.frame.psm != GS_PSM_CT24;
             key.forceAlpha = (fba && !key.keepBlendAlpha) ? 1u : 0u;
-            if (fba && key.keepBlendAlpha)
-                noteOnce("FBA with source alpha blending: alpha MSB not forced");
 
             // FBMSK, a channel at a time.
             uint8_t mask = 0xFu;
@@ -2072,13 +2491,14 @@ void main()
             const bool sixteen = key.frame16 != 0u;
             const uint32_t channelBits[4] = {sixteen ? 0xF8u : 0xFFu, sixteen ? 0xF800u : 0xFF00u,
                                              sixteen ? 0xF80000u : 0xFF0000u, sixteen ? 0x80000000u : 0xFF000000u};
+            bool partialMask = false;
             for (uint32_t i = 0; i < 4u; ++i)
             {
                 const uint32_t bits = fbmsk & channelBits[i];
                 if (bits == channelBits[i])
                     mask &= static_cast<uint8_t>(~(1u << i));
                 else if (bits != 0u)
-                    noteOnce("partial FBMSK drawn unmasked");
+                    partialMask = true;
             }
             if (ctx.frame.psm == GS_PSM_CT24)
                 mask &= 7u;
@@ -2086,10 +2506,28 @@ void main()
             if (mask != 0u)
                 drawTarget->gpuDirty = true;
 
+            // What GL blending and colour masks cannot do, the shader does reading the frame buffer.
+            const bool date = ((test >> 14) & 1u) != 0u && ctx.frame.psm != GS_PSM_CT24;
+            if (partialMask || date || !blendExact)
+            {
+                key.dstMode = 1u;
+                key.blend = 0u;
+                key.keepBlendAlpha = 0u;
+                key.forceAlpha = fba ? 1u : 0u;
+                key.shaderBlend = state.prim.abe ? 1u : 0u;
+                key.blendSel = static_cast<uint8_t>(ctx.alpha & 0xFFu);
+                key.blendFix = static_cast<uint8_t>((ctx.alpha >> 32) & 0xFFu);
+                key.pabe = state.pabe ? 1u : 0u;
+                key.date = date ? 1u : 0u;
+                key.datm = ((test >> 15) & 1u) != 0u ? 1u : 0u;
+                key.frameKind = ctx.frame.psm == GS_PSM_CT24 ? 1u : (sixteen ? 2u : 0u);
+                key.fbmsk = fbmsk;
+            }
+
             const uint32_t first = static_cast<uint32_t>(m_batch.vertices.size());
             m_batch.vertices.insert(m_batch.vertices.end(), out, out + count);
             ++m_stats.vertices;
-            if (m_openDraw >= 0 && static_cast<size_t>(m_openDraw) + 1u == m_batch.commands.size() &&
+            if (!key.dstMode && m_openDraw >= 0 && static_cast<size_t>(m_openDraw) + 1u == m_batch.commands.size() &&
                 std::memcmp(&m_batch.commands[static_cast<size_t>(m_openDraw)].key, &key, sizeof(key)) == 0)
             {
                 m_batch.commands[static_cast<size_t>(m_openDraw)].count += count;
@@ -2109,10 +2547,29 @@ void main()
             command.first = first;
             command.count = count;
             m_openDraw = static_cast<int>(m_batch.commands.size() - 1u);
+            if (key.dstMode)
+            {
+                // Each primitive reads the frame buffer as the ones before left it: no merging,
+                // and the copy covers only what it can touch.
+                m_openDraw = -1;
+                const int x0 = std::clamp(static_cast<int>(std::floor(minX)), static_cast<int>(key.scissorX0),
+                                          static_cast<int>(key.scissorX1));
+                const int y0 = std::clamp(static_cast<int>(std::floor(minY)), static_cast<int>(key.scissorY0),
+                                          static_cast<int>(key.scissorY1));
+                const int x1 = std::clamp(static_cast<int>(std::ceil(maxX)), static_cast<int>(key.scissorX0),
+                                          static_cast<int>(key.scissorX1));
+                const int y1 = std::clamp(static_cast<int>(std::ceil(maxY)), static_cast<int>(key.scissorY0),
+                                          static_cast<int>(key.scissorY1));
+                command.x = static_cast<uint32_t>(x0);
+                command.y = static_cast<uint32_t>(y0);
+                command.width = static_cast<uint32_t>(x1 - x0 + 1);
+                command.height = static_cast<uint32_t>(y1 - y0 + 1);
+                ++m_stats.dstDraws;
+            }
             ++m_stats.draws;
         }
 
-        void GlesBackend::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
+        void GlesCore::LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             if (frameLogging())
@@ -2131,7 +2588,7 @@ void main()
             m_cpu.LoadClut(tex0, texclut);
         }
 
-        void GlesBackend::BeginTransfer(const GSTransferCommand &command)
+        void GlesCore::BeginTransfer(const GSTransferCommand &command)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             if (frameLogging())
@@ -2186,7 +2643,7 @@ void main()
                 noteCpuWrite();
         }
 
-        void GlesBackend::UploadImage(const uint8_t *data, uint32_t sizeBytes)
+        void GlesCore::UploadImage(const uint8_t *data, uint32_t sizeBytes)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             m_cpu.UploadImage(data, sizeBytes);
@@ -2200,7 +2657,7 @@ void main()
         }
 
         // The transferred rectangle, from local memory to the GPU frame buffer.
-        void GlesBackend::finishDirectUpload()
+        void GlesCore::finishDirectUpload()
         {
             if (!m_directUpload.active)
                 return;
@@ -2229,20 +2686,20 @@ void main()
             ++m_stats.directUploads;
         }
 
-        void GlesBackend::Flush()
+        void GlesCore::Flush()
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             if (m_batch.vertices.size() >= kHandOverVertices || m_batch.blob.size() >= (1u << 20))
                 handOver(false);
         }
 
-        void GlesBackend::TextureFlush()
+        void GlesCore::TextureFlush()
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             m_cpu.TextureFlush();
         }
 
-        void GlesBackend::Sync(GSSyncReason reason)
+        void GlesCore::Sync(GSSyncReason reason)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             if (reason == GSSyncReason::DebugReadback || reason == GSSyncReason::LocalToHost)
@@ -2250,7 +2707,7 @@ void main()
             m_cpu.Sync(reason);
         }
 
-        PresentationFrame GlesBackend::Present(const GSPresentationRequest &request)
+        PresentationFrame GlesCore::Present(const GSPresentationRequest &request)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             PresentParams params{};
@@ -2322,19 +2779,20 @@ void main()
             return {};
         }
 
-        void GlesBackend::trace()
+        void GlesCore::trace()
         {
             if (!traceEnabled() || m_stats.presents % 300u != 0u)
                 return;
             std::fprintf(stderr,
                          "[gles] %llu swaps: %llu draw calls, %llu primitives, %llu texture uploads (%.1f Mtexels), "
-                         "%llu copies back (%.1f ms), %llu direct uploads, %llu reloads, %llu targets made, %zu live, "
-                         "%zu textures\n",
+                         "%llu copies back (%.1f ms), %llu direct uploads, %llu destination draws, %llu reloads, "
+                         "%llu targets made, %zu live, %zu textures\n",
                          static_cast<unsigned long long>(m_stats.presents), static_cast<unsigned long long>(m_stats.draws),
                          static_cast<unsigned long long>(m_stats.vertices), static_cast<unsigned long long>(m_stats.uploads),
                          static_cast<double>(m_stats.uploadTexels) / 1.0e6, static_cast<unsigned long long>(m_stats.writeBacks),
                          static_cast<double>(m_stats.writeBackNs) / 1.0e6,
                          static_cast<unsigned long long>(m_stats.directUploads),
+                         static_cast<unsigned long long>(m_stats.dstDraws),
                          static_cast<unsigned long long>(m_stats.reloads),
                          static_cast<unsigned long long>(m_stats.targetsCreated), m_targets.size(), m_textures.size());
             const uint64_t presents = m_stats.presents;
@@ -2342,7 +2800,7 @@ void main()
             m_stats.presents = presents;
         }
 
-        bool GlesBackend::ClearFramebuffer(const GSContext &context, uint32_t rgba)
+        bool GlesCore::ClearFramebuffer(const GSContext &context, uint32_t rgba)
         {
             if (context.frame.fbw == 0u)
                 return false;
@@ -2368,21 +2826,21 @@ void main()
             return true;
         }
 
-        uint32_t GlesBackend::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
+        uint32_t GlesCore::ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             return m_cpu.ConsumeLocalToHostBytes(dst, maxBytes);
         }
 
-        uint32_t GlesBackend::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
+        uint32_t GlesCore::ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
-            auto *self = const_cast<GlesBackend *>(this);
+            auto *self = const_cast<GlesCore *>(this);
             self->writeBackOverlapping(bufferPages(base, bw, static_cast<uint8_t>(psm), x + 1u, y + 1u), "ReadVram");
             return m_cpu.ReadVram(psm, base, bw, x, y);
         }
 
-        void GlesBackend::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
+        void GlesCore::WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value)
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             writeBackOverlapping(bufferPages(base, bw, static_cast<uint8_t>(psm), x + 1u, y + 1u), "WriteVram");
@@ -2390,18 +2848,279 @@ void main()
             noteCpuWrite();
         }
 
-        void GlesBackend::SnapshotVram(std::vector<uint8_t> &out) const
+        void GlesCore::SnapshotVram(std::vector<uint8_t> &out) const
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
-            const_cast<GlesBackend *>(this)->writeBackAll();
+            const_cast<GlesCore *>(this)->writeBackAll();
             m_cpu.SnapshotVram(out);
         }
 
-        GSTransferSnapshot GlesBackend::GetTransferSnapshot() const
+        GSTransferSnapshot GlesCore::GetTransferSnapshot() const
         {
             std::lock_guard<std::recursive_mutex> lock(m_mutex);
             return m_cpu.GetTransferSnapshot();
         }
+
+        // Queues every call for a worker thread that runs GlesCore, so the threads that feed the
+        // GS (the EE and VIF1 threads) only copy the primitive: converting it, decoding textures
+        // and loading palettes would otherwise run on them. Calls that answer from local memory
+        // wait for the queue first, so the order the guest sees does not change.
+        class GlesBackend final : public GSRasterBackend
+        {
+        public:
+            GlesBackend()
+            {
+                m_worker = std::thread([this]() { workerLoop(); });
+            }
+
+            ~GlesBackend() override
+            {
+                {
+                    std::lock_guard<std::mutex> lock(m_mutex);
+                    m_stop = true;
+                }
+                m_workCv.notify_all();
+                m_room.notify_all();
+                if (m_worker.joinable())
+                    m_worker.join();
+            }
+
+            void Initialize(uint8_t *vram, uint32_t vramSize) override
+            {
+                drain();
+                m_core.Initialize(vram, vramSize);
+            }
+            void Reset() override { enqueue(Kind::Reset, [](Queue &) {}); }
+            void Submit(const GSPrimitiveBatch &batch) override
+            {
+                if (batch.vertexCount == 0u)
+                    return;
+                enqueue(Kind::Submit, [&](Queue &q) { q.draws.push_back(batch); });
+            }
+            void LoadClut(const GSTex0Reg &tex0, const GSTexClutReg &texclut) override
+            {
+                enqueue(Kind::LoadClut, [&](Queue &q) { q.cluts.push_back({tex0, texclut}); });
+            }
+            void BeginTransfer(const GSTransferCommand &command) override
+            {
+                enqueue(Kind::BeginTransfer, [&](Queue &q) { q.transfers.push_back(command); });
+            }
+            void UploadImage(const uint8_t *data, uint32_t sizeBytes) override
+            {
+                if (!data || sizeBytes == 0u)
+                    return;
+                enqueue(Kind::UploadImage, [&](Queue &q) { q.payloads.emplace_back(data, data + sizeBytes); });
+            }
+            void Flush() override
+            {
+                // End of a GIF packet: whatever is queued can start.
+                std::lock_guard<std::mutex> lock(m_mutex);
+                if (!m_pending.items.empty() && m_workerWaiting)
+                    m_workCv.notify_one();
+            }
+            void TextureFlush() override { enqueue(Kind::TextureFlush, [](Queue &) {}); }
+            void Sync(GSSyncReason reason) override
+            {
+                if (reason == GSSyncReason::DebugReadback || reason == GSSyncReason::LocalToHost ||
+                    reason == GSSyncReason::Reset)
+                {
+                    drain();
+                    m_core.Sync(reason);
+                }
+            }
+            PresentationFrame Present(const GSPresentationRequest &request) override
+            {
+                enqueue(Kind::Present, [&](Queue &q) { q.presents.push_back(request); }, true);
+                return {};
+            }
+            bool ClearFramebuffer(const GSContext &context, uint32_t rgba) override
+            {
+                if (context.frame.fbw == 0u)
+                    return false;
+                enqueue(Kind::Clear, [&](Queue &q) { q.clears.push_back({context, rgba}); });
+                return true;
+            }
+            uint32_t ConsumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes) override
+            {
+                drain();
+                return m_core.ConsumeLocalToHostBytes(dst, maxBytes);
+            }
+            uint32_t ReadVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y) const override
+            {
+                drain();
+                return m_core.ReadVram(psm, base, bw, x, y);
+            }
+            void WriteVram(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y, uint32_t value) override
+            {
+                enqueue(Kind::WriteVram, [&](Queue &q) { q.writes.push_back({psm, base, bw, x, y, value}); });
+            }
+            void SnapshotVram(std::vector<uint8_t> &out) const override
+            {
+                drain();
+                m_core.SnapshotVram(out);
+            }
+            GSTransferSnapshot GetTransferSnapshot() const override
+            {
+                drain();
+                return m_core.GetTransferSnapshot();
+            }
+
+        private:
+            enum class Kind : uint8_t
+            {
+                Submit,
+                LoadClut,
+                BeginTransfer,
+                UploadImage,
+                TextureFlush,
+                Present,
+                Clear,
+                WriteVram,
+                Reset,
+            };
+            struct Clut
+            {
+                GSTex0Reg tex0;
+                GSTexClutReg texclut;
+            };
+            struct Clear
+            {
+                GSContext context;
+                uint32_t rgba;
+            };
+            struct Write
+            {
+                uint32_t psm, base, bw, x, y, value;
+            };
+            // Calls in order; each kind's arguments in its own list, taken in turn.
+            struct Queue
+            {
+                std::vector<Kind> items;
+                std::vector<GSPrimitiveBatch> draws;
+                std::vector<Clut> cluts;
+                std::vector<GSTransferCommand> transfers;
+                std::vector<std::vector<uint8_t>> payloads;
+                std::vector<GSPresentationRequest> presents;
+                std::vector<Clear> clears;
+                std::vector<Write> writes;
+                void clear()
+                {
+                    items.clear();
+                    draws.clear();
+                    cluts.clear();
+                    transfers.clear();
+                    payloads.clear();
+                    presents.clear();
+                    clears.clear();
+                    writes.clear();
+                }
+            };
+            // A woken worker takes everything queued; a waiting one is woken every this many calls
+            // (and at the end of each GIF packet, and by anything that waits for it).
+            static constexpr size_t kCallsPerWake = 256u;
+            static constexpr size_t kMaxQueued = 65536u;
+
+            template <typename Fill>
+            void enqueue(Kind kind, Fill &&fill, bool wake = false)
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                if (m_pending.items.size() >= kMaxQueued)
+                {
+                    m_workCv.notify_one();
+                    m_room.wait(lock, [&]() { return m_stop || m_pending.items.size() < kMaxQueued; });
+                }
+                m_pending.items.push_back(kind);
+                fill(m_pending);
+                if (m_workerWaiting && (wake || m_pending.items.size() % kCallsPerWake == 0u))
+                    m_workCv.notify_one();
+            }
+
+            // Returns once the worker has run everything queued before the call.
+            void drain() const
+            {
+                std::unique_lock<std::mutex> lock(m_mutex);
+                m_workCv.notify_one();
+                m_idle.wait(lock, [&]() { return m_stop || (m_pending.items.empty() && !m_busy); });
+            }
+
+            void workerLoop()
+            {
+                ThreadNaming::SetCurrentThreadName("GS-GL");
+                Queue work;
+                for (;;)
+                {
+                    {
+                        std::unique_lock<std::mutex> lock(m_mutex);
+                        m_busy = false;
+                        m_idle.notify_all();
+                        m_workerWaiting = true;
+                        m_workCv.wait(lock, [&]() { return m_stop || !m_pending.items.empty(); });
+                        m_workerWaiting = false;
+                        if (m_pending.items.empty())
+                            return;
+                        std::swap(work, m_pending);
+                        m_busy = true;
+                    }
+                    m_room.notify_all();
+                    size_t draw = 0, clut = 0, transfer = 0, payload = 0, present = 0, clear = 0, write = 0;
+                    for (const Kind kind : work.items)
+                    {
+                        switch (kind)
+                        {
+                        case Kind::Submit:
+                            m_core.Submit(work.draws[draw++]);
+                            break;
+                        case Kind::LoadClut:
+                            m_core.LoadClut(work.cluts[clut].tex0, work.cluts[clut].texclut);
+                            ++clut;
+                            break;
+                        case Kind::BeginTransfer:
+                            m_core.BeginTransfer(work.transfers[transfer++]);
+                            break;
+                        case Kind::UploadImage:
+                        {
+                            const std::vector<uint8_t> &data = work.payloads[payload++];
+                            m_core.UploadImage(data.data(), static_cast<uint32_t>(data.size()));
+                            break;
+                        }
+                        case Kind::TextureFlush:
+                            m_core.TextureFlush();
+                            break;
+                        case Kind::Present:
+                            m_core.Present(work.presents[present++]);
+                            break;
+                        case Kind::Clear:
+                            m_core.ClearFramebuffer(work.clears[clear].context, work.clears[clear].rgba);
+                            ++clear;
+                            break;
+                        case Kind::WriteVram:
+                        {
+                            const Write &w = work.writes[write++];
+                            m_core.WriteVram(w.psm, w.base, w.bw, w.x, w.y, w.value);
+                            break;
+                        }
+                        case Kind::Reset:
+                            m_core.Reset();
+                            break;
+                        }
+                    }
+                    // A packet's worth of draws ends here: start the GPU on it.
+                    m_core.Flush();
+                    work.clear();
+                }
+            }
+
+            mutable GlesCore m_core;
+            mutable std::mutex m_mutex;
+            mutable std::condition_variable m_workCv;
+            mutable std::condition_variable m_idle;
+            std::condition_variable m_room;
+            Queue m_pending;
+            bool m_busy = false;
+            bool m_workerWaiting = false;
+            bool m_stop = false;
+            std::thread m_worker;
+        };
     }
 
     bool requested()

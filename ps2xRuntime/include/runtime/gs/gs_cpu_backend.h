@@ -65,6 +65,8 @@ public:
                       const uint32_t *values);
     // Applies uploads, transfers and palette loads as they are submitted, whatever PS2X_GS_ASYNC says.
     void SetSynchronous();
+    // The 256 colours the palette gives the indices of the state's texture format (TEXA applied).
+    void PaletteRgba(const GSDrawState &state, uint32_t *out);
 
     // Replay support (ps2_gs_replay): restores the palette a PS2X_GS_RECORD
     // recording started with.
