@@ -322,7 +322,8 @@ namespace ps2x::settings
             {
                 Definition aspect{"video", "aspect", "Proporção",
                                   "4:3 é a TV para a qual o jogo foi feito. 16:9 e 21:9 abrem a cena dos lados nos jogos "
-                                  "que suportam; menus e vídeos continuam em 4:3, com faixas.",
+                                  "que suportam; menus e vídeos continuam em 4:3, com faixas. Experimental: no Devil "
+                                  "Kings a batalha ainda mostra falhas no chão e no céu.",
                                   Kind::Choice, "4:3", "PS2X_WIDESCREEN", {"4:3", "16:9", "21:9", "stretch"},
                                   {"4:3", "16:9", "21:9", "Esticar na janela"}, 0, 0, nullptr, false};
                 aspect.choiceEnvironment = {"", "16:9", "21:9", ""};
