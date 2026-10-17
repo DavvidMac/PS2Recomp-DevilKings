@@ -18,12 +18,17 @@ void dmaTrace(const char *format, ...);
 namespace
 {
     // PS2X_VU1_THREADS=<n>: worker threads for translated VU1 runs (0: none). Unset: 3 with 8
-    // or more logical CPUs, 2 with 6 or 7 (the GS bands take most of the rest), else none.
+    // or more logical CPUs, 2 with 6 or 7 (the GS bands take most of the rest), else none; none
+    // on ARM, where the workers were no faster on a phone and 2 of them hung a run (the queue
+    // was only proven on x86's stronger memory ordering).
     // Read when the runtime asks for the queue (once, at start-up).
     uint32_t vu1ThreadCount()
     {
         if (const char *value = std::getenv("PS2X_VU1_THREADS"))
             return static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16));
+#if defined(__aarch64__) || defined(__arm__)
+        return 0u;
+#endif
         const unsigned int cpus = std::thread::hardware_concurrency();
         return cpus >= 8u ? 3u : cpus >= 6u ? 2u : 0u;
     }
