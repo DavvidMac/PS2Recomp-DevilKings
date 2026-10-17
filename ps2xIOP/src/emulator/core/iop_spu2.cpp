@@ -460,6 +460,7 @@ namespace ps2x::iop::detail
         {
             m_outputRead = (m_outputRead + 1u) % capacity;
             --m_outputCount;
+            ++m_outputTrace.dropped;
         }
         const size_t write = (m_outputRead + m_outputCount) % capacity;
         m_output[write * 2u] = static_cast<int16_t>(inputLeft);
@@ -506,16 +507,42 @@ namespace ps2x::iop::detail
 
     size_t Spu2::readOutput(int16_t *destination, size_t frames)
     {
-        std::lock_guard<std::mutex> lock(m_outputMutex);
-        const size_t capacity = m_output.size() / 2u;
-        const size_t count = std::min(frames, m_outputCount);
-        for (size_t i = 0; i < count; ++i)
+        static const bool s_trace = std::getenv("PS2X_AUDIO_TRACE") != nullptr || std::getenv("PS2X_FPS_TRACE") != nullptr;
+        OutputTrace report;
+        size_t count = 0u;
         {
-            destination[i * 2u] = m_output[m_outputRead * 2u];
-            destination[i * 2u + 1u] = m_output[m_outputRead * 2u + 1u];
-            m_outputRead = (m_outputRead + 1u) % capacity;
+            std::lock_guard<std::mutex> lock(m_outputMutex);
+            const size_t capacity = m_output.size() / 2u;
+            count = std::min(frames, m_outputCount);
+            if (s_trace)
+            {
+                OutputTrace &trace = m_outputTrace;
+                trace.requested += frames;
+                trace.silent += frames - count;
+                trace.minLevel = std::min(trace.minLevel, m_outputCount);
+                trace.maxLevel = std::max(trace.maxLevel, m_outputCount);
+                if (trace.requested >= 48000u * 5u)
+                {
+                    report = trace;
+                    trace = {};
+                }
+            }
+            for (size_t i = 0; i < count; ++i)
+            {
+                destination[i * 2u] = m_output[m_outputRead * 2u];
+                destination[i * 2u + 1u] = m_output[m_outputRead * 2u + 1u];
+                m_outputRead = (m_outputRead + 1u) % capacity;
+            }
+            m_outputCount -= count;
         }
-        m_outputCount -= count;
+        if (report.requested != 0u)
+        {
+            const double requested = static_cast<double>(report.requested);
+            std::fprintf(stderr, "[audio] last %.1f s: %.2f%% silence (mixing behind), %.2f%% dropped (mixing ahead), buffer %.0f-%.0f ms\n",
+                         requested / 48000.0, 100.0 * static_cast<double>(report.silent) / requested,
+                         100.0 * static_cast<double>(report.dropped) / requested,
+                         static_cast<double>(report.minLevel) / 48.0, static_cast<double>(report.maxLevel) / 48.0);
+        }
         return count;
     }
 }

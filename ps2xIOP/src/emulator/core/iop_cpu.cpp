@@ -36,7 +36,7 @@ namespace ps2x::iop::detail
 
     bool IopCpuCore::executeInstruction(IopCpuState &cpu)
     {
-        return executeInstructionInline(cpu);
+        return executeInstructionInline(cpu, m_memory.read32(cpu.pc));
     }
 
 }

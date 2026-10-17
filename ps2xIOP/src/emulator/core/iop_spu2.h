@@ -103,5 +103,16 @@ namespace ps2x::iop::detail
         std::vector<int16_t> m_output;
         size_t m_outputRead = 0;
         size_t m_outputCount = 0;
+        // PS2X_AUDIO_TRACE (or PS2X_FPS_TRACE): frames asked for, played as silence (not mixed
+        // yet) and dropped (mixed too far ahead), and the buffer level seen by the host.
+        struct OutputTrace
+        {
+            uint64_t requested = 0;
+            uint64_t silent = 0;
+            uint64_t dropped = 0;
+            size_t minLevel = SIZE_MAX;
+            size_t maxLevel = 0;
+        };
+        OutputTrace m_outputTrace;
     };
 }

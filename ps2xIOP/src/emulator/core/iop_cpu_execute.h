@@ -34,10 +34,9 @@ namespace ps2x::iop::detail
         scheduledValue = value;
     }
 
-    PS2X_IOP_INLINE bool IopCpuCore::executeInstructionInline(IopCpuState &cpu)
+    PS2X_IOP_INLINE bool IopCpuCore::executeInstructionInline(IopCpuState &cpu, uint32_t instruction)
     {
         const uint32_t pc = cpu.pc;
-        const uint32_t instruction = m_memory.read32(pc);
         const bool wasDelaySlot = cpu.branchPending;
         const uint32_t priorBranchTarget = cpu.branchTarget;
 

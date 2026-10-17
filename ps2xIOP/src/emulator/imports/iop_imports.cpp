@@ -43,6 +43,7 @@ namespace ps2x::iop::detail
     void IopImportRegistry::reset()
     {
         m_libraries.clear();
+        ++m_generation;
     }
 
     std::optional<IopImportCall> IopImportRegistry::decode(uint32_t pc) const
@@ -124,11 +125,13 @@ namespace ps2x::iop::detail
                 return false;
         }
         m_libraries[physical] = std::move(library);
+        ++m_generation;
         return true;
     }
 
     bool IopImportRegistry::releaseExportTable(uint32_t address)
     {
+        ++m_generation;
         return m_libraries.erase(IopMemory::physicalAddress(address)) != 0u;
     }
 
@@ -184,6 +187,7 @@ namespace ps2x::iop::detail
 
     void IopImportRegistry::eraseRange(uint32_t base, uint32_t size)
     {
+        ++m_generation;
         for (auto library = m_libraries.begin(); library != m_libraries.end();)
         {
             if (library->first >= base && library->first < base + size)

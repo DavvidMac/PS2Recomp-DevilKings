@@ -69,6 +69,53 @@ namespace ps2x::iop::detail
             return true;
         }
 
+        // The libraries the emulator implements itself (HLE); Other ones are guest modules.
+        enum class ImportLibrary : uint8_t
+        {
+            Sysmem,
+            Cdvdman,
+            Loadcore,
+            Threadman,
+            Thsemap,
+            Thevent,
+            Thmsgbx,
+            Sifcmd,
+            Intrman,
+            Secrman,
+            Modload,
+            Ioman,
+            Sifman,
+            Vblank,
+            Timrman,
+            Dmacman,
+            Stdio,
+            Sysclib,
+            Heaplib,
+            Other,
+        };
+
+        ImportLibrary classifyImportLibrary(std::string_view name)
+        {
+            static constexpr std::pair<std::string_view, ImportLibrary> kLibraries[] = {
+                {"sysmem", ImportLibrary::Sysmem},     {"cdvdman", ImportLibrary::Cdvdman},
+                {"loadcore", ImportLibrary::Loadcore}, {"thbase", ImportLibrary::Threadman},
+                {"threadman", ImportLibrary::Threadman}, {"thsemap", ImportLibrary::Thsemap},
+                {"thevent", ImportLibrary::Thevent},   {"thmsgbx", ImportLibrary::Thmsgbx},
+                {"sifcmd", ImportLibrary::Sifcmd},     {"intrman", ImportLibrary::Intrman},
+                {"secrman", ImportLibrary::Secrman},   {"modload", ImportLibrary::Modload},
+                {"ioman", ImportLibrary::Ioman},       {"sifman", ImportLibrary::Sifman},
+                {"vblank", ImportLibrary::Vblank},     {"timrman", ImportLibrary::Timrman},
+                {"dmacman", ImportLibrary::Dmacman},   {"stdio", ImportLibrary::Stdio},
+                {"sysclib", ImportLibrary::Sysclib},   {"heaplib", ImportLibrary::Heaplib},
+            };
+            for (const auto &[library, kind] : kLibraries)
+            {
+                if (iequals(name, library))
+                    return kind;
+            }
+            return ImportLibrary::Other;
+        }
+
     }
 
     class IopEmulator::Impl final : public IopGuestExecutor
@@ -135,9 +182,11 @@ namespace ps2x::iop::detail
             pendingDmaInterrupts.clear();
             nextDmaInterruptCycle = UINT64_MAX;
             pendingGuestCallbacks.clear();
+            importCache.clear();
             nextModuleId = 1;
             moduleCursor = kModuleLoadBase;
             totalCycles = 0;
+            timelineCycles = 0u;
             memory.setCycleCounter(&totalCycles);
             totalInstructions = 0;
             eeCycleCarry = 0;
@@ -259,69 +308,111 @@ namespace ps2x::iop::detail
             Missing,
         };
 
-        ImportDisposition dispatchImport(const IopImportCall &call, CpuState &cpu)
+        // Import stubs already decoded, by stub address: decoding scans the module's import
+        // table and finding the library compares names, which a sound driver calling LIBSD
+        // thousands of times a second would otherwise redo on every call. Emptied when the
+        // export tables change and when modules are loaded or stopped.
+        struct CachedImport
         {
+            uint32_t delayWord = 0u; // the stub's second word (it holds the ordinal)
+            bool isImport = false;   // false: a plain return that looks like a stub
+            IopImportCall call;
+            ImportLibrary library = ImportLibrary::Other;
+            uint32_t guestTarget = 0u; // the export it resolves to, 0 if none
+        };
+        std::unordered_map<uint32_t, CachedImport> importCache;
+        uint64_t importCacheGeneration = 0u;
+        uint64_t importCalls = 0u;
+
+        // The import stub at pc (whose first word is jr ra), or null for a plain return.
+        const CachedImport *findImport(uint32_t pc)
+        {
+            const uint32_t delay = memory.read32(pc + 4u);
+            if ((delay & 0xFFFF0000u) != 0x24000000u)
+                return nullptr; // what decode() checks first: not a stub
+            if (importCacheGeneration != imports.generation())
+            {
+                importCache.clear();
+                importCacheGeneration = imports.generation();
+            }
+            CachedImport &entry = importCache[pc];
+            if (entry.delayWord != delay) // new, or another stub now (the delay word is never 0)
+            {
+                entry = {};
+                entry.delayWord = delay;
+                if (std::optional<IopImportCall> call = imports.decode(pc))
+                {
+                    entry.isImport = true;
+                    entry.library = classifyImportLibrary(call->library);
+                    entry.guestTarget = imports.resolve(call->library, call->ordinal, call->version);
+                    entry.call = std::move(*call);
+                }
+            }
+            return entry.isImport ? &entry : nullptr;
+        }
+
+        ImportDisposition dispatchImport(const CachedImport &import, CpuState &cpu)
+        {
+            const IopImportCall &call = import.call;
             const uint32_t a0 = cpu.gpr[4];
             auto setV0 = [&](uint32_t value)
             {
                 cpu.gpr[2] = value;
             };
 
-            if (iequals(call.library, "sysmem") && sysmem.dispatchImport(call.ordinal, cpu))
-                return ImportDisposition::Handled;
-
-            if (iequals(call.library, "cdvdman") && cdvd.dispatchImport(call.ordinal, cpu))
+            // Libraries the emulator implements; an ordinal one of them leaves to the guest
+            // falls through to the export table like any other library.
+            switch (import.library)
             {
-                if (const auto callback = cdvd.takeCompletionCallback())
+            case ImportLibrary::Sysmem:
+                if (sysmem.dispatchImport(call.ordinal, cpu))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Cdvdman:
+                if (cdvd.dispatchImport(call.ordinal, cpu))
                 {
-                    pendingGuestCallbacks.emplace(
-                        totalCycles + kCdvdCompletionCycles,
-                        ScheduledGuestCallback{
-                            callback->address,
-                            callback->gp,
-                            callback->reason,
-                        });
+                    if (const auto callback = cdvd.takeCompletionCallback())
+                    {
+                        pendingGuestCallbacks.emplace(
+                            totalCycles + kCdvdCompletionCycles,
+                            ScheduledGuestCallback{
+                                callback->address,
+                                callback->gp,
+                                callback->reason,
+                            });
+                    }
+                    return ImportDisposition::Handled;
                 }
-                return ImportDisposition::Handled;
-            }
-
-            if (iequals(call.library, "loadcore") && loadcore.dispatchImport(call.ordinal, cpu))
-                return ImportDisposition::Handled;
-
-            if (iequals(call.library, "thbase") || iequals(call.library, "threadman"))
-            {
+                break;
+            case ImportLibrary::Loadcore:
+                if (loadcore.dispatchImport(call.ordinal, cpu))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Threadman:
                 return kernel.dispatchThreadImport(call.ordinal, cpu, totalCycles)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "thsemap"))
-            {
+            case ImportLibrary::Thsemap:
                 return kernel.dispatchSemaphoreImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "thevent"))
-            {
+            case ImportLibrary::Thevent:
                 return kernel.dispatchEventImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "thmsgbx"))
-            {
+            case ImportLibrary::Thmsgbx:
                 return kernel.dispatchMailboxImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "sifcmd"))
-            {
+            case ImportLibrary::Sifcmd:
                 return rpc.dispatchSifCmdImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "intrman") && intrman.dispatchImport(call.ordinal, cpu, *this))
-                return ImportDisposition::Handled;
-            if (iequals(call.library, "secrman"))
-            {
+            case ImportLibrary::Intrman:
+                if (intrman.dispatchImport(call.ordinal, cpu, *this))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Secrman:
                 switch (call.ordinal)
                 {
                 case 4: // SecrSetMcCommandHandler
@@ -335,42 +426,51 @@ namespace ps2x::iop::detail
                 default:
                     break;
                 }
-            }
-            if (iequals(call.library, "modload") && call.ordinal == 13u)
-            {
-                checkKelfPathCallback = {a0, cpu.gpr[28]};
-                setV0(0);
-                return ImportDisposition::Handled;
-            }
-            if (iequals(call.library, "ioman") && ioman.dispatchImport(call.ordinal, cpu, *this))
-                return ImportDisposition::Handled;
-            if (iequals(call.library, "sifman"))
-            {
+                break;
+            case ImportLibrary::Modload:
+                if (call.ordinal == 13u)
+                {
+                    checkKelfPathCallback = {a0, cpu.gpr[28]};
+                    setV0(0);
+                    return ImportDisposition::Handled;
+                }
+                break;
+            case ImportLibrary::Ioman:
+                if (ioman.dispatchImport(call.ordinal, cpu, *this))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Sifman:
                 return rpc.dispatchSifManImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
-            }
-            if (iequals(call.library, "vblank") && vblank.dispatchImport(call.ordinal, cpu, totalCycles))
-                return ImportDisposition::Handled;
-            if (iequals(call.library, "timrman") && timrman.dispatchImport(call.ordinal, cpu, totalCycles))
-                return ImportDisposition::Handled;
-            if (iequals(call.library, "dmacman"))
-            {
+            case ImportLibrary::Vblank:
+                if (vblank.dispatchImport(call.ordinal, cpu, totalCycles))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Timrman:
+                if (timrman.dispatchImport(call.ordinal, cpu, totalCycles))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Dmacman:
                 setV0(0);
                 return ImportDisposition::Handled;
-            }
-            if (iequals(call.library, "stdio") && stdio.dispatchImport(call.ordinal, cpu))
-                return ImportDisposition::Handled;
-            if (iequals(call.library, "sysclib"))
-            {
+            case ImportLibrary::Stdio:
+                if (stdio.dispatchImport(call.ordinal, cpu))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Sysclib:
                 return sysclib.dispatchImport(call.ordinal, cpu)
                            ? ImportDisposition::Handled
                            : ImportDisposition::Missing;
+            case ImportLibrary::Heaplib:
+                if (heaplib.dispatchImport(call.ordinal, cpu))
+                    return ImportDisposition::Handled;
+                break;
+            case ImportLibrary::Other:
+                break;
             }
-            if (iequals(call.library, "heaplib") && heaplib.dispatchImport(call.ordinal, cpu))
-                return ImportDisposition::Handled;
 
-            const uint32_t target = imports.resolve(call.library, call.ordinal, call.version);
+            const uint32_t target = import.guestTarget;
             if (target != 0u)
             {
                 cpu.pc = target;
@@ -500,9 +600,10 @@ namespace ps2x::iop::detail
                 }
             }
 
-            // Import stubs start with jr ra (decode checks it too); skip the call otherwise.
-            if (const auto import = word == 0x03E00008u ? imports.decode(cpu.pc) : std::optional<IopImportCall>{})
+            // Import stubs start with jr ra (decode checks it too); skip the lookup otherwise.
+            if (const CachedImport *import = word == 0x03E00008u ? findImport(cpu.pc) : nullptr)
             {
+                ++importCalls;
                 const ImportDisposition disposition = dispatchImport(*import, cpu);
                 ++totalInstructions;
                 ++totalCycles;
@@ -513,7 +614,7 @@ namespace ps2x::iop::detail
                 return !cpu.stopped;
             }
 
-            const bool running = cpuCore.executeInstructionInline(cpu);
+            const bool running = cpuCore.executeInstructionInline(cpu, word);
             if (memory.hasDmaStart())
                 schedulePendingDma();
             ++totalInstructions;
@@ -767,11 +868,79 @@ namespace ps2x::iop::detail
             servicingGuestCallbacks = false;
         }
 
+        // Diagnostics: PS2X_IOP_TIME=1 prints, about every five seconds, the host time the IOP
+        // took per second and its instruction rate. Only the batches that run are timed (timing
+        // every EE report would cost more than the IOP does).
         void runCycles(uint64_t cycles) noexcept
         {
+            static const bool s_timed = std::getenv("PS2X_IOP_TIME") != nullptr;
+            if (!s_timed)
+            {
+                runCyclesUntimed(cycles);
+                return;
+            }
+            using Clock = std::chrono::steady_clock;
+            static Clock::duration s_inside{};
+            static Clock::time_point s_windowStart = Clock::now();
+            static uint64_t s_calls = 0u;
+            static uint64_t s_windowInstructions = totalInstructions;
+            static uint64_t s_windowImports = importCalls;
+            static uint64_t s_windowCycles = totalCycles;
+            const Clock::time_point start = Clock::now();
+            runCyclesUntimed(cycles);
+            const Clock::time_point end = Clock::now();
+            s_inside += end - start;
+            ++s_calls;
+            if (end - s_windowStart < std::chrono::seconds(5))
+                return;
+            const double window = std::chrono::duration<double>(end - s_windowStart).count();
+            const double inside = std::chrono::duration<double>(s_inside).count();
+            const double instructions = static_cast<double>(totalInstructions - s_windowInstructions);
+            std::fprintf(stderr, "[iop-time] %.1f ms per second, %.2f M instructions/s (%.1f ns each), %.0f batches/s, %.0f imports/s, clock %.3f MHz\n",
+                         inside * 1000.0 / window, instructions / window / 1.0e6,
+                         instructions > 0.0 ? inside * 1.0e9 / instructions : 0.0,
+                         static_cast<double>(s_calls) / window,
+                         static_cast<double>(importCalls - s_windowImports) / window,
+                         static_cast<double>(totalCycles - s_windowCycles) / window / 1.0e6);
+            s_inside = {};
+            s_calls = 0u;
+            s_windowStart = end;
+            s_windowInstructions = totalInstructions;
+            s_windowImports = importCalls;
+            s_windowCycles = totalCycles;
+        }
+
+        // The IOP cycle the EE's time has reached. The IOP's own cycles can run past it: the
+        // RPC handlers and module start-ups the EE calls run at once, outside EE time, and a
+        // batch ends after its last slice or routine. Counting each batch from where the IOP
+        // stood instead (as before) let its clock run about 2% fast in Devil Kings, and with it
+        // the SPU2 (its buffer stayed full, dropping samples, a quarter second late) and the
+        // sound drivers' timers; on a phone, movie sound broke up (the IOP played the streamed
+        // audio faster than the EE fed it). Now the IOP waits for the EE to catch up; a lead over
+        // kMaxTimelineLead (module start-up at boot) is forgiven so its threads never stall
+        // for long. PS2X_IOP_TIMELINE=0 restores the relative batches.
+        static constexpr uint64_t kMaxTimelineLead = 36864000u / 10u; // 100 ms
+        uint64_t timelineCycles = 0u;
+
+        void runCyclesUntimed(uint64_t cycles) noexcept
+        {
+            static const bool s_timeline = []()
+            {
+                const char *value = std::getenv("PS2X_IOP_TIMELINE");
+                return !(value && value[0] == '0');
+            }();
+            uint64_t target = totalCycles + cycles;
+            if (s_timeline)
+            {
+                timelineCycles += cycles;
+                if (totalCycles > timelineCycles + kMaxTimelineLead)
+                    timelineCycles = totalCycles - kMaxTimelineLead;
+                if (totalCycles >= timelineCycles)
+                    return;
+                target = timelineCycles;
+            }
             try
             {
-                const uint64_t target = totalCycles + cycles;
                 while (totalCycles < target)
                 {
                     servicePendingDmaInterrupts();
@@ -833,6 +1002,7 @@ namespace ps2x::iop::detail
             module.size = loaded.size;
             module.entry = loaded.entry;
             module.gp = loaded.gp;
+            importCache.clear();
             installNativeRoutines(module);
 
             // IRX entry: start(int argc, char *argv[]). Like loadcore, argv[0] is
@@ -923,6 +1093,7 @@ namespace ps2x::iop::detail
             kernel.terminateThreadsInRange(it->second.base, it->second.size);
             rpc.removeServersInRange(it->second.base, it->second.size);
             imports.eraseRange(it->second.base, it->second.size);
+            importCache.clear();
             modules.erase(it);
             kernel.cleanupDeadThreads();
             if (result)
@@ -1011,7 +1182,15 @@ namespace ps2x::iop::detail
         // The EE scheduler reports progress every few dozen cycles (each guest
         // loop checkpoint). Running the IOP scheduler for a handful of cycles per
         // call costs far more than the emulated work, so batch small advances.
-        constexpr uint64_t kMinIopBatchCycles = 128u;
+        // Every call that talks to the IOP (RPC, SIF transfers, module loads)
+        // flushes the carry first, so a batch only delays the IOP's own progress.
+        // PS2X_IOP_BATCH=<IOP cycles> sets the batch (default 128).
+        static const uint64_t kMinIopBatchCycles = []() -> uint64_t
+        {
+            const char *value = std::getenv("PS2X_IOP_BATCH");
+            const long long cycles = value ? std::atoll(value) : 128;
+            return cycles > 0 ? static_cast<uint64_t>(cycles) : 1u;
+        }();
         const uint64_t total = m_impl->eeCycleCarry + eeCycles;
         if (total / 8u < kMinIopBatchCycles)
         {

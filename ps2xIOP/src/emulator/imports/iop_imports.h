@@ -32,6 +32,8 @@ namespace ps2x::iop::detail
         [[nodiscard]] uint32_t resolve(std::string_view library, uint16_t ordinal, std::optional<uint16_t> version = std::nullopt) const;
         [[nodiscard]] int32_t setRebootTimeLibraryHandlingMode(uint32_t address, uint32_t mode);
         void eraseRange(uint32_t base, uint32_t size);
+        // Changes whenever the export tables do (what decode() and resolve() return may differ).
+        [[nodiscard]] uint64_t generation() const noexcept { return m_generation; }
 
     private:
         struct ExportLibrary
@@ -46,5 +48,6 @@ namespace ps2x::iop::detail
 
         IopMemory &m_memory;
         std::map<uint32_t, ExportLibrary> m_libraries;
+        uint64_t m_generation = 0;
     };
 }
