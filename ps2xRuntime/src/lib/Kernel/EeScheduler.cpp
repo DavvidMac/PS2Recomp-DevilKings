@@ -4,6 +4,7 @@
 #include "ps2_runtime_macros.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
@@ -750,6 +751,31 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
     return KE_OK;
 }
 
+namespace
+{
+    // Back to the dispatcher, unwinding the guest frames. PS2X_EE_TRANSFER_STATS counts how often
+    // (every unwind walks each recompiled frame, which costs on Android).
+    [[noreturn]] void leaveGuestCode()
+    {
+        static const bool s_stats = std::getenv("PS2X_EE_TRANSFER_STATS") != nullptr;
+        if (s_stats)
+        {
+            static uint64_t s_count = 0u;
+            static auto s_start = std::chrono::steady_clock::now();
+            ++s_count;
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_start >= std::chrono::seconds(5))
+            {
+                std::fprintf(stderr, "[ee-transfer] %.0f per second\n",
+                             static_cast<double>(s_count) / std::chrono::duration<double>(now - s_start).count());
+                s_count = 0u;
+                s_start = now;
+            }
+        }
+        throw EeDispatcherTransfer{};
+    }
+}
+
 [[noreturn]] void EeScheduler::exitCurrent(bool deleteThreadRecord)
 {
     assertExecutor();
@@ -768,7 +794,7 @@ int EeScheduler::startThread(int id, uint32_t arg, const R5900Context &caller, b
         m_runtime.guestFree(ownedStack);
     }
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    leaveGuestCode();
 }
 
 int EeScheduler::terminateThread(int id, uint32_t &ownedStack, bool interruptSafe)
@@ -1061,7 +1087,7 @@ void EeScheduler::transferIfRequested(bool interruptSafe)
     m_rescheduleRequested = false;
     m_timeSliceExpired = false;
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    leaveGuestCode();
 }
 
 int EeScheduler::createSemaphore(int initCount, int maxCount, uint32_t attr, uint32_t option)
@@ -1364,7 +1390,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
     invocation.sequence = ++m_invocationSequence;
     owner->invocations.push_back(std::move(invocation));
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    leaveGuestCode();
 }
 
 [[noreturn]] void EeScheduler::invokeCurrentSequence(std::vector<GuestInvocation> invocations)
@@ -1383,7 +1409,7 @@ void EeScheduler::queueInvocation(GuestInvocation invocation)
         owner->invocations.push_back(std::move(*it));
     }
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    leaveGuestCode();
 }
 
 bool EeScheduler::hasInvocation(GuestInvocationKind kind, uint64_t tag) const
@@ -1934,7 +1960,7 @@ void EeScheduler::blockCurrent(EeWaitState wait)
     self->status = self->suspendCount == 0 ? EeThreadStatus::Waiting : EeThreadStatus::WaitingSuspended;
     m_currentThreadId = 0;
     publishSnapshot();
-    throw EeDispatcherTransfer{};
+    leaveGuestCode();
 }
 
 void EeScheduler::makeReady(GuestThread &item, int result, bool interruptSafe)

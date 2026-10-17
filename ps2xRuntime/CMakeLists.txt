@@ -689,7 +689,9 @@ if(PS2X_IS_VITA)
 endif()
 
 if(PS2X_IS_ANDROID)
-    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp)
+    target_sources(ps2EntryRunner PRIVATE src/lib/ps2_android_runtime.cpp src/lib/ps2_android_unwind.cpp)
+    # Its own unit: it defines dl_iterate_phdr, and staying out keeps the runner's batches as they are.
+    set_source_files_properties(src/lib/ps2_android_unwind.cpp PROPERTIES SKIP_UNITY_BUILD_INCLUSION TRUE)
     # main.cpp keeps the screen on through the activity of raylib's android_app.
     target_include_directories(ps2EntryRunner PRIVATE "${ANDROID_NDK}/sources/android/native_app_glue")
 endif()
