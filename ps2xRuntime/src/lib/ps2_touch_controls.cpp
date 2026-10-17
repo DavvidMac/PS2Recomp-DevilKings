@@ -528,7 +528,7 @@ namespace ps2x::touch
         {
             const float u = l.u;
             const float y = l.portrait ? std::max(0.3f * u, l.top * 0.45f - 0.4f * u) : l.h * 0.42f - 0.4f * u;
-            const float wide = 2.1f * u, narrow = 0.9f * u, height = 0.8f * u, gap = 0.2f * u;
+            const float wide = 2.6f * u, narrow = 0.9f * u, height = 0.8f * u, gap = 0.2f * u;
             const float total = 3.0f * wide + 2.0f * narrow + 4.0f * gap;
             float x = (l.w - total) * 0.5f;
             std::array<ToolButton, static_cast<size_t>(Tool::Count)> out{};
