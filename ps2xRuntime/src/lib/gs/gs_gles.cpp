@@ -244,6 +244,9 @@ namespace ps2x::gles
             uint32_t bgcolor;
             bool field;
             bool oddField;
+            // Fields of half height (a buffer per field) are woven with the previous one into a
+            // picture twice as tall, as the software renderer's presentation does (PS2X_DEINTERLACE).
+            bool weave;
             uint32_t outWidth;
             uint32_t outHeight;
         };
@@ -724,6 +727,36 @@ void main()
 }
 )";
 
+        // The software path's FieldWeaver on the GPU: the current field on the rows its parity owns,
+        // the previous field on the others where the picture is still, and the current one
+        // interpolated where it moved.
+        const char *kWeaveFragment = R"(
+uniform sampler2D uCurrent;
+uniform sampler2D uPrevious;
+uniform ivec4 uWeave;  // parity, previous field valid, field rows, 0
+in vec2 vPos;
+out vec4 oColor;
+
+void main()
+{
+    ivec2 p = ivec2(floor(vPos));
+    int y = p.y >> 1;
+    int parity = uWeave.x;
+    vec3 current = floor(texelFetch(uCurrent, ivec2(p.x, y), 0).rgb * 255.0 + 0.5);
+    if ((p.y & 1) == parity)
+    {
+        oColor = vec4(current / 255.0, 1.0);
+        return;
+    }
+    int neighbourY = parity == 0 ? min(y + 1, uWeave.z - 1) : max(y - 1, 0);
+    vec3 neighbour = floor(texelFetch(uCurrent, ivec2(p.x, neighbourY), 0).rgb * 255.0 + 0.5);
+    vec3 interpolated = floor((current + neighbour + 1.0) / 2.0);
+    vec3 previous = uWeave.y == 1 ? floor(texelFetch(uPrevious, ivec2(p.x, y), 0).rgb * 255.0 + 0.5) : current;
+    vec3 difference = abs(previous - interpolated);
+    oColor = vec4((difference.r + difference.g + difference.b > 48.0 ? interpolated : previous) / 255.0, 1.0);
+}
+)";
+
         GLuint compileShader(GLenum type, const char *body)
         {
             const GLuint shader = glCreateShader(type);
@@ -805,6 +838,17 @@ void main()
             std::unordered_map<uint64_t, GLuint> m_framebuffers;
             GLuint m_drawProgram = 0;
             GLuint m_presentProgram = 0;
+            GLuint m_weaveProgram = 0;
+            GLint m_weaveCurrent = -1, m_weavePrevious = -1, m_weaveParams = -1, m_weaveOutSize = -1;
+            // The last two fields composed (weaving), and their pixels for the field order test.
+            GLuint m_fieldTexture[2] = {0, 0};
+            GLuint m_fieldFramebuffer[2] = {0, 0};
+            uint32_t m_fieldWidth = 0;
+            uint32_t m_fieldHeight = 0;
+            int m_fieldCurrent = 0;
+            bool m_haveField = false;
+            uint32_t m_fieldParity = 0;
+            std::vector<uint8_t> m_fieldPixels[2];
             GLuint m_vao = 0;
             GLuint m_vbo = 0;
             GLuint m_emptyVao = 0;
@@ -863,6 +907,13 @@ void main()
             const auto pu = [&](const char *name) { return glGetUniformLocation(m_presentProgram, name); };
             m_pu = {pu("uOutSize"), pu("uCrt1"), pu("uCrt2"), pu("uOrigin"), pu("uSize"),
                     pu("uStore"), pu("uEnable"), pu("uBg"), pu("uField")};
+            m_weaveProgram = linkProgram(kPresentVertex, kWeaveFragment);
+            if (!m_weaveProgram)
+                return false;
+            m_weaveCurrent = glGetUniformLocation(m_weaveProgram, "uCurrent");
+            m_weavePrevious = glGetUniformLocation(m_weaveProgram, "uPrevious");
+            m_weaveParams = glGetUniformLocation(m_weaveProgram, "uWeave");
+            m_weaveOutSize = glGetUniformLocation(m_weaveProgram, "uOutSize");
 
             glGenVertexArrays(1, &m_vao);
             glGenBuffers(1, &m_vbo);
@@ -1108,11 +1159,12 @@ void main()
                     ++slotIndex;
             }
             DisplaySlot &slot = g_slots[static_cast<size_t>(slotIndex)];
-            if (!slot.texture || slot.width != params.outWidth || slot.height != params.outHeight)
+            const uint32_t pictureHeight = params.weave ? params.outHeight * 2u : params.outHeight;
+            if (!slot.texture || slot.width != params.outWidth || slot.height != pictureHeight)
             {
                 if (slot.texture)
                     glDeleteTextures(1, &slot.texture);
-                slot.texture = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, params.outWidth, params.outHeight, nullptr);
+                slot.texture = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, params.outWidth, pictureHeight, nullptr);
                 // The main thread sets the filter it shows the picture with.
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1121,10 +1173,30 @@ void main()
                 glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
                 slot.width = params.outWidth;
-                slot.height = params.outHeight;
+                slot.height = pictureHeight;
             }
-            glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
-            glViewport(0, 0, static_cast<GLsizei>(slot.width), static_cast<GLsizei>(slot.height));
+            // Weaving composes the field into a texture of its own first.
+            if (params.weave && (!m_fieldTexture[0] || m_fieldWidth != params.outWidth || m_fieldHeight != params.outHeight))
+            {
+                for (int i = 0; i < 2; ++i)
+                {
+                    if (m_fieldTexture[i])
+                        glDeleteTextures(1, &m_fieldTexture[i]);
+                    m_fieldTexture[i] = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, params.outWidth, params.outHeight, nullptr);
+                    if (!m_fieldFramebuffer[i])
+                        glGenFramebuffers(1, &m_fieldFramebuffer[i]);
+                    glBindFramebuffer(GL_FRAMEBUFFER, m_fieldFramebuffer[i]);
+                    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_fieldTexture[i], 0);
+                }
+                m_fieldWidth = params.outWidth;
+                m_fieldHeight = params.outHeight;
+                m_haveField = false;
+            }
+            if (!params.weave)
+                m_haveField = false;
+            const uint32_t composeHeight = params.outHeight;
+            glBindFramebuffer(GL_FRAMEBUFFER, params.weave ? m_fieldFramebuffer[m_fieldCurrent] : slot.framebuffer);
+            glViewport(0, 0, static_cast<GLsizei>(slot.width), static_cast<GLsizei>(composeHeight));
             glDisable(GL_SCISSOR_TEST);
             glDisable(GL_BLEND);
             glDisable(GL_DEPTH_TEST);
@@ -1142,7 +1214,7 @@ void main()
                     store[i * 2 + 1] = static_cast<int>(found->second.height);
                 }
             }
-            glUniform2f(m_pu.outSize, static_cast<float>(slot.width), static_cast<float>(slot.height));
+            glUniform2f(m_pu.outSize, static_cast<float>(slot.width), static_cast<float>(composeHeight));
             glUniform1i(m_pu.crt1, 0);
             glUniform1i(m_pu.crt2, 1);
             glUniform4i(m_pu.origin, params.originX[0], params.originY[0], params.originX[1], params.originY[1]);
@@ -1157,6 +1229,58 @@ void main()
             glUniform2i(m_pu.field, params.field ? 1 : 0, params.oddField ? 1 : 0);
             glBindVertexArray(m_emptyVao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
+            if (params.weave)
+            {
+                const int current = m_fieldCurrent;
+                const int previous = current ^ 1;
+                const uint32_t w = params.outWidth;
+                const uint32_t h = params.outHeight;
+                const size_t rowBytes = static_cast<size_t>(w) * 4u;
+                std::vector<uint8_t> &field = m_fieldPixels[current];
+                field.resize(rowBytes * h);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, m_fieldFramebuffer[current]);
+                glReadPixels(0, 0, static_cast<GLsizei>(w), static_cast<GLsizei>(h), GL_RGBA, GL_UNSIGNED_BYTE, field.data());
+                // Which rows the current field owns: the order that combs least against the
+                // previous field, switched only on a clear win (as FieldWeaver::weave).
+                uint32_t parity = params.oddField ? 1u : 0u;
+                const std::vector<uint8_t> &before = m_fieldPixels[previous];
+                if (m_haveField && h > 4u && before.size() == field.size())
+                {
+                    uint64_t combEven = 0u, combOdd = 0u;
+                    for (uint32_t y = 1u; y + 1u < h; y += 2u)
+                    {
+                        const uint8_t *c = field.data() + y * rowBytes;
+                        const uint8_t *a = before.data() + (y - 1u) * rowBytes;
+                        const uint8_t *b = before.data() + (y + 1u) * rowBytes;
+                        for (uint32_t x = 0; x < w; x += 4u)
+                            for (uint32_t ch = 0; ch < 3u; ++ch)
+                            {
+                                const size_t i = x * 4u + ch;
+                                combEven += static_cast<uint32_t>(std::abs(static_cast<int>(c[i]) - static_cast<int>(a[i])));
+                                combOdd += static_cast<uint32_t>(std::abs(static_cast<int>(c[i]) - static_cast<int>(b[i])));
+                            }
+                    }
+                    if (combEven * 5u < combOdd * 4u)
+                        m_fieldParity = 0u;
+                    else if (combOdd * 5u < combEven * 4u)
+                        m_fieldParity = 1u;
+                    parity = m_fieldParity;
+                }
+                glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
+                glViewport(0, 0, static_cast<GLsizei>(slot.width), static_cast<GLsizei>(slot.height));
+                glUseProgram(m_weaveProgram);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, m_fieldTexture[current]);
+                glActiveTexture(GL_TEXTURE1);
+                glBindTexture(GL_TEXTURE_2D, m_fieldTexture[previous]);
+                glUniform1i(m_weaveCurrent, 0);
+                glUniform1i(m_weavePrevious, 1);
+                glUniform4i(m_weaveParams, static_cast<int>(parity), m_haveField ? 1 : 0, static_cast<int>(h), 0);
+                glUniform2f(m_weaveOutSize, static_cast<float>(slot.width), static_cast<float>(slot.height));
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                m_fieldCurrent = previous;
+                m_haveField = true;
+            }
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, 0u);
             glActiveTexture(GL_TEXTURE0);
@@ -2768,6 +2892,12 @@ void main()
             params.outHeight = std::max(params.enable[0] ? params.height[0] : 0u, params.enable[1] ? params.height[1] : 0u);
             if (params.outWidth == 0u || params.outHeight == 0u)
                 return {};
+            static const bool s_deinterlace = []()
+            {
+                const char *value = std::getenv("PS2X_DEINTERLACE");
+                return !(value && value[0] == '0');
+            }();
+            params.weave = s_deinterlace && params.outHeight <= 256u && params.outWidth <= 640u;
             push(Command::Kind::Present).present = params;
             if (frameLogging())
                 std::fprintf(stderr, "[framelog] present fbp %u/%u\n", params.target[0], params.target[1]);
