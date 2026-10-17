@@ -476,6 +476,7 @@ uniform ivec4 uReTarget2; // element bits, first page, reinterpreting, 0
 uniform ivec4 uDstMode;   // on, blend selectors, blend, pabe
 uniform ivec4 uDstMode2;  // date, datm, frame kind (0 32-bit, 1 24-bit, 2 16-bit), fix
 uniform ivec4 uPremul;    // mode, blend selectors
+uniform ivec4 uScale;     // stored texels per GS texel of the texture, of frame buffers (internal resolution)
 uniform uint uFbmsk;
 in vec3 vTex;
 in vec4 vColor;
@@ -509,7 +510,7 @@ uint targetBits(int bitAddr, int count)
     int y = (page / uReTarget.w) * uReTarget.z + (xy >> 8);
     vec4 t = vec4(0.0);
     if (x < uStore.x && y < uStore.y)
-        t = texelFetch(uTex, ivec2(x, y), 0);
+        t = texelFetch(uTex, ivec2(x, y) * uScale.y, 0);
     uvec3 c = uvec3(floor(t.rgb * 255.0 + 0.5));
     uint raw;
     if (elementBits == 32)
@@ -549,15 +550,26 @@ vec4 reinterpretTexel(int u, int v)
     return c;
 }
 
-vec4 fetchTexel(int u, int v)
+int floorDiv(int a, int b)
 {
+    return a >= 0 ? a / b : -((-a + b - 1) / b);
+}
+
+// The stored texel (su, sv): a frame buffer drawn at a higher internal resolution holds
+// uScale.x of them per GS texel. Wrapping works on the GS texel and keeps the place inside it.
+vec4 fetchTexel(int su, int sv)
+{
+    int scale = uScale.x;
+    int u = floorDiv(su, scale);
+    int v = floorDiv(sv, scale);
+    ivec2 inside = ivec2(su - u * scale, sv - v * scale);
     u = wrapCoord(u, uWrap.z, uWrap.x, uRegion.x, uRegion.y);
     v = wrapCoord(v, uWrap.w, uWrap.y, uRegion.z, uRegion.w);
     if (uReTarget2.z == 1)
         return reinterpretTexel(u, v);
     vec4 t = vec4(0.0);
     if (u >= 0 && v >= 0 && u < uStore.x && v < uStore.y)
-        t = texelFetch(uTex, ivec2(u, v), 0);
+        t = texelFetch(uTex, ivec2(u, v) * scale + inside, 0);
     vec4 c = vec4(floor(t.rgb * 255.0 + 0.5), floor(t.a * uTexa.w + 0.5));
     bool black = c.r == 0.0 && c.g == 0.0 && c.b == 0.0;
     if (uStore.z == 1)
@@ -570,7 +582,7 @@ vec4 fetchTexel(int u, int v)
 vec4 sampleTexture()
 {
     float q = abs(vTex.z) > 1e-8 ? vTex.z : 1.0;
-    vec2 uv = vTex.xy / q;
+    vec2 uv = vTex.xy / q * float(uScale.x);
     if (uMode.w == 0)
         return fetchTexel(int(floor(uv.x)), int(floor(uv.y)));
     uv -= 0.5;
@@ -723,43 +735,50 @@ uniform ivec4 uSize;     // w1, h1, w2, h2
 uniform ivec4 uStore;    // stored sizes of 1 and 2
 uniform ivec4 uEnable;   // crt1, crt2, slbg, mmod
 uniform vec4 uBg;        // background, alp
-uniform ivec2 uField;    // field mode, odd field
+uniform ivec4 uField;    // field mode, odd field, internal resolution
 in vec2 vPos;
 out vec4 oColor;
 
-vec4 fetchCrt(sampler2D t, ivec2 p, ivec2 origin, ivec2 store)
+// Output pixels come uField.z to a GS pixel; positions and sizes are in GS pixels.
+ivec2 gsPixel;
+ivec2 inside;
+
+vec4 fetchCrt(sampler2D t, ivec2 origin, ivec2 store)
 {
-    ivec2 q = p + origin;
+    ivec2 q = gsPixel + origin;
     if (q.x < 0 || q.y < 0 || q.x >= store.x || q.y >= store.y)
         return vec4(0.0);
-    return texelFetch(t, q, 0);
+    return texelFetch(t, q * uField.z + inside, 0);
 }
 
 void main()
 {
     ivec2 p = ivec2(floor(vPos));
+    gsPixel = p / uField.z;
+    inside = p - gsPixel * uField.z;
+    ivec2 pg = gsPixel;
     if (uField.x == 1)
-        p.y = ((p.y >> 1) << 1) + uField.y;
-    bool one = uEnable.x == 1 && p.x < uSize.x && p.y < uSize.y;
-    bool two = uEnable.y == 1 && p.x < uSize.z && p.y < uSize.w;
+        gsPixel.y = ((gsPixel.y >> 1) << 1) + uField.y;
+    bool one = uEnable.x == 1 && pg.x < uSize.x && pg.y < uSize.y;
+    bool two = uEnable.y == 1 && pg.x < uSize.z && pg.y < uSize.w;
     vec3 rgb;
     if (uEnable.x == 1 && uEnable.y == 1)
     {
         vec3 back = uBg.rgb;
         if (uEnable.z == 0 && two)
-            back = fetchCrt(uCrt2, p, uOrigin.zw, uStore.zw).rgb;
+            back = fetchCrt(uCrt2, uOrigin.zw, uStore.zw).rgb;
         rgb = back;
         if (one)
         {
-            vec4 c1 = fetchCrt(uCrt1, p, uOrigin.xy, uStore.xy);
+            vec4 c1 = fetchCrt(uCrt1, uOrigin.xy, uStore.xy);
             float factor = uEnable.w == 1 ? uBg.a : min(1.0, c1.a * 256.0 / 255.0);
             rgb = mix(back, c1.rgb, factor);
         }
     }
     else if (uEnable.x == 1)
-        rgb = one ? fetchCrt(uCrt1, p, uOrigin.xy, uStore.xy).rgb : vec3(0.0);
+        rgb = one ? fetchCrt(uCrt1, uOrigin.xy, uStore.xy).rgb : vec3(0.0);
     else
-        rgb = two ? fetchCrt(uCrt2, p, uOrigin.zw, uStore.zw).rgb : vec3(0.0);
+        rgb = two ? fetchCrt(uCrt2, uOrigin.zw, uStore.zw).rgb : vec3(0.0);
     oColor = vec4(rgb, 1.0);
 }
 )";
@@ -770,25 +789,30 @@ void main()
         const char *kWeaveFragment = R"(
 uniform sampler2D uCurrent;
 uniform sampler2D uPrevious;
-uniform ivec4 uWeave;  // parity, previous field valid, field rows, 0
+uniform ivec4 uWeave;  // parity, previous field valid, field lines, internal resolution
 in vec2 vPos;
 out vec4 oColor;
 
+// A line of the woven picture is uWeave.w rows; each field line, uWeave.w rows of its texture.
 void main()
 {
     ivec2 p = ivec2(floor(vPos));
-    int y = p.y >> 1;
+    int scale = uWeave.w;
+    int line = p.y / scale;
+    int inside = p.y - line * scale;
+    int y = line >> 1;
     int parity = uWeave.x;
-    vec3 current = floor(texelFetch(uCurrent, ivec2(p.x, y), 0).rgb * 255.0 + 0.5);
-    if ((p.y & 1) == parity)
+    vec3 current = floor(texelFetch(uCurrent, ivec2(p.x, y * scale + inside), 0).rgb * 255.0 + 0.5);
+    if ((line & 1) == parity)
     {
         oColor = vec4(current / 255.0, 1.0);
         return;
     }
     int neighbourY = parity == 0 ? min(y + 1, uWeave.z - 1) : max(y - 1, 0);
-    vec3 neighbour = floor(texelFetch(uCurrent, ivec2(p.x, neighbourY), 0).rgb * 255.0 + 0.5);
+    vec3 neighbour = floor(texelFetch(uCurrent, ivec2(p.x, neighbourY * scale + inside), 0).rgb * 255.0 + 0.5);
     vec3 interpolated = floor((current + neighbour + 1.0) / 2.0);
-    vec3 previous = uWeave.y == 1 ? floor(texelFetch(uPrevious, ivec2(p.x, y), 0).rgb * 255.0 + 0.5) : current;
+    vec3 previous = uWeave.y == 1 ? floor(texelFetch(uPrevious, ivec2(p.x, y * scale + inside), 0).rgb * 255.0 + 0.5)
+                                  : current;
     vec3 difference = abs(previous - interpolated);
     oColor = vec4((difference.r + difference.g + difference.b > 48.0 ? interpolated : previous) / 255.0, 1.0);
 }
@@ -886,7 +910,9 @@ void main()
             bool m_haveField = false;
             uint32_t m_fieldParity = 0;
             std::vector<uint8_t> m_fieldPixels[2];
-            void compare(const Command &command, const std::vector<uint8_t> &picture, uint32_t width, uint32_t height);
+            // The picture at internal resolution `scale`: compared on its first row and column per GS pixel.
+            void compare(const Command &command, const std::vector<uint8_t> &picture, uint32_t width, uint32_t height,
+                         uint32_t scale);
             struct CompareStats
             {
                 uint64_t presents = 0;
@@ -908,10 +934,19 @@ void main()
             uint32_t m_dstWidth = 0;
             uint32_t m_dstHeight = 0;
             GLuint m_swizzleTexture = 0;
+            // Internal resolution: frame and depth buffers are drawn this many times larger
+            // (PS2X_PGS_SCALE, settings Video > Internal resolution). Everything the GS side sees
+            // stays in GS pixels: copies back are scaled down, uploads up.
+            int m_scale = 1;
+            GLuint m_bridgeTexture = 0;
+            GLuint m_bridgeFramebuffer = 0;
+            uint32_t m_bridgeWidth = 0;
+            uint32_t m_bridgeHeight = 0;
+            void bridgeFramebuffer(uint32_t width, uint32_t height);
             struct DrawUniforms
             {
                 GLint targetSize, tex, mode, wrap, region, store, texa, fog, test, palette, dst, swizzle, reTex, reTex2,
-                    reTarget, reTarget2, dstMode, dstMode2, fbmsk, premul;
+                    reTarget, reTarget2, dstMode, dstMode2, fbmsk, premul, scale;
             } m_du{};
             struct PresentUniforms
             {
@@ -934,8 +969,33 @@ void main()
             return texture;
         }
 
+        // A GS-pixel-sized texture to copy a frame buffer through at internal resolution.
+        void Renderer::bridgeFramebuffer(uint32_t width, uint32_t height)
+        {
+            if (!m_bridgeTexture || m_bridgeWidth < width || m_bridgeHeight < height)
+            {
+                if (m_bridgeTexture)
+                    glDeleteTextures(1, &m_bridgeTexture);
+                m_bridgeWidth = std::max(m_bridgeWidth, width);
+                m_bridgeHeight = std::max(m_bridgeHeight, height);
+                m_bridgeTexture = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, m_bridgeWidth, m_bridgeHeight, nullptr);
+                if (!m_bridgeFramebuffer)
+                    glGenFramebuffers(1, &m_bridgeFramebuffer);
+                glBindFramebuffer(GL_FRAMEBUFFER, m_bridgeFramebuffer);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_bridgeTexture, 0);
+            }
+        }
+
         bool Renderer::init()
         {
+            {
+                // 1aa and 2aa (paraLLEl-GS's super-sampling) draw at 1x and 2x here.
+                const char *value = std::getenv("PS2X_PGS_SCALE");
+                const int scale = value ? std::atoi(value) : 1;
+                m_scale = scale >= 4 ? 4 : scale >= 2 ? 2 : 1;
+                if (m_scale > 1)
+                    std::fprintf(stderr, "[gles] internal resolution %dx\n", m_scale);
+            }
             m_drawProgram = linkProgram(kDrawVertex, kDrawFragment);
             m_presentProgram = linkProgram(kPresentVertex, kPresentFragment);
             if (!m_drawProgram || !m_presentProgram)
@@ -944,7 +1004,7 @@ void main()
             m_du = {du("uTargetSize"), du("uTex"), du("uMode"), du("uWrap"), du("uRegion"),
                     du("uStore"), du("uTexa"), du("uFog"), du("uTest"), du("uPalette"),
                     du("uDst"), du("uSwizzle"), du("uReTex"), du("uReTex2"), du("uReTarget"),
-                    du("uReTarget2"), du("uDstMode"), du("uDstMode2"), du("uFbmsk"), du("uPremul")};
+                    du("uReTarget2"), du("uDstMode"), du("uDstMode2"), du("uFbmsk"), du("uPremul"), du("uScale")};
             // Units: 0 the texture, 1 the second read circuit (present), 2 the palette, 3 the frame
             // buffer copy of destination mode, 4 the layout tables.
             glUseProgram(m_drawProgram);
@@ -1041,9 +1101,11 @@ void main()
                     depthTarget->second.needsClear = false;
                 }
             }
-            glViewport(0, 0, k.targetWidth, k.targetHeight);
+            const int S = m_scale;
+            glViewport(0, 0, k.targetWidth * S, k.targetHeight * S);
             glEnable(GL_SCISSOR_TEST);
-            glScissor(k.scissorX0, k.scissorY0, k.scissorX1 - k.scissorX0 + 1, k.scissorY1 - k.scissorY0 + 1);
+            glScissor(k.scissorX0 * S, k.scissorY0 * S, (k.scissorX1 - k.scissorX0 + 1) * S,
+                      (k.scissorY1 - k.scissorY0 + 1) * S);
 
             GLuint texture = 0;
             if (k.source == SourceCache)
@@ -1062,8 +1124,8 @@ void main()
                     if (k.source == SourceTargetCopy || k.source == SourceReinterpretCopy)
                     {
                         // GL does not define sampling the texture a draw writes: copy it first.
-                        const uint32_t w = found->second.width;
-                        const uint32_t h = found->second.height;
+                        const uint32_t w = found->second.width * S;
+                        const uint32_t h = found->second.height * S;
                         if (!m_copyTexture || m_copyWidth != w || m_copyHeight != h)
                         {
                             if (m_copyTexture)
@@ -1091,8 +1153,8 @@ void main()
             if (k.dstMode)
             {
                 // The rectangle the draw covers, copied for the shader to read.
-                const uint32_t w = colorTarget->second.width;
-                const uint32_t h = colorTarget->second.height;
+                const uint32_t w = colorTarget->second.width * S;
+                const uint32_t h = colorTarget->second.height * S;
                 glActiveTexture(GL_TEXTURE3);
                 if (!m_dstTexture || m_dstWidth != w || m_dstHeight != h)
                 {
@@ -1104,9 +1166,9 @@ void main()
                 }
                 glBindTexture(GL_TEXTURE_2D, m_dstTexture);
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, framebufferFor(k.target, 0u));
-                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(command.x), static_cast<GLint>(command.y),
-                                    static_cast<GLint>(command.x), static_cast<GLint>(command.y),
-                                    static_cast<GLsizei>(command.width), static_cast<GLsizei>(command.height));
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(command.x) * S, static_cast<GLint>(command.y) * S,
+                                    static_cast<GLint>(command.x) * S, static_cast<GLint>(command.y) * S,
+                                    static_cast<GLsizei>(command.width) * S, static_cast<GLsizei>(command.height) * S);
                 glBindFramebuffer(GL_FRAMEBUFFER, framebuffer);
             }
             glActiveTexture(GL_TEXTURE0);
@@ -1129,6 +1191,7 @@ void main()
             glUniform4i(m_du.dstMode2, k.date, k.datm, k.frameKind, k.blendFix);
             glUniform1ui(m_du.fbmsk, k.fbmsk);
             glUniform4i(m_du.premul, k.premul, k.blendSel, 0, 0);
+            glUniform4i(m_du.scale, (k.source == SourceTarget || k.source == SourceTargetCopy) ? S : 1, S, 0, 0);
             const int alphaOut = k.forceAlpha ? 1 : (k.keepBlendAlpha ? 2 : 0);
 
             if (k.blend)
@@ -1195,14 +1258,42 @@ void main()
             if (found == m_targets.end() || job.pixels.empty())
                 return;
             glBindFramebuffer(GL_READ_FRAMEBUFFER, framebufferFor(job.target, 0u));
+            if (m_scale > 1)
+            {
+                // One pixel per GS pixel: the buffer scaled down first.
+                bridgeFramebuffer(job.width, job.height);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, framebufferFor(job.target, 0u));
+                glBindFramebuffer(GL_DRAW_FRAMEBUFFER, m_bridgeFramebuffer);
+                glDisable(GL_SCISSOR_TEST);
+                glBlitFramebuffer(0, 0, static_cast<GLint>(job.width) * m_scale, static_cast<GLint>(job.height) * m_scale, 0,
+                                  0, static_cast<GLint>(job.width), static_cast<GLint>(job.height), GL_COLOR_BUFFER_BIT,
+                                  GL_NEAREST);
+                glBindFramebuffer(GL_READ_FRAMEBUFFER, m_bridgeFramebuffer);
+            }
             glReadPixels(0, 0, static_cast<GLsizei>(job.width), static_cast<GLsizei>(job.height), GL_RGBA,
                          GL_UNSIGNED_BYTE, job.pixels.data());
         }
 
         // Pixels whose colour differs by more than 8 in a channel count as off.
-        void Renderer::compare(const Command &command, const std::vector<uint8_t> &picture, uint32_t width,
-                               uint32_t height)
+        void Renderer::compare(const Command &command, const std::vector<uint8_t> &source, uint32_t sourceWidth,
+                               uint32_t sourceHeight, uint32_t scale)
         {
+            // One pixel per GS pixel.
+            std::vector<uint8_t> scaled;
+            const std::vector<uint8_t> *pictureData = &source;
+            uint32_t width = sourceWidth, height = sourceHeight;
+            if (scale > 1u)
+            {
+                width = sourceWidth / scale;
+                height = sourceHeight / scale;
+                scaled.resize(static_cast<size_t>(width) * height * 4u);
+                for (uint32_t y = 0; y < height; ++y)
+                    for (uint32_t x = 0; x < width; ++x)
+                        std::memcpy(scaled.data() + (static_cast<size_t>(y) * width + x) * 4u,
+                                    source.data() + (static_cast<size_t>(y) * scale * sourceWidth + x * scale) * 4u, 4u);
+                pictureData = &scaled;
+            }
+            const std::vector<uint8_t> &picture = *pictureData;
             const std::vector<uint8_t> &reference = *command.reference;
             const uint32_t w = std::min(width, command.referenceWidth);
             const uint32_t h = std::min(height, command.referenceHeight);
@@ -1278,12 +1369,16 @@ void main()
                     ++slotIndex;
             }
             DisplaySlot &slot = g_slots[static_cast<size_t>(slotIndex)];
-            const uint32_t pictureHeight = params.weave ? params.outHeight * 2u : params.outHeight;
-            if (!slot.texture || slot.width != params.outWidth || slot.height != pictureHeight)
+            // At 2x and 4x each field already has the lines a woven picture would: shown as drawn.
+            const bool weave = params.weave && m_scale == 1;
+            const uint32_t S = static_cast<uint32_t>(m_scale);
+            const uint32_t pictureWidth = params.outWidth * S;
+            const uint32_t pictureHeight = (weave ? params.outHeight * 2u : params.outHeight) * S;
+            if (!slot.texture || slot.width != pictureWidth || slot.height != pictureHeight)
             {
                 if (slot.texture)
                     glDeleteTextures(1, &slot.texture);
-                slot.texture = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, params.outWidth, pictureHeight, nullptr);
+                slot.texture = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, pictureWidth, pictureHeight, nullptr);
                 // The main thread sets the filter it shows the picture with.
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -1291,30 +1386,31 @@ void main()
                     glGenFramebuffers(1, &slot.framebuffer);
                 glBindFramebuffer(GL_FRAMEBUFFER, slot.framebuffer);
                 glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, slot.texture, 0);
-                slot.width = params.outWidth;
+                slot.width = pictureWidth;
                 slot.height = pictureHeight;
             }
             // Weaving composes the field into a texture of its own first.
-            if (params.weave && (!m_fieldTexture[0] || m_fieldWidth != params.outWidth || m_fieldHeight != params.outHeight))
+            if (weave && (!m_fieldTexture[0] || m_fieldWidth != pictureWidth || m_fieldHeight != params.outHeight * S))
             {
                 for (int i = 0; i < 2; ++i)
                 {
                     if (m_fieldTexture[i])
                         glDeleteTextures(1, &m_fieldTexture[i]);
-                    m_fieldTexture[i] = newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, params.outWidth, params.outHeight, nullptr);
+                    m_fieldTexture[i] =
+                        newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, pictureWidth, params.outHeight * S, nullptr);
                     if (!m_fieldFramebuffer[i])
                         glGenFramebuffers(1, &m_fieldFramebuffer[i]);
                     glBindFramebuffer(GL_FRAMEBUFFER, m_fieldFramebuffer[i]);
                     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, m_fieldTexture[i], 0);
                 }
-                m_fieldWidth = params.outWidth;
-                m_fieldHeight = params.outHeight;
+                m_fieldWidth = pictureWidth;
+                m_fieldHeight = params.outHeight * S;
                 m_haveField = false;
             }
-            if (!params.weave)
+            if (!weave)
                 m_haveField = false;
-            const uint32_t composeHeight = params.outHeight;
-            glBindFramebuffer(GL_FRAMEBUFFER, params.weave ? m_fieldFramebuffer[m_fieldCurrent] : slot.framebuffer);
+            const uint32_t composeHeight = params.outHeight * S;
+            glBindFramebuffer(GL_FRAMEBUFFER, weave ? m_fieldFramebuffer[m_fieldCurrent] : slot.framebuffer);
             glViewport(0, 0, static_cast<GLsizei>(slot.width), static_cast<GLsizei>(composeHeight));
             glDisable(GL_SCISSOR_TEST);
             glDisable(GL_BLEND);
@@ -1345,15 +1441,15 @@ void main()
             glUniform4f(m_pu.bg, static_cast<float>(params.bgcolor & 0xFFu) / 255.0f,
                         static_cast<float>((params.bgcolor >> 8) & 0xFFu) / 255.0f,
                         static_cast<float>((params.bgcolor >> 16) & 0xFFu) / 255.0f, static_cast<float>(params.alp) / 255.0f);
-            glUniform2i(m_pu.field, params.field ? 1 : 0, params.oddField ? 1 : 0);
+            glUniform4i(m_pu.field, params.field ? 1 : 0, params.oddField ? 1 : 0, m_scale, 0);
             glBindVertexArray(m_emptyVao);
             glDrawArrays(GL_TRIANGLES, 0, 3);
-            if (params.weave)
+            if (weave)
             {
                 const int current = m_fieldCurrent;
                 const int previous = current ^ 1;
-                const uint32_t w = params.outWidth;
-                const uint32_t h = params.outHeight;
+                const uint32_t w = pictureWidth;
+                const uint32_t h = params.outHeight * S;
                 const size_t rowBytes = static_cast<size_t>(w) * 4u;
                 std::vector<uint8_t> &field = m_fieldPixels[current];
                 field.resize(rowBytes * h);
@@ -1363,15 +1459,17 @@ void main()
                 // previous field, switched only on a clear win (as FieldWeaver::weave).
                 uint32_t parity = params.oddField ? 1u : 0u;
                 const std::vector<uint8_t> &before = m_fieldPixels[previous];
-                if (m_haveField && h > 4u && before.size() == field.size())
+                const uint32_t lines = params.outHeight;
+                if (m_haveField && lines > 4u && before.size() == field.size())
                 {
+                    // On GS lines and pixels (the first row and column of each at internal resolution).
                     uint64_t combEven = 0u, combOdd = 0u;
-                    for (uint32_t y = 1u; y + 1u < h; y += 2u)
+                    for (uint32_t y = 1u; y + 1u < lines; y += 2u)
                     {
-                        const uint8_t *c = field.data() + y * rowBytes;
-                        const uint8_t *a = before.data() + (y - 1u) * rowBytes;
-                        const uint8_t *b = before.data() + (y + 1u) * rowBytes;
-                        for (uint32_t x = 0; x < w; x += 4u)
+                        const uint8_t *c = field.data() + y * S * rowBytes;
+                        const uint8_t *a = before.data() + (y - 1u) * S * rowBytes;
+                        const uint8_t *b = before.data() + (y + 1u) * S * rowBytes;
+                        for (uint32_t x = 0; x < w; x += 4u * S)
                             for (uint32_t ch = 0; ch < 3u; ++ch)
                             {
                                 const size_t i = x * 4u + ch;
@@ -1394,13 +1492,13 @@ void main()
                 glBindTexture(GL_TEXTURE_2D, m_fieldTexture[previous]);
                 glUniform1i(m_weaveCurrent, 0);
                 glUniform1i(m_weavePrevious, 1);
-                glUniform4i(m_weaveParams, static_cast<int>(parity), m_haveField ? 1 : 0, static_cast<int>(h), 0);
+                glUniform4i(m_weaveParams, static_cast<int>(parity), m_haveField ? 1 : 0, static_cast<int>(lines), m_scale);
                 glUniform2f(m_weaveOutSize, static_cast<float>(slot.width), static_cast<float>(slot.height));
                 glDrawArrays(GL_TRIANGLES, 0, 3);
                 m_fieldCurrent = previous;
                 m_haveField = true;
                 if (command && command->reference)
-                    compare(*command, field, w, h);
+                    compare(*command, field, w, h, S);
             }
             else if (command && command->reference)
             {
@@ -1408,7 +1506,7 @@ void main()
                 glBindFramebuffer(GL_READ_FRAMEBUFFER, slot.framebuffer);
                 glReadPixels(0, 0, static_cast<GLsizei>(slot.width), static_cast<GLsizei>(slot.height), GL_RGBA,
                              GL_UNSIGNED_BYTE, picture.data());
-                compare(*command, picture, slot.width, slot.height);
+                compare(*command, picture, slot.width, slot.height, S);
             }
             glActiveTexture(GL_TEXTURE1);
             glBindTexture(GL_TEXTURE_2D, 0u);
@@ -1448,11 +1546,11 @@ void main()
                     target.height = command.height;
                     target.depth = command.depth;
                     target.needsClear = command.depth;
+                    const uint32_t w = command.width * static_cast<uint32_t>(m_scale);
+                    const uint32_t h = command.height * static_cast<uint32_t>(m_scale);
                     target.texture = command.depth
-                                         ? newTexture(GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT,
-                                                      command.width, command.height, nullptr)
-                                         : newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, command.width, command.height,
-                                                      nullptr);
+                                         ? newTexture(GL_DEPTH_COMPONENT32F, GL_DEPTH_COMPONENT, GL_FLOAT, w, h, nullptr)
+                                         : newTexture(GL_RGBA8, GL_RGBA, GL_UNSIGNED_BYTE, w, h, nullptr);
                     break;
                 }
                 case Command::Kind::DeleteTarget:
@@ -1471,10 +1569,28 @@ void main()
                     const auto found = m_targets.find(command.id);
                     if (found == m_targets.end())
                         break;
-                    glBindTexture(GL_TEXTURE_2D, found->second.texture);
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(command.x), static_cast<GLint>(command.y),
-                                    static_cast<GLsizei>(command.width), static_cast<GLsizei>(command.height), GL_RGBA,
-                                    GL_UNSIGNED_BYTE, batch.blob.data() + command.blob);
+                    if (m_scale == 1)
+                    {
+                        glBindTexture(GL_TEXTURE_2D, found->second.texture);
+                        glTexSubImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(command.x), static_cast<GLint>(command.y),
+                                        static_cast<GLsizei>(command.width), static_cast<GLsizei>(command.height), GL_RGBA,
+                                        GL_UNSIGNED_BYTE, batch.blob.data() + command.blob);
+                        break;
+                    }
+                    // GS pixels in, each drawn as a block at internal resolution.
+                    bridgeFramebuffer(command.width, command.height);
+                    glBindTexture(GL_TEXTURE_2D, m_bridgeTexture);
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, static_cast<GLsizei>(command.width),
+                                    static_cast<GLsizei>(command.height), GL_RGBA, GL_UNSIGNED_BYTE,
+                                    batch.blob.data() + command.blob);
+                    glBindFramebuffer(GL_READ_FRAMEBUFFER, m_bridgeFramebuffer);
+                    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, framebufferFor(command.id, 0u));
+                    glDisable(GL_SCISSOR_TEST);
+                    glBlitFramebuffer(0, 0, static_cast<GLint>(command.width), static_cast<GLint>(command.height),
+                                      static_cast<GLint>(command.x) * m_scale, static_cast<GLint>(command.y) * m_scale,
+                                      static_cast<GLint>(command.x + command.width) * m_scale,
+                                      static_cast<GLint>(command.y + command.height) * m_scale, GL_COLOR_BUFFER_BIT,
+                                      GL_NEAREST);
                     break;
                 }
                 case Command::Kind::UploadTexture:

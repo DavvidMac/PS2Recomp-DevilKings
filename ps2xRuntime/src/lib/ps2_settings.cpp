@@ -316,13 +316,14 @@ namespace ps2x::settings
                 renderer.choiceAvailable = {true, kHaveVulkan, true};
                 add(renderer);
                 Definition scale{"video", "internal_resolution", "Resolução interna",
-                                 "Só no Vulkan. 2x e 4x desenham a imagem 2 e 4 vezes maior (detalhe nítido em telas "
-                                 "grandes); \"suavizado\" desenha mais amostras por pixel no mesmo tamanho, o que "
-                                 "tira o serrilhado. Quanto mais à direita, mais trabalho para a placa de vídeo.",
+                                 "Vulkan e OpenGL. 2x e 4x desenham a imagem 2 e 4 vezes maior (detalhe nítido em "
+                                 "telas grandes); \"suavizado\" (só no Vulkan) desenha mais amostras por pixel no "
+                                 "mesmo tamanho, o que tira o serrilhado, e no OpenGL vale como o tamanho sem "
+                                 "suavizar. Quanto mais à direita, mais trabalho para a placa de vídeo.",
                                  Kind::Choice, "1", "PS2X_PGS_SCALE", {"1", "1aa", "2", "2aa", "4"},
                                  {"1x (nativa)", "1x suavizado", "2x", "2x suavizado", "4x"}, 0, 0, nullptr, false};
                 scale.choiceEnvironment = {"", "1aa", "2", "2aa", "4"};
-                scale.choiceAvailable = {true, kHaveVulkan, kHaveVulkan, kHaveVulkan, kHaveVulkan};
+                scale.choiceAvailable = {true, true, true, true, true};
                 add(scale);
             }
             add({"video", "window", "Janela", "Como o jogo ocupa o monitor.", Kind::Choice, "windowed", nullptr,
