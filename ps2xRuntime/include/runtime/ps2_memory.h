@@ -557,6 +557,15 @@ public:
     };
 
     std::array<EeTimer, 4> m_eeTimers{};
+    // advanceEeTimers() runs on every block of guest code. It only adds up the cycles until
+    // the next timer interrupt is due (m_eeTimerFlushAt); the counts catch up then, or when a
+    // timer register is read or written (flushEeTimers()). The arithmetic carries remainders,
+    // so applying the cycles at once gives the same counts as applying them one by one.
+    uint64_t m_eeTimerPendingCycles = 0;
+    uint64_t m_eeTimerFlushAt = 0;
+    uint32_t *m_gifStatSlot = nullptr; // GIF_STAT in m_ioRegisters (its FQC drains as time passes)
+    uint32_t m_eeTimerLateInterrupts = 0; // raised by a catch-up on a register access, reported next
+    uint32_t flushEeTimers() noexcept;
     bool tryProcessScratchpadDma(uint32_t channelBase, uint32_t chcr);
     bool tryProcessIpuInputDma(uint32_t channelBase, uint32_t chcr);
     void appendIpuDmaData(std::vector<uint8_t> &payload, uint32_t srcAddr, uint32_t qwCount);

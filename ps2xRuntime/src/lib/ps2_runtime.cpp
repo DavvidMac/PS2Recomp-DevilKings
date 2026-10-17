@@ -1484,6 +1484,7 @@ bool PS2Runtime::replaceFunction(uint32_t address, RecompiledFunction func)
     }
 
     // Outside the generated dense table: code loaded at runtime.
+    forgetCachedDynamicFunction(address);
     if (func != nullptr)
     {
         m_dynamicFunctions[address] = func;
@@ -1539,6 +1540,7 @@ uint32_t PS2Runtime::guestModuleBase(uint32_t address) const
 
 void PS2Runtime::unregisterFunctionRange(uint32_t start, uint32_t end)
 {
+    m_dynamicFunctionCache.fill({});
     for (auto it = m_dynamicFunctions.begin(); it != m_dynamicFunctions.end();)
     {
         if (it->first >= start && it->first < end)
@@ -1565,9 +1567,15 @@ PS2Runtime::RecompiledFunction PS2Runtime::findFunction(uint32_t address)
 
     if (!m_dynamicFunctions.empty())
     {
+        DynamicFunctionCacheEntry &cached = dynamicFunctionCacheSlot(address);
+        if (cached.address == address && cached.fn != nullptr)
+        {
+            return cached.fn;
+        }
         const auto it = m_dynamicFunctions.find(address);
         if (it != m_dynamicFunctions.end())
         {
+            cached = {address, it->second};
             return it->second;
         }
     }
@@ -1579,6 +1587,7 @@ PS2Runtime::RecompiledFunction PS2Runtime::findFunction(uint32_t address)
         m_resolvingMissingFunction = false;
         if (fn != nullptr)
         {
+            forgetCachedDynamicFunction(address);
             m_dynamicFunctions[address] = fn;
             return fn;
         }

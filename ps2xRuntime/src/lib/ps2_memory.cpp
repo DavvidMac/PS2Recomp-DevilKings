@@ -434,6 +434,7 @@ bool PS2Memory::initialize(size_t ramSize)
 
         // Initialize I/O registers
         m_ioRegisters.clear();
+        m_gifStatSlot = &m_ioRegisters[0x10003020u];
 
         // Initialize GS registers
         memset(&gs_regs, 0, sizeof(gs_regs));
@@ -481,6 +482,9 @@ bool PS2Memory::initialize(size_t ramSize)
 void PS2Memory::resetEeTimers() noexcept
 {
     m_eeTimers = {};
+    m_eeTimerPendingCycles = 0u;
+    m_eeTimerFlushAt = 0u;
+    m_eeTimerLateInterrupts = 0u;
 }
 
 uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
@@ -490,11 +494,26 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
         return 0u;
     }
 
-    constexpr uint32_t kGifStat = 0x10003020u;
     constexpr uint32_t kGifFqcMask = 0x1F000000u;
-    auto gifStatIt = m_ioRegisters.find(kGifStat);
-    if (gifStatIt != m_ioRegisters.end())
-        gifStatIt->second &= ~kGifFqcMask;
+    if (m_gifStatSlot)
+        *m_gifStatSlot &= ~kGifFqcMask;
+
+    m_eeTimerPendingCycles += eeCycles;
+    uint32_t interrupts = m_eeTimerLateInterrupts;
+    m_eeTimerLateInterrupts = 0u;
+    if (m_eeTimerPendingCycles >= m_eeTimerFlushAt)
+        interrupts |= flushEeTimers();
+    return interrupts;
+}
+
+uint32_t PS2Memory::flushEeTimers() noexcept
+{
+    const uint64_t eeCycles = m_eeTimerPendingCycles;
+    m_eeTimerPendingCycles = 0u;
+    if (eeCycles == 0u)
+    {
+        return 0u;
+    }
 
     uint32_t interruptMask = 0u;
     for (size_t index = 0; index < m_eeTimers.size(); ++index)
@@ -556,6 +575,8 @@ uint32_t PS2Memory::advanceEeTimers(uint64_t eeCycles) noexcept
             interruptMask |= 1u << index;
         }
     }
+    // Catch up again at the next interrupt, or at least every 2^20 cycles (~3.4 ms of EE time).
+    m_eeTimerFlushAt = std::min<uint64_t>(cyclesUntilNextEeTimerInterrupt(), 1ull << 20);
     return interruptMask;
 }
 
@@ -598,6 +619,9 @@ uint64_t PS2Memory::cyclesUntilNextEeTimerInterrupt() const noexcept
         const uint64_t cycles = (numerator + clockHz - 1u) / clockHz;
         nearest = std::min(nearest, std::max<uint64_t>(1u, cycles));
     }
+    // The counts above stop where the last catch-up left them; cycles added since count too.
+    if (nearest != std::numeric_limits<uint64_t>::max())
+        nearest = nearest > m_eeTimerPendingCycles ? nearest - m_eeTimerPendingCycles : 1u;
     return nearest;
 }
 
@@ -1338,6 +1362,8 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        m_eeTimerLateInterrupts |= flushEeTimers();
+        m_eeTimerFlushAt = 0u; // the next interrupt may have moved
         EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {
@@ -2939,6 +2965,7 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
     uint32_t timerOffset = 0u;
     if (decodeEeTimerRegister(address, timerIndex, timerOffset))
     {
+        m_eeTimerLateInterrupts |= flushEeTimers();
         const EeTimer &timer = m_eeTimers[timerIndex];
         switch (timerOffset)
         {

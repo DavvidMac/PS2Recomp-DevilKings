@@ -540,6 +540,25 @@ private:
     std::atomic<uint32_t> m_missingFunctionPolicy{static_cast<uint32_t>(MissingFunctionPolicy::ContinueToTarget)};
     RecompiledFunction findFunction(uint32_t address);
     std::unordered_map<uint32_t, RecompiledFunction> m_dynamicFunctions;
+    // Recent hits in m_dynamicFunctions (the code of loaded modules, looked up on every call into
+    // it), direct-mapped by address. A slot is dropped when its address is registered again or
+    // removed; removing a range drops them all.
+    struct DynamicFunctionCacheEntry
+    {
+        uint32_t address = 0;
+        RecompiledFunction fn = nullptr;
+    };
+    std::array<DynamicFunctionCacheEntry, 4096> m_dynamicFunctionCache{};
+    DynamicFunctionCacheEntry &dynamicFunctionCacheSlot(uint32_t address)
+    {
+        return m_dynamicFunctionCache[(address >> 2) & (m_dynamicFunctionCache.size() - 1u)];
+    }
+    void forgetCachedDynamicFunction(uint32_t address)
+    {
+        DynamicFunctionCacheEntry &slot = dynamicFunctionCacheSlot(address);
+        if (slot.address == address)
+            slot = {};
+    }
     struct GuestModuleRange
     {
         uint32_t base = 0;
