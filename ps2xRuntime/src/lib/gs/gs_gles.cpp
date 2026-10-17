@@ -220,6 +220,10 @@ namespace ps2x::gles
             // Destination mode: the shader reads the frame buffer (a copy) and does the GS blend,
             // FBMSK and DATE itself, for what GL blending and colour masks cannot express.
             uint8_t dstMode, blendSel, shaderBlend, pabe, date, datm, frameKind;
+            // Source alpha on the source side only ((A - B) * As with A, B in {Cs, 0}): the shader
+            // computes that term, so alpha above 0x80 (factors up to 2) stays exact. 1: GL adds
+            // it to Cd, 2: GL takes it from Cd, 3: it is the result.
+            uint8_t premul;
             uint16_t targetWidth, targetHeight;
             uint16_t texWidth, texHeight;      // 2^TW, 2^TH
             uint16_t storeWidth, storeHeight;  // the GL texture's size
@@ -471,6 +475,7 @@ uniform ivec4 uReTarget;  // inverse table, page width, page height, pages per r
 uniform ivec4 uReTarget2; // element bits, first page, reinterpreting, 0
 uniform ivec4 uDstMode;   // on, blend selectors, blend, pabe
 uniform ivec4 uDstMode2;  // date, datm, frame kind (0 32-bit, 1 24-bit, 2 16-bit), fix
+uniform ivec4 uPremul;    // mode, blend selectors
 uniform uint uFbmsk;
 in vec3 vTex;
 in vec4 vColor;
@@ -668,6 +673,18 @@ void main()
         bool passes = alphaPasses(c.a);
         if (uTest.z == 0 ? !passes : passes)
             discard;
+    }
+    if (uPremul.x != 0)
+    {
+        int sel = uPremul.y;
+        vec3 a = (sel & 3) == 0 ? c.rgb : vec3(0.0);
+        vec3 b = ((sel >> 2) & 3) == 0 ? c.rgb : vec3(0.0);
+        vec3 t = floor((a - b) * c.a / 128.0);
+        if (((sel >> 6) & 3) == 0)
+            t += c.rgb;
+        if (uPremul.x == 2)
+            t = -t;
+        c.rgb = clamp(t, 0.0, 255.0);
     }
     if (uDstMode.x == 1)
         c = applyDestination(c);
@@ -894,7 +911,7 @@ void main()
             struct DrawUniforms
             {
                 GLint targetSize, tex, mode, wrap, region, store, texa, fog, test, palette, dst, swizzle, reTex, reTex2,
-                    reTarget, reTarget2, dstMode, dstMode2, fbmsk;
+                    reTarget, reTarget2, dstMode, dstMode2, fbmsk, premul;
             } m_du{};
             struct PresentUniforms
             {
@@ -927,7 +944,7 @@ void main()
             m_du = {du("uTargetSize"), du("uTex"), du("uMode"), du("uWrap"), du("uRegion"),
                     du("uStore"), du("uTexa"), du("uFog"), du("uTest"), du("uPalette"),
                     du("uDst"), du("uSwizzle"), du("uReTex"), du("uReTex2"), du("uReTarget"),
-                    du("uReTarget2"), du("uDstMode"), du("uDstMode2"), du("uFbmsk")};
+                    du("uReTarget2"), du("uDstMode"), du("uDstMode2"), du("uFbmsk"), du("uPremul")};
             // Units: 0 the texture, 1 the second read circuit (present), 2 the palette, 3 the frame
             // buffer copy of destination mode, 4 the layout tables.
             glUseProgram(m_drawProgram);
@@ -1111,6 +1128,7 @@ void main()
             glUniform4i(m_du.dstMode, k.dstMode, k.blendSel, k.shaderBlend, k.pabe);
             glUniform4i(m_du.dstMode2, k.date, k.datm, k.frameKind, k.blendFix);
             glUniform1ui(m_du.fbmsk, k.fbmsk);
+            glUniform4i(m_du.premul, k.premul, k.blendSel, 0, 0);
             const int alphaOut = k.forceAlpha ? 1 : (k.keepBlendAlpha ? 2 : 0);
 
             if (k.blend)
@@ -2735,6 +2753,21 @@ void main()
                 key.keepBlendAlpha = (blend.enable && blend.usesSourceAlpha) ? 1u : 0u;
                 blendExact = blend.exact && !state.pabe &&
                              !(((ctx.alpha >> 32) & 0xFFu) > 0x80u && ((ctx.alpha >> 4) & 3u) == 2u);
+                const uint32_t selA = ctx.alpha & 3u, selB = (ctx.alpha >> 2) & 3u, selC = (ctx.alpha >> 4) & 3u,
+                               selD = (ctx.alpha >> 6) & 3u;
+                if (selC == 0u && selA != 1u && selB != 1u && selA != selB && !state.pabe)
+                {
+                    // Additive glows and the like: the shader works the term out, GL only adds or
+                    // subtracts the frame buffer.
+                    key.premul = selD == 1u ? (selA == 0u ? 1u : 2u) : 3u;
+                    key.blend = key.premul != 3u ? 1u : 0u;
+                    key.blendEquation = key.premul == 2u ? GL_FUNC_REVERSE_SUBTRACT : GL_FUNC_ADD;
+                    key.blendSrc = GL_ONE;
+                    key.blendDst = GL_ONE;
+                    key.blendSel = static_cast<uint8_t>(ctx.alpha & 0xFFu);
+                    key.keepBlendAlpha = 0u;
+                    blendExact = true;
+                }
             }
             const bool fba = (ctx.fba & 1u) != 0u && ctx.frame.psm != GS_PSM_CT24;
             key.forceAlpha = (fba && !key.keepBlendAlpha) ? 1u : 0u;
@@ -2765,6 +2798,7 @@ void main()
             if (partialMask || date || !blendExact)
             {
                 key.dstMode = 1u;
+                key.premul = 0u;
                 key.blend = 0u;
                 key.keepBlendAlpha = 0u;
                 key.forceAlpha = fba ? 1u : 0u;

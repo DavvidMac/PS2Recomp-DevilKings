@@ -1,6 +1,5 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_cpu_backend.h"
-#include "runtime/gs/gs_gles.h"
 #include "runtime/gs/gs_hud_layout.h"
 #include "runtime/gs/gs_pgs.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
@@ -181,10 +180,6 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
     ps2x::pgs::setRegisters(privRegs);
     if (!m_backend)
         m_backend = std::make_unique<GSCpuBackend>();
-    // PS2X_RENDERER=opengl: the runtime starts the renderer's GL thread once the window exists,
-    // and goes back to a CPU backend if it cannot.
-    if (ps2x::gles::requested() && dynamic_cast<GSCpuBackend *>(m_backend.get()))
-        m_backend = ps2x::gles::createBackend();
     m_backend->Initialize(vram, vramSize);
     reset();
 }

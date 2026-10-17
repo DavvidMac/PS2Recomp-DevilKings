@@ -2910,6 +2910,19 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
     const float a0 = (fy1 - fy2) * k;
     const float a1 = (fy2 - fy0) * k;
     const float a2 = -(a0 + a1);
+    // The GS fill convention (top-left, as the hardware and PCSX2 draw): a pixel whose centre
+    // lies on an edge belongs to the triangle only through a left or top edge, so two triangles
+    // sharing an edge do not both draw its pixels (blended strips, such as weapon trails, showed
+    // their edges twice as bright). An edge is left when the weight grows to the right, top when
+    // it is horizontal and the weight grows downwards.
+    const float d0 = (fx2 - fx1) * k;
+    const float d1 = (fx0 - fx2) * k;
+    const float d2 = -(d0 + d1);
+    const auto onEdgeLimit = [](float dx, float dy)
+    { return (dx > 0.0f || (dx == 0.0f && dy > 0.0f)) ? -kEdgeEpsilon : kEdgeEpsilon; };
+    const float limit0 = onEdgeLimit(a0, d0);
+    const float limit1 = onEdgeLimit(a1, d1);
+    const float limit2 = onEdgeLimit(a2, d2);
     for (int y = minY; y <= maxY; ++y)
     {
         if (!ownsRow(y))
@@ -2943,7 +2956,7 @@ void GSCpuBackend::DrawTriangle(const GSPrimitiveBatch &batch)
             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
             float w2 = 1.0f - w0 - w1;
 
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            if (w0 < limit0 || w1 < limit1 || w2 < limit2)
                 continue;
 
             double z = v0.z * w0 + v1.z * w1 + v2.z * w2;
