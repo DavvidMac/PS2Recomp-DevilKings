@@ -22,6 +22,7 @@ private:
     bool m_initialized = false;
     bool m_visible = false;
     void *m_font = nullptr; // ImFont*
+    float m_scale = 1.0f;   // UI size: 1 on a desktop, larger on a phone's dense screen
     char m_pathBuffer[512] = {};
     int m_capture = -1; // pad button waiting for a key
 };

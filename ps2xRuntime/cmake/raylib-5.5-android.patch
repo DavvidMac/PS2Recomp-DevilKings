@@ -1,0 +1,82 @@
+diff --git a/src/platforms/rcore_android.c b/src/platforms/rcore_android.c
+index 85ce82a3..f5329b38 100644
+--- a/src/platforms/rcore_android.c
++++ b/src/platforms/rcore_android.c
+@@ -434,7 +434,7 @@ int GetMonitorCount(void)
+ // Get number of monitors
+ int GetCurrentMonitor(void)
+ {
+-    TRACELOG(LOG_WARNING, "GetCurrentMonitor() not implemented on target platform");
++    // ps2x: the phone's display is the one monitor (rlImGui asks every frame when fullscreen).
+     return 0;
+ }
+ 
+@@ -448,15 +448,15 @@ Vector2 GetMonitorPosition(int monitor)
+ // Get selected monitor width (currently used by monitor)
+ int GetMonitorWidth(int monitor)
+ {
+-    TRACELOG(LOG_WARNING, "GetMonitorWidth() not implemented on target platform");
+-    return 0;
++    // ps2x: the phone's display, so a fullscreen UI does not get a 0 x 0 screen.
++    return CORE.Window.display.width;
+ }
+ 
+ // Get selected monitor height (currently used by monitor)
+ int GetMonitorHeight(int monitor)
+ {
+-    TRACELOG(LOG_WARNING, "GetMonitorHeight() not implemented on target platform");
+-    return 0;
++    // ps2x: the phone's display, so a fullscreen UI does not get a 0 x 0 screen.
++    return CORE.Window.display.height;
+ }
+ 
+ // Get selected monitor physical width in millimetres
+@@ -497,7 +497,7 @@ Vector2 GetWindowPosition(void)
+ // Get window scale DPI factor for current monitor
+ Vector2 GetWindowScaleDPI(void)
+ {
+-    TRACELOG(LOG_WARNING, "GetWindowScaleDPI() not implemented on target platform");
++    // ps2x: one framebuffer pixel per screen pixel, without a warning on every call.
+     return (Vector2){ 1.0f, 1.0f };
+ }
+ 
+@@ -643,6 +643,39 @@ const char *GetKeyName(int key)
+ // Register all input events
+ void PollInputEvents(void)
+ {
++    // ps2x: follow the window when the device rotates. The activity handles orientation
++    // changes itself (configChanges), so the surface stays but its size changes. The buffers
++    // go back to the window's own size (InitGraphicsDevice() fixed them to the first one), and
++    // the screen, the viewport and the projection follow it.
++    CORE.Window.resizedLastFrame = false;
++    if ((platform.app != NULL) && (platform.app->window != NULL) && isGpuReady && !platform.contextRebindRequired)
++    {
++        static ANativeWindow *ps2xFreedWindow = NULL;
++        if (ps2xFreedWindow != platform.app->window)
++        {
++            ANativeWindow_setBuffersGeometry(platform.app->window, 0, 0, 0);
++            ps2xFreedWindow = platform.app->window;
++        }
++        const int width = ANativeWindow_getWidth(platform.app->window);
++        const int height = ANativeWindow_getHeight(platform.app->window);
++        if ((width > 0) && (height > 0) && ((width != CORE.Window.screen.width) || (height != CORE.Window.screen.height)))
++        {
++            CORE.Window.display.width = width;
++            CORE.Window.display.height = height;
++            CORE.Window.screen.width = width;
++            CORE.Window.screen.height = height;
++            CORE.Window.render.width = width;
++            CORE.Window.render.height = height;
++            CORE.Window.currentFbo.width = width;
++            CORE.Window.currentFbo.height = height;
++            CORE.Window.renderOffset.x = 0;
++            CORE.Window.renderOffset.y = 0;
++            CORE.Window.screenScale = MatrixIdentity();
++            SetupViewport(width, height);
++            CORE.Window.resizedLastFrame = true;
++        }
++    }
++
+ #if defined(SUPPORT_GESTURES_SYSTEM)
+     // NOTE: Gestures update must be called every frame to reset gestures correctly
+     // because ProcessGestureEvent() is just called on an event, not every frame

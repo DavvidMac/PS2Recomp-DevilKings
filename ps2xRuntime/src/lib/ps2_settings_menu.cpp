@@ -2,6 +2,7 @@
 
 #include "ps2_runtime.h"
 #include "runtime/ps2_settings.h"
+#include "runtime/ps2_touch_controls.h"
 
 #include "imgui.h"
 #include "raylib.h"
@@ -24,8 +25,8 @@ namespace
     };
 
     constexpr Tab kTabs[] = {
-        {"Vídeo", "video"},       {"Desempenho", "performance"}, {"Áudio", "audio"}, {"Controles", nullptr},
-        {"Saves", "saves"},       {"Hacks", nullptr},            {"Avançado", "advanced"},
+        {"Vídeo", "video"},   {"Desempenho", "performance"}, {"Áudio", "audio"},       {"Controles", nullptr},
+        {"Toque", "touch"},   {"Saves", "saves"},            {"Hacks", nullptr},       {"Avançado", "advanced"},
     };
 
     void helpLine(const char *text)
@@ -51,14 +52,19 @@ void PS2SettingsMenu::initialize()
         return;
     m_initialized = true;
     ImGuiIO &io = ImGui::GetIO();
+#if defined(__ANDROID__)
+    // A phone packs ~400 pixels per inch: size the menu from the screen's short side.
+    m_scale = std::clamp(static_cast<float>(std::min(GetScreenWidth(), GetScreenHeight())) / 540.0f, 1.0f, 3.0f);
+    ImGui::GetStyle().ScaleAllSizes(m_scale);
+#endif
     // The default font has no accented letters; ImGui 1.92 loads glyphs on demand.
     for (const char *candidate : {"C:\\Windows\\Fonts\\segoeui.ttf", "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                                  "/System/Library/Fonts/Supplemental/Arial.ttf"})
+                                  "/System/Library/Fonts/Supplemental/Arial.ttf", "/system/fonts/Roboto-Regular.ttf"})
     {
         std::error_code error;
         if (std::filesystem::exists(candidate, error))
         {
-            m_font = io.Fonts->AddFontFromFileTTF(candidate, 18.0f);
+            m_font = io.Fonts->AddFontFromFileTTF(candidate, 18.0f * m_scale);
             break;
         }
     }
@@ -66,6 +72,7 @@ void PS2SettingsMenu::initialize()
 
 void PS2SettingsMenu::close()
 {
+    std::fprintf(stderr, "[menu] closed\n");
     m_visible = false;
     settings::save();
     settings::setInputBlocked(false);
@@ -74,12 +81,19 @@ void PS2SettingsMenu::close()
 void PS2SettingsMenu::draw(PS2Runtime &runtime)
 {
     (void)runtime;
-    if (IsKeyPressed(KEY_F1))
+    // F1 on a keyboard; the menu button of the touch controls or Back on a phone.
+    const bool toggle = IsKeyPressed(KEY_F1) || ps2x::touch::takeMenuRequest()
+#if defined(__ANDROID__)
+                        || IsKeyPressed(KEY_BACK)
+#endif
+        ;
+    if (toggle)
     {
         if (m_visible)
             close();
         else
         {
+            std::fprintf(stderr, "[menu] opened\n");
             m_visible = true;
             settings::setInputBlocked(true);
         }
@@ -89,14 +103,20 @@ void PS2SettingsMenu::draw(PS2Runtime &runtime)
 
     rlImGuiBegin();
     if (m_font)
-        ImGui::PushFont(static_cast<ImFont *>(m_font), 18.0f);
+        ImGui::PushFont(static_cast<ImFont *>(m_font), 18.0f * m_scale);
 
     const ImVec2 screen(static_cast<float>(GetScreenWidth()), static_cast<float>(GetScreenHeight()));
-    const ImVec2 size(std::min(760.0f, screen.x - 40.0f), std::min(560.0f, screen.y - 40.0f));
+    const ImVec2 size(std::min(760.0f * m_scale, screen.x - 20.0f * m_scale),
+                      std::min(560.0f * m_scale, screen.y - 20.0f * m_scale));
     ImGui::SetNextWindowPos(ImVec2((screen.x - size.x) * 0.5f, (screen.y - size.y) * 0.5f), ImGuiCond_Appearing);
     ImGui::SetNextWindowSize(size, ImGuiCond_Appearing);
     bool open = true;
-    if (ImGui::Begin("Opções  (F1 fecha)", &open, ImGuiWindowFlags_NoCollapse))
+#if defined(__ANDROID__)
+    const char *title = "Opções";
+#else
+    const char *title = "Opções  (F1 fecha)";
+#endif
+    if (ImGui::Begin(title, &open, ImGuiWindowFlags_NoCollapse))
     {
         if (ImGui::BeginTabBar("settings-tabs"))
         {
@@ -122,7 +142,7 @@ void PS2SettingsMenu::draw(PS2Runtime &runtime)
             ImGui::TextColored(ImVec4(0.9f, 0.75f, 0.35f, 1.0f), "Algumas mudanças valem quando o jogo for reiniciado.");
             ImGui::SameLine();
         }
-        const float buttons = 220.0f;
+        const float buttons = 220.0f * m_scale;
         ImGui::SetCursorPosX(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - buttons));
         if (ImGui::Button("Restaurar padrões"))
             settings::resetToDefaults();
@@ -141,8 +161,6 @@ void PS2SettingsMenu::draw(PS2Runtime &runtime)
 
 void PS2SettingsMenu::drawSettings(const char *section)
 {
-    if (std::strcmp(section, "video") == 0)
-        helpLine("Em breve: o HUD 2D sem esticar no 16:9 e 21:9.");
     for (const settings::Definition &definition : settings::definitions())
     {
         if (std::strcmp(definition.section, section) != 0)

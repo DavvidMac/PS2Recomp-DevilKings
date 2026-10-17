@@ -368,6 +368,16 @@ namespace ps2x::settings
             // Áudio
             add({"audio", "volume", "Volume geral", "Volume de saída do jogo.", Kind::Number, "100", nullptr, {}, {}, 0,
                  100, nullptr, true});
+            // Toque (controles na tela)
+            add({"touch", "mode", "Controles na tela",
+                 "Botões, analógico e menu desenhados sobre a imagem. Automático mostra no celular quando "
+                 "não há controle conectado.",
+                 Kind::Choice, "auto", nullptr, {"auto", "on", "off"}, {"Automático", "Sempre", "Nunca"}, 0, 0, nullptr,
+                 true});
+            add({"touch", "opacity", "Opacidade", "Quanto os controles na tela cobrem a imagem, em %.", Kind::Number,
+                 "55", nullptr, {}, {}, 10, 100, nullptr, true});
+            add({"touch", "size", "Tamanho", "Tamanho dos controles na tela, em % do padrão.", Kind::Number, "100",
+                 nullptr, {}, {}, 50, 200, nullptr, true});
             // Saves
             add({"saves", "memcard_folder", "Pasta do memory card 1",
                  "Pasta dos saves do slot 1 (o slot 2 usa a pasta irmã mc1). Relativa à pasta do jogo.", Kind::Path,

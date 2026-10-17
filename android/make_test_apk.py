@@ -1,11 +1,12 @@
 """Builds a debuggable test APK around the runner library without Gradle.
 
-The app is a NativeActivity with no Java code, so the SDK's build tools are enough:
-aapt2 compiles the manifest, the library goes in lib/arm64-v8a, zipalign aligns it and
-apksigner signs with a debug key (created with the JDK's keytool if missing).
+The app is a NativeActivity plus one small Java class (ImmersiveActivity.java, which hides the
+system bars), so the SDK's build tools and a JDK are enough: javac and d8 make classes.dex, aapt2
+compiles the manifest, the library goes in lib/arm64-v8a, zipalign aligns it and apksigner signs
+with a debug key (created with the JDK's keytool if missing).
 
 usage: python make_test_apk.py <libps2EntryRunner.so> <output.apk> [--label NAME]
-Environment: ANDROID_SDK (default %LOCALAPPDATA%/Android/Sdk), JAVA_HOME for keytool.
+Environment: ANDROID_SDK (default %LOCALAPPDATA%/Android/Sdk), JAVA_HOME for javac and keytool.
 """
 import argparse
 import os
@@ -20,11 +21,11 @@ MANIFEST = """<?xml version="1.0" encoding="utf-8"?>
     package="com.ps2x.runner" android:versionCode="1" android:versionName="0.1.0">
     <uses-sdk android:minSdkVersion="28" android:targetSdkVersion="34" />
     <uses-feature android:glEsVersion="0x00030000" android:required="true" />
-    <application android:label="{label}" android:hasCode="false" android:isGame="true"
+    <application android:label="{label}" android:hasCode="true" android:isGame="true"
         android:debuggable="true" android:extractNativeLibs="true">
-        <activity android:name="android.app.NativeActivity"
+        <activity android:name="com.ps2x.runner.ImmersiveActivity"
             android:configChanges="orientation|screenSize|screenLayout|keyboard|keyboardHidden|navigation"
-            android:screenOrientation="landscape" android:exported="true">
+            android:screenOrientation="fullUser" android:exported="true">
             <meta-data android:name="android.app.lib_name" android:value="ps2EntryRunner" />
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -66,8 +67,20 @@ def main():
     run(os.path.join(tools, 'aapt2' + exe), 'link', '-o', base, '--manifest', manifest,
         '-I', os.path.join(platform, 'android.jar'))
 
+    # The activity class: javac against the platform's android.jar, then d8 to classes.dex.
+    jdk_bin = os.path.join(os.environ['JAVA_HOME'], 'bin') if os.environ.get('JAVA_HOME') else ''
+    classes = os.path.join(work, 'classes')
+    os.makedirs(classes)
+    source = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'ImmersiveActivity.java')
+    run(os.path.join(jdk_bin, 'javac' + exe), '--release', '11', '-nowarn', '-classpath', os.path.join(platform, 'android.jar'),
+        '-d', classes, source)
+    class_files = [os.path.join(root, name) for root, _, names in os.walk(classes) for name in names if name.endswith('.class')]
+    run(os.path.join(tools, 'd8' + bat), '--min-api', '28', '--lib', os.path.join(platform, 'android.jar'),
+        '--output', work, *class_files)
+
     # The library uncompressed, so zipalign -p can page-align it.
     with zipfile.ZipFile(base, 'a') as apk:
+        apk.write(os.path.join(work, 'classes.dex'), 'classes.dex')
         apk.write(args.library, 'lib/arm64-v8a/libps2EntryRunner.so', compress_type=zipfile.ZIP_STORED)
     aligned = os.path.join(work, 'aligned.apk')
     run(os.path.join(tools, 'zipalign' + exe), '-p', '-f', '4', base, aligned)

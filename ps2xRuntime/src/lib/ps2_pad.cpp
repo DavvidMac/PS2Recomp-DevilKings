@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 #include "runtime/ps2_settings.h"
+#include "runtime/ps2_touch_controls.h"
 
 namespace
 {
@@ -130,6 +131,15 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
                 }
             }
         }
+    }
+
+    // The on-screen controls (phones) add to whatever else is held.
+    btns &= static_cast<uint16_t>(~ps2x::touch::buttons());
+    float stickX = 0.0f, stickY = 0.0f;
+    if (ps2x::touch::stick(stickX, stickY))
+    {
+        data[6] = static_cast<uint8_t>(128 + stickX * 127);
+        data[7] = static_cast<uint8_t>(128 + stickY * 127);
     }
 
     data[2] = static_cast<uint8_t>(btns & 0xFF);

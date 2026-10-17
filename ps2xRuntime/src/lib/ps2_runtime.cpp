@@ -8,6 +8,7 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_hud_layout.h"
 #include "runtime/gs/gs_pgs.h"
+#include "runtime/ps2_touch_controls.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
 #include "Kernel/Stubs/Audio.h"
@@ -127,6 +128,11 @@ static constexpr uint32_t DEFAULT_FB_ADDR = (PS2_RAM_SIZE - DEFAULT_FB_SIZE - 0x
 #if defined(PLATFORM_VITA)
 static constexpr int HOST_WINDOW_WIDTH = 960;
 static constexpr int HOST_WINDOW_HEIGHT = 544;
+#elif defined(__ANDROID__)
+// raylib takes 0 x 0 as the phone's own size: the picture and the touch controls get the whole
+// screen and follow rotation.
+static constexpr int HOST_WINDOW_WIDTH = 0;
+static constexpr int HOST_WINDOW_HEIGHT = 0;
 #else
 static constexpr int HOST_WINDOW_WIDTH = FB_WIDTH;
 static constexpr int HOST_WINDOW_HEIGHT = DEFAULT_DISPLAY_HEIGHT;
@@ -2821,7 +2827,8 @@ namespace
 {
     // Live player settings for the window and the picture (ps2x::settings, the F1 menu),
     // applied on the thread that owns the window.
-    // Presentation filters, applied while drawing the frame to the window (GLSL 330, desktop).
+    // Presentation filters, applied while drawing the frame to the window (GLSL 330; phones get
+    // the GLSL ES spelling from filterShaderSource()).
     const char *kFilterShader = R"(#version 330
 in vec2 fragTexCoord;
 in vec4 fragColor;
@@ -2893,6 +2900,26 @@ void main()
     finalColor = vec4(color * shade, 1.0) * colDiffuse * fragColor;
 }
 )";
+
+    // The same filters for OpenGL ES 2 (phones): GLSL ES 1.00 spellings of the desktop source.
+    std::string filterShaderSource()
+    {
+        std::string source = kFilterShader;
+#if defined(__ANDROID__)
+        const auto replace = [&source](const std::string &from, const std::string &to)
+        {
+            for (size_t at = source.find(from); at != std::string::npos; at = source.find(from, at + to.size()))
+                source.replace(at, from.size(), to);
+        };
+        replace("#version 330", "#version 100\nprecision mediump float;");
+        replace("in vec2 fragTexCoord;", "varying vec2 fragTexCoord;");
+        replace("in vec4 fragColor;", "varying vec4 fragColor;");
+        replace("out vec4 finalColor;", "");
+        replace("finalColor", "gl_FragColor");
+        replace("texture(", "texture2D(");
+#endif
+        return source;
+    }
 
     struct PresentationSettings
     {
@@ -2976,11 +3003,11 @@ void main()
         void drawFrame(const Texture2D &frameTex, const Rectangle &src, const Rectangle &dst)
         {
             const bool filtered = shaderMode != 0 || antialias;
-#if !defined(PLATFORM_VITA) && !defined(__ANDROID__)
+#if !defined(PLATFORM_VITA)
             if (filtered && !shaderTried)
             {
                 shaderTried = true;
-                shader = LoadShaderFromMemory(nullptr, kFilterShader);
+                shader = LoadShaderFromMemory(nullptr, filterShaderSource().c_str());
                 if (!IsShaderValid(shader))
                     std::cerr << "[video] filter shader unavailable; showing the plain picture" << std::endl;
                 uniformTextureSize = GetShaderLocation(shader, "textureSize");
@@ -3132,10 +3159,12 @@ void PS2Runtime::run()
         float dstWidth = screenWidth;
         float dstHeight = screenHeight;
         const bool wide = (presentation.aspect == "16:9" || presentation.aspect == "21:9") && !ps2x::hud::pillarbox();
-        const float shape = !wide && presentation.aspect != "stretch" ? 4.0f / 3.0f
-                            : presentation.aspect == "16:9"           ? 16.0f / 9.0f
-                            : presentation.aspect == "21:9"           ? 21.0f / 9.0f
-                                                                      : 0.0f;
+        // In portrait with the touch controls on, the picture goes to the top and the controls below.
+        const bool atTop = ps2x::touch::pictureAtTop(static_cast<int>(screenWidth), static_cast<int>(screenHeight));
+        const float shape = !wide && (presentation.aspect != "stretch" || atTop) ? 4.0f / 3.0f
+                            : presentation.aspect == "16:9"                     ? 16.0f / 9.0f
+                            : presentation.aspect == "21:9"                     ? 21.0f / 9.0f
+                                                                                : 0.0f;
         if (shape > 0.0f)
         {
             dstWidth = std::min(screenWidth, screenHeight * shape);
@@ -3144,11 +3173,12 @@ void PS2Runtime::run()
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
+            atTop ? 0.0f : (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
         presentation.drawFrame(frameTex, srcRect, dstRect);
         presentation.drawFps(dstRect);
+        ps2x::touch::frame(static_cast<int>(screenWidth), static_cast<int>(screenHeight));
         if (m_debugUiInitialized && m_debugUiDrawCallback)
         {
             m_debugUiDrawCallback(*this, m_debugUiUserData);

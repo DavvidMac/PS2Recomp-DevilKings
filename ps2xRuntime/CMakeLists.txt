@@ -83,7 +83,32 @@ else()
     )
     FetchContent_MakeAvailable(raylib)
 
-    if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_ANDROID)
+    if(PS2X_IS_ANDROID)
+        # raylib 5.5 on Android keeps the first window size and answers the monitor queries with
+        # 0 x 0 (rlImGui then draws nothing); the patch makes the window follow rotation and the
+        # phone's display answer for the monitor. A file with an older patch is restored first.
+        set(PS2X_RAYLIB_ANDROID_CORE "${raylib_SOURCE_DIR}/src/platforms/rcore_android.c")
+        file(READ "${PS2X_RAYLIB_ANDROID_CORE}" PS2X_RAYLIB_ANDROID_TEXT)
+        string(FIND "${PS2X_RAYLIB_ANDROID_TEXT}" "ps2x: the phone's display is the one monitor" PS2X_RAYLIB_PATCHED)
+        if(PS2X_RAYLIB_PATCHED EQUAL -1)
+            find_package(Git REQUIRED)
+            string(FIND "${PS2X_RAYLIB_ANDROID_TEXT}" "ps2x:" PS2X_RAYLIB_OLD_PATCH)
+            if(NOT PS2X_RAYLIB_OLD_PATCH EQUAL -1)
+                execute_process(COMMAND "${GIT_EXECUTABLE}" checkout -- src/platforms/rcore_android.c
+                                WORKING_DIRECTORY "${raylib_SOURCE_DIR}")
+            endif()
+            execute_process(
+                COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
+                        "${CMAKE_CURRENT_SOURCE_DIR}/cmake/raylib-5.5-android.patch"
+                WORKING_DIRECTORY "${raylib_SOURCE_DIR}"
+                RESULT_VARIABLE PS2X_RAYLIB_PATCH_RESULT)
+            if(NOT PS2X_RAYLIB_PATCH_RESULT EQUAL 0)
+                message(WARNING "raylib Android patch did not apply: no rotation, and the settings menu draws nothing")
+            endif()
+        endif()
+    endif()
+
+    if(PS2X_ENABLE_DEBUG_UI)
         FetchContent_Declare(
             imgui
             GIT_REPOSITORY https://github.com/ocornut/imgui.git
@@ -388,6 +413,7 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_settings.cpp
+    src/lib/ps2_touch_controls.cpp
     src/lib/ps2_rom_device.cpp
     src/lib/ps2_vfs.cpp
     src/lib/ps2_runtime.cpp
@@ -565,7 +591,7 @@ target_link_libraries(ps2EntryRunner
     ps2_runtime
 )
 
-if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA AND NOT PS2X_IS_ANDROID)
+if(PS2X_ENABLE_DEBUG_UI AND NOT PS2X_IS_VITA)
     target_sources(ps2EntryRunner PRIVATE
         src/lib/ps2_debug_panel.cpp
         src/lib/ps2_settings_menu.cpp
