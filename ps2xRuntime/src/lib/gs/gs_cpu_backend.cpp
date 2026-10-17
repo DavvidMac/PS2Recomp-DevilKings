@@ -2384,6 +2384,86 @@ void GSCpuBackend::JoinInflightUnlocked()
     m_inflightWritePages.reset();
 }
 
+void GSCpuBackend::DecodeTextureRgba(const GSDrawState &state, uint32_t width, uint32_t height,
+                                     std::vector<uint32_t> &out)
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const auto &tex = state.context.tex0;
+    out.resize(static_cast<size_t>(width) * height);
+    if (!m_vram || out.empty())
+        return;
+    std::vector<uint32_t> raw(out.size());
+    GSMem::ReadTextureRect(nullptr, m_vram, tex.psm, tex.tbp0, tex.tbw, 0u, 0u, width, height, raw.data(), width);
+    ConvertTexelsUnlocked(state, m_clut, raw.data(), out.data(), static_cast<uint32_t>(out.size()));
+}
+
+uint64_t GSCpuBackend::NewTextureEpoch()
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return ++m_writeEpoch;
+}
+
+bool GSCpuBackend::TextureWrittenSince(const GSTex0Reg &tex, uint32_t width, uint32_t height, uint64_t epoch) const
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const uint32_t firstPage = tex.tbp0 / 32u;
+    const uint32_t lastPage = lastTexturePage(tex, width, height);
+    const uint32_t pageCount = std::min<uint32_t>(512u, lastPage - firstPage + 1u);
+    for (uint32_t i = 0; i < pageCount; ++i)
+        if (m_pageWriteEpoch[(firstPage + i) & 511u] >= epoch)
+            return true;
+    return false;
+}
+
+uint64_t GSCpuBackend::ClutVersion() const
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_clutVersion;
+}
+
+void GSCpuBackend::ReadRectRaw(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x0, uint32_t y0, uint32_t width,
+                               uint32_t height, std::vector<uint32_t> &out) const
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    out.resize(static_cast<size_t>(width) * height);
+    if (!m_vram || out.empty())
+        return;
+    const ReadVramFunc read = m_readVramFuncs[psm & 0x3Fu];
+    uint32_t *dst = out.data();
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+            *dst++ = read(m_vram, base, bw, x0 + x, y0 + y);
+}
+
+void GSCpuBackend::WriteRectRaw(uint32_t psm, uint32_t base, uint32_t bw, uint32_t width, uint32_t height,
+                                const uint32_t *values)
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!m_vram || !values)
+        return;
+    const WriteVramFunc write = m_writeVramFuncs[psm & 0x3Fu];
+    for (uint32_t y = 0; y < height; ++y)
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            MarkVramWriteUnlocked(psm, base, bw, x, y);
+            write(m_vram, base, bw, x, y, *values++);
+        }
+}
+
+void GSCpuBackend::SetSynchronous()
+{
+    DrainQueue();
+    std::lock_guard<std::mutex> queueLock(m_queueMutex);
+    m_asyncResolved = true;
+    m_async = false;
+}
+
 void GSCpuBackend::MarkVramWriteUnlocked(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x, uint32_t y)
 {
     m_pageWriteEpoch[vramPageOf(psm, base, bw, x, y) & 511u] = m_writeEpoch;

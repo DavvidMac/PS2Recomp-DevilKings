@@ -8,6 +8,8 @@
 #include "runtime/gs/gs_frontend.h"
 #include "runtime/gs/gs_hud_layout.h"
 #include "runtime/gs/gs_pgs.h"
+#include "runtime/gs/gs_gles.h"
+#include "runtime/gs/gs_cpu_backend.h"
 #include "runtime/ps2_touch_controls.h"
 #include "runtime/ee_scheduler.h"
 #include "ThreadNaming.h"
@@ -657,6 +659,34 @@ static void DumpPresentedFrame(uint64_t currentTick, const uint8_t *rgba, uint32
 #endif
 }
 
+// PS2X_FRAME_DUMP_DIR with the OpenGL renderer: the picture is read back from its texture,
+// only when a dump is due.
+static void DumpGlesFrame(const Texture2D &picture, uint64_t currentTick)
+{
+    static const char *s_frameDumpDir = std::getenv("PS2X_FRAME_DUMP_DIR");
+    if (!s_frameDumpDir || !*s_frameDumpDir)
+        return;
+    static uint64_t s_lastTick = 0u;
+    static const uint64_t s_interval = []() -> uint64_t
+    {
+        const char *value = std::getenv("PS2X_FRAME_DUMP_INTERVAL");
+        return value ? std::max<uint64_t>(1u, std::strtoull(value, nullptr, 10)) : 120u;
+    }();
+    static const uint64_t s_fromTick = []() -> uint64_t
+    {
+        const char *value = std::getenv("PS2X_FRAME_DUMP_FROM");
+        return value ? std::strtoull(value, nullptr, 10) : 0u;
+    }();
+    if (currentTick < s_fromTick || currentTick < s_lastTick + s_interval)
+        return;
+    s_lastTick = currentTick;
+    Image image = LoadImageFromTexture(picture);
+    if (image.data)
+        DumpPresentedFrame(currentTick, static_cast<const uint8_t *>(image.data), static_cast<uint32_t>(image.width),
+                           static_cast<uint32_t>(image.height), static_cast<uint32_t>(image.width) * 4u, 0u);
+    UnloadImage(image);
+}
+
 // The Vulkan renderer's newest scanout, in a texture resized to it: 2x and 4x internal
 // resolution scan out larger frames than the 640x512 one the software renderer fills.
 static void UploadVulkanFrame(Texture2D &tex, uint64_t currentTick, uint32_t &outWidth, uint32_t &outHeight)
@@ -724,6 +754,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         UploadVulkanFrame(tex, currentTick, outWidth, outHeight);
         return;
     }
+    // The OpenGL renderer's picture is a texture already (ps2x::gles::displayTexture).
+    if (ps2x::gles::active())
+        return;
     if (!needsLatch && s_hasUploadedFrame)
     {
         outWidth = (s_lastWidth != 0u) ? s_lastWidth : FB_WIDTH;
@@ -1117,6 +1150,11 @@ bool PS2Runtime::initialize(const char *title)
         }
 #endif
         SetTargetFPS(60);
+        if (ps2x::gles::requested() && !ps2x::gles::attachToWindow())
+        {
+            std::cerr << "[video] the OpenGL renderer is unavailable; using the software renderer" << std::endl;
+            m_gs.setRasterBackend(std::make_unique<GSCpuBackend>());
+        }
         if (m_debugUiInitCallback)
         {
             m_debugUiInitCallback(*this, m_debugUiUserData);
@@ -3154,8 +3192,25 @@ void PS2Runtime::run()
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
         UploadFrame(frameTex, this, presentWidth, presentHeight);
+        Texture2D picture = frameTex;
+        if (ps2x::gles::active())
+        {
+            unsigned glesTexture = 0u;
+            uint32_t glesWidth = 0u;
+            uint32_t glesHeight = 0u;
+            if (ps2x::gles::displayTexture(glesTexture, glesWidth, glesHeight))
+            {
+                picture = Texture2D{glesTexture, static_cast<int>(glesWidth), static_cast<int>(glesHeight), 1,
+                                    PIXELFORMAT_UNCOMPRESSED_R8G8B8A8};
+                presentWidth = glesWidth;
+                presentHeight = glesHeight;
+                DumpGlesFrame(picture, m_eeScheduler->currentVSyncTick());
+            }
+        }
 
         presentation.apply(frameTex);
+        if (picture.id != frameTex.id)
+            SetTextureFilter(picture, presentation.filter == "sharp" ? TEXTURE_FILTER_POINT : TEXTURE_FILTER_BILINEAR);
         BeginDrawing();
         ClearBackground(BLACK);
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
@@ -3185,7 +3240,7 @@ void PS2Runtime::run()
             atTop ? 0.0f : (screenHeight - dstHeight) * 0.5f,
             dstWidth,
             dstHeight};
-        presentation.drawFrame(frameTex, srcRect, dstRect);
+        presentation.drawFrame(picture, srcRect, dstRect);
         presentation.drawFps(dstRect);
         ps2x::touch::frame(static_cast<int>(screenWidth), static_cast<int>(screenHeight));
         if (m_debugUiInitialized && m_debugUiDrawCallback)
@@ -3209,6 +3264,7 @@ void PS2Runtime::run()
         // The game thread may have been waiting for the VIF1 thread until it stopped.
         m_memory.shutdownVif1();
     }
+    ps2x::gles::shutdown();
 
     if (m_debugUiInitialized && m_debugUiShutdownCallback)
     {

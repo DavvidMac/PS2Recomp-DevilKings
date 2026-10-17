@@ -299,12 +299,15 @@ namespace ps2x::settings
 #endif
                 Definition renderer{"video", "renderer", "Renderizador",
                                     "Software desenha na CPU. Vulkan desenha na placa de vídeo (paraLLEl-GS, tão fiel "
-                                    "quanto o Software) e permite resolução interna maior.",
-                                    Kind::Choice, "software", "PS2X_RENDERER", {"software", "vulkan"},
-                                    {"Software (CPU)", kHaveVulkan ? "Vulkan (GPU)" : "Vulkan (não incluído nesta build)"},
+                                    "quanto o Software) e permite resolução interna maior. OpenGL também desenha na "
+                                    "placa de vídeo e roda em celulares sem Vulkan 1.3 (em desenvolvimento: alguns "
+                                    "efeitos ainda faltam).",
+                                    Kind::Choice, "software", "PS2X_RENDERER", {"software", "vulkan", "opengl"},
+                                    {"Software (CPU)", kHaveVulkan ? "Vulkan (GPU)" : "Vulkan (não incluído nesta build)",
+                                     "OpenGL (GPU)"},
                                     0, 0, nullptr, false};
-                renderer.choiceEnvironment = {"", "vulkan"};
-                renderer.choiceAvailable = {true, kHaveVulkan};
+                renderer.choiceEnvironment = {"", "vulkan", "opengl"};
+                renderer.choiceAvailable = {true, kHaveVulkan, true};
                 add(renderer);
                 Definition scale{"video", "internal_resolution", "Resolução interna",
                                  "Só no Vulkan. 2x e 4x desenham a imagem 2 e 4 vezes maior (detalhe nítido em telas "

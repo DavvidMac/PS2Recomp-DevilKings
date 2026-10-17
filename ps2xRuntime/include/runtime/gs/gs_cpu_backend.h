@@ -45,6 +45,27 @@ public:
     void SnapshotVram(std::vector<uint8_t> &out) const override;
     GSTransferSnapshot GetTransferSnapshot() const override;
 
+    // For the OpenGL renderer (gs_gles.cpp), which keeps VRAM, the palette and the transfers
+    // here and draws on the GPU. Each drains the queue first, so it sees every upload and
+    // palette load submitted before it.
+    // The width x height texels at the texture's origin as RGBA8888, palette and TEXA applied.
+    void DecodeTextureRgba(const GSDrawState &state, uint32_t width, uint32_t height, std::vector<uint32_t> &out);
+    // An epoch to stamp a decoded texture with, and whether a VRAM page the texture covers was
+    // written since that stamp.
+    uint64_t NewTextureEpoch();
+    bool TextureWrittenSince(const GSTex0Reg &tex, uint32_t width, uint32_t height, uint64_t epoch) const;
+    // A hash of the palette's contents.
+    uint64_t ClutVersion() const;
+    // The values stored in the width x height pixels at (x0, y0) of a buffer, and stores values
+    // at its origin (marking the pages written): frame buffers the GPU starts drawing to, and
+    // what it drew, copied back before the guest reads that memory.
+    void ReadRectRaw(uint32_t psm, uint32_t base, uint32_t bw, uint32_t x0, uint32_t y0, uint32_t width,
+                     uint32_t height, std::vector<uint32_t> &out) const;
+    void WriteRectRaw(uint32_t psm, uint32_t base, uint32_t bw, uint32_t width, uint32_t height,
+                      const uint32_t *values);
+    // Applies uploads, transfers and palette loads as they are submitted, whatever PS2X_GS_ASYNC says.
+    void SetSynchronous();
+
     // Replay support (ps2_gs_replay): restores the palette a PS2X_GS_RECORD
     // recording started with.
     void RestoreClutForReplay(const std::array<uint16_t, 512> &clut, const std::array<uint32_t, 2> &clutCbp);

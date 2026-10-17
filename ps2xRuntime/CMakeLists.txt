@@ -423,6 +423,7 @@ add_library(ps2_runtime STATIC
     src/lib/gs/ps2_gs_memory.cpp
     src/lib/gs/gs_frontend.cpp
     src/lib/gs/gs_hud_layout.cpp
+    src/lib/gs/gs_gles.cpp
     src/lib/gs/gs_cpu_backend.cpp
     src/lib/ps2_iop_host.cpp
     src/lib/ps2_memory.cpp
@@ -580,6 +581,11 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg ps2_iop)
+# The OpenGL renderer (gs_gles.cpp) calls OpenGL ES 3.0 and EGL itself on Android; on the desktop it
+# goes through raylib's GL loader and GLFW.
+if(PS2X_IS_ANDROID)
+    target_link_libraries(ps2_runtime PUBLIC GLESv3 EGL)
+endif()
 
 # Vulkan renderer: paraLLEl-GS (the GS emulated in Vulkan compute, LGPL-3.0+), built when
 # PS2X_PGS_DIR points at a checkout of https://github.com/Arntzen-Software/parallel-gs (or a fork)
