@@ -1,6 +1,9 @@
 #include "ps2_vu1_parallel.h"
 #include "runtime/gs/ps2_gif_arbiter.h"
 #include "runtime/gs/gs_frontend.h"
+#include "runtime/ps2_settings.h"
+
+#include <chrono>
 
 #include <algorithm>
 #include <cstdio>
@@ -18,16 +21,15 @@ void dmaTrace(const char *format, ...);
 namespace
 {
     // PS2X_VU1_THREADS=<n>: worker threads for translated VU1 runs (0: none). Unset: 3 with 8
-    // or more logical CPUs, 2 with 6 or 7 (the GS bands take most of the rest), else none; none
-    // on ARM, where the workers were no faster on a phone and 2 of them hung a run (the queue
-    // was only proven on x86's stronger memory ordering).
+    // or more logical CPUs, 2 with 6 or 7 (the GS bands take most of the rest), else none; 2
+    // on ARM (a Galaxy S21 battle ran 6-10% faster with them than without, PS2X_VU1_AB).
     // Read when the runtime asks for the queue (once, at start-up).
     uint32_t vu1ThreadCount()
     {
         if (const char *value = std::getenv("PS2X_VU1_THREADS"))
             return static_cast<uint32_t>(std::clamp(std::atoi(value), 0, 16));
 #if defined(__aarch64__) || defined(__arm__)
-        return 0u;
+        return 2u;
 #endif
         const unsigned int cpus = std::thread::hardware_concurrency();
         return cpus >= 8u ? 3u : cpus >= 6u ? 2u : 0u;
@@ -969,6 +971,48 @@ void VU1Interpreter::Parallel::prepare(Slot &slot, bool mscal, uint32_t entryPc,
 
 // ---------------------------------------------------------------- VU1Interpreter
 
+namespace
+{
+    // PS2X_VU1_AB=<frames>: runs VU1 programs in parallel and in place by turns, <frames> game
+    // frames each, and every few turns prints each way's frame rate, so one stretch of play
+    // compares them (the same scenes come up in both).
+    bool parallelTurn()
+    {
+        static const uint64_t s_window = []() -> uint64_t
+        {
+            const char *value = std::getenv("PS2X_VU1_AB");
+            const long long frames = value ? std::atoll(value) : 0;
+            return frames > 0 ? static_cast<uint64_t>(frames) : 0u;
+        }();
+        if (s_window == 0u)
+            return true;
+        using Clock = std::chrono::steady_clock;
+        const uint64_t frames = ps2x::settings::gameFrames();
+        const bool parallel = ((frames / s_window) & 1u) == 0u;
+        static bool s_parallel = parallel;
+        static uint64_t s_turnFrames = frames;
+        static Clock::time_point s_turnStart = Clock::now();
+        static double s_seconds[2] = {0.0, 0.0};
+        static uint64_t s_frames[2] = {0u, 0u};
+        static uint32_t s_turns = 0u;
+        if (parallel != s_parallel)
+        {
+            const Clock::time_point now = Clock::now();
+            const int way = s_parallel ? 1 : 0;
+            s_seconds[way] += std::chrono::duration<double>(now - s_turnStart).count();
+            s_frames[way] += frames - s_turnFrames;
+            s_parallel = parallel;
+            s_turnFrames = frames;
+            s_turnStart = now;
+            if (++s_turns % 4u == 0u && s_seconds[0] > 0.0 && s_seconds[1] > 0.0)
+                std::fprintf(stderr, "[vu1-ab] in place %.1f fps, parallel %.1f fps (%u turns)\n",
+                             static_cast<double>(s_frames[0]) / s_seconds[0],
+                             static_cast<double>(s_frames[1]) / s_seconds[1], s_turns);
+        }
+        return parallel;
+    }
+}
+
 Vu1RunQueue *VU1Interpreter::runQueue()
 {
     if (!m_parallel && m_unit == Unit::VU1 && parallelAllowed())
@@ -986,6 +1030,12 @@ bool VU1Interpreter::runInParallel(bool mscal, uint8_t *vuCode, uint32_t codeSiz
     Parallel &p = *m_parallel;
     if (p.inCommit)
         return false; // a run being redone at commit time goes the ordinary way
+    if (!parallelTurn())
+    {
+        p.drain();
+        ++p.stats.inline_;
+        return false;
+    }
     p.vuCode = vuCode;
     p.codeSize = codeSize;
     p.live = vuData;
